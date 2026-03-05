@@ -310,8 +310,11 @@ function capTest(t: CapTest): CapTestResults {
   const {partitionKey} = t;
   const cap = new Cap(snitch, storage, t.limit, partitionKey);
   if (t.partitionKey === undefined) {
-    assert(t.partitionValues.length === 1);
-    assert(t.partitionValues[0] === undefined);
+    assert(t.partitionValues.length === 1, 'expected single partition value');
+    assert(
+      t.partitionValues[0] === undefined,
+      'expected undefined partition value',
+    );
   }
   const results: CapTestResults = {
     partitions: [],
