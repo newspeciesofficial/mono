@@ -1738,24 +1738,25 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
     [
       'change primary key columns in single ALTER TABLE (same constraint name)',
       `
-      CREATE TABLE my.pktest (
+      CREATE TABLE your.pktest (
         old_a TEXT NOT NULL,
         old_b TEXT NOT NULL,
         CONSTRAINT pktest_pkey PRIMARY KEY (old_a, old_b)
       );
-      ALTER TABLE my.pktest
+      ALTER TABLE your.pktest
         DROP CONSTRAINT pktest_pkey,
         DROP COLUMN old_b,
         ADD COLUMN new_b TEXT NOT NULL DEFAULT 'x',
         ADD CONSTRAINT pktest_pkey PRIMARY KEY (old_a, new_b);
       `,
       [
-        // First transaction: CREATE TABLE
-        [{tag: 'create-table'}, {tag: 'create-index'}],
-        // Second transaction: compound ALTER TABLE
-        // The index name "pktest_pkey" exists in both before and after
-        // but with different columns, so it must be detected as modified.
+        // Both statements execute in one DDL event. The CREATE TABLE
+        // creates the index "pktest_pkey", and the ALTER TABLE drops and
+        // recreates it with different columns. The index name is the same
+        // before and after, so it must be detected as structurally modified.
         [
+          {tag: 'create-table'},
+          {tag: 'create-index'},
           {tag: 'drop-index'},
           {tag: 'update-table-metadata'},
           {tag: 'drop-column'},
@@ -1766,7 +1767,7 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
       {},
       [
         {
-          name: 'my.pktest',
+          name: 'your.pktest',
           columns: {
             old_a: {
               characterMaximumLength: null,
@@ -1780,7 +1781,7 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
               characterMaximumLength: null,
               dataType: 'text|NOT_NULL',
               elemPgTypeClass: null,
-              dflt: null,
+              dflt: "'x'",
               notNull: false,
               pos: 3,
             },
@@ -1789,15 +1790,15 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
               dataType: 'TEXT',
               elemPgTypeClass: null,
               notNull: false,
-              pos: 4,
+              pos: 2,
             },
           },
         },
       ],
       [
         {
-          tableName: 'my.pktest',
-          name: 'my.pktest_pkey',
+          tableName: 'your.pktest',
+          name: 'your.pktest_pkey',
           columns: {old_a: 'ASC', new_b: 'ASC'},
           unique: true,
         },
