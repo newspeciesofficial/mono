@@ -330,7 +330,6 @@ function buildPipelineInternal(
         end,
         name,
         true,
-        unordered,
       );
     }
   }
@@ -365,15 +364,7 @@ function buildPipelineInternal(
 
   if (ast.related) {
     for (const csq of ast.related) {
-      end = applyCorrelatedSubQuery(
-        csq,
-        delegate,
-        queryID,
-        end,
-        name,
-        false,
-        unordered,
-      );
+      end = applyCorrelatedSubQuery(csq, delegate, queryID, end, name, false);
     }
   }
 
@@ -638,7 +629,6 @@ function applyCorrelatedSubQuery(
   end: Input,
   name: string,
   fromCondition: boolean,
-  unordered?: boolean,
 ) {
   // TODO: we only omit the join if the CSQ if from a condition since
   // we want to create an empty array for `related` fields that are `limit(0)`
@@ -665,7 +655,6 @@ function applyCorrelatedSubQuery(
     relationshipName: sq.subquery.alias,
     hidden: sq.hidden ?? false,
     system: sq.system ?? 'client',
-    unordered,
   });
   delegate.addEdge(end, join);
   delegate.addEdge(child, join);

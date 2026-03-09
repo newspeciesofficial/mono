@@ -28,7 +28,6 @@ type Args = {
   relationshipName: string;
   hidden: boolean;
   system: System;
-  unordered?: boolean | undefined;
 };
 
 /**
@@ -48,7 +47,6 @@ export class Join implements Input {
   readonly #childKey: CompoundKey;
   readonly #relationshipName: string;
   readonly #schema: SourceSchema;
-  readonly #unordered: boolean;
 
   #output: Output = throwOutput;
 
@@ -62,7 +60,6 @@ export class Join implements Input {
     relationshipName,
     hidden,
     system,
-    unordered,
   }: Args) {
     assert(parent !== child, 'Parent and child must be different operators');
     assert(
@@ -74,7 +71,6 @@ export class Join implements Input {
     this.#parentKey = parentKey;
     this.#childKey = childKey;
     this.#relationshipName = relationshipName;
-    this.#unordered = unordered ?? false;
 
     const parentSchema = parent.getSchema();
     const childSchema = child.getSchema();
@@ -267,7 +263,6 @@ export class Join implements Input {
       const stream = constraint ? this.#child.fetch({constraint}) : [];
 
       if (
-        !this.#unordered &&
         this.#inprogressChildChange &&
         isJoinMatch(
           parentNodeRow,

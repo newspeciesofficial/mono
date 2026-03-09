@@ -32,7 +32,6 @@ type Args = {
   relationshipName: string;
   hidden: boolean;
   system: System;
-  unordered?: boolean | undefined;
 };
 
 /**
@@ -50,7 +49,6 @@ export class FlippedJoin implements Input {
   readonly #childKey: CompoundKey;
   readonly #relationshipName: string;
   readonly #schema: SourceSchema;
-  readonly #unordered: boolean;
 
   #output: Output = throwOutput;
 
@@ -64,7 +62,6 @@ export class FlippedJoin implements Input {
     relationshipName,
     hidden,
     system,
-    unordered,
   }: Args) {
     assert(parent !== child, 'Parent and child must be different operators');
     assert(
@@ -76,7 +73,6 @@ export class FlippedJoin implements Input {
     this.#parentKey = parentKey;
     this.#childKey = childKey;
     this.#relationshipName = relationshipName;
-    this.#unordered = unordered ?? false;
 
     const parentSchema = parent.getSchema();
     const childSchema = child.getSchema();
@@ -140,8 +136,6 @@ export class FlippedJoin implements Input {
         yield node;
         continue;
       }
-      // we could infer the order.......
-      // and create a valid comparator for use later.
       childNodes.push(node);
     }
 
@@ -153,10 +147,7 @@ export class FlippedJoin implements Input {
     // related parents with position greater than change.position
     // (which should not yet have the node removed), would not even
     // be fetched here, and would be absent from the output all together.
-    if (
-      !this.#unordered &&
-      this.#inprogressChildChange?.change.type === 'remove'
-    ) {
+    if (this.#inprogressChildChange?.change.type === 'remove') {
       const removedNode = this.#inprogressChildChange.change.node;
       const compare = this.#child.getSchema().compareRows;
       const insertPos = binarySearch(childNodes.length, i =>
@@ -247,7 +238,6 @@ export class FlippedJoin implements Input {
         }
         let overlaidRelatedChildNodes = relatedChildNodes;
         if (
-          !this.#unordered &&
           this.#inprogressChildChange &&
           this.#inprogressChildChange.position &&
           isJoinMatch(
