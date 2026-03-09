@@ -69,6 +69,20 @@ describe('pg/logic-replication', {timeout: 30000}, () => {
     return queue;
   }
 
+  // PG may over-send relation messages if it forgot that it already
+  // sent one (presumably due to some state being reset). Use this
+  // when expecting a non-relation message to skip spurious re-sends.
+  async function dequeueNonRelation(
+    queue: Queue<StreamMessage[1]>,
+  ): Promise<StreamMessage[1]> {
+    for (;;) {
+      const msg = await queue.dequeue();
+      if (msg.tag !== 'relation') {
+        return msg;
+      }
+    }
+  }
+
   async function expectNonRelationMessages(
     queue: Queue<StreamMessage[1]>,
     count: number,
@@ -148,7 +162,7 @@ describe('pg/logic-replication', {timeout: 30000}, () => {
     SELECT pg_logical_emit_message(true, 'foo/bar', 'baz');
     `);
 
-    expect(await msgs.dequeue()).toMatchObject({tag: 'begin'});
+    expect(await dequeueNonRelation(msgs)).toMatchObject({tag: 'begin'});
     expect(await msgs.dequeue()).toMatchObject({
       tag: 'relation',
       schema: 'public',
@@ -157,7 +171,7 @@ describe('pg/logic-replication', {timeout: 30000}, () => {
       relationOid: expect.any(Number),
       replicaIdentity: 'default',
     });
-    expect(await msgs.dequeue()).toMatchObject({
+    expect(await dequeueNonRelation(msgs)).toMatchObject({
       tag: 'insert',
       relation: {name: 'foo'},
       new: {
@@ -175,7 +189,7 @@ describe('pg/logic-replication', {timeout: 30000}, () => {
         jsons: [1, '2', {a: 123}],
       },
     });
-    expect(await msgs.dequeue()).toMatchObject({
+    expect(await dequeueNonRelation(msgs)).toMatchObject({
       tag: 'update',
       relation: {name: 'foo'},
       key: null,
@@ -193,7 +207,7 @@ describe('pg/logic-replication', {timeout: 30000}, () => {
       },
       old: null,
     });
-    expect(await msgs.dequeue()).toMatchObject({
+    expect(await dequeueNonRelation(msgs)).toMatchObject({
       tag: 'delete',
       relation: {name: 'foo'},
       key: {id: 'bar'},
@@ -206,7 +220,7 @@ describe('pg/logic-replication', {timeout: 30000}, () => {
       relationOid: expect.any(Number),
       replicaIdentity: 'default',
     });
-    expect(await msgs.dequeue()).toMatchObject({
+    expect(await dequeueNonRelation(msgs)).toMatchObject({
       tag: 'insert',
       new: {a: '1', b: '2', c: '3', d: '4'},
       relation: {name: 'boo'},
@@ -221,7 +235,7 @@ describe('pg/logic-replication', {timeout: 30000}, () => {
       schema: 'public',
       name: 'foo',
     });
-    expect(await msgs.dequeue()).toMatchObject({
+    expect(await dequeueNonRelation(msgs)).toMatchObject({
       tag: 'truncate',
       restartIdentity: false,
       cascade: false,
@@ -238,14 +252,14 @@ describe('pg/logic-replication', {timeout: 30000}, () => {
         },
       ],
     });
-    expect(await msgs.dequeue()).toMatchObject({
+    expect(await dequeueNonRelation(msgs)).toMatchObject({
       tag: 'message',
       prefix: 'foo/bar',
       content: Buffer.from([98, 97, 122]), // 'b', 'a', 'z'
       flags: 1,
       transactional: true,
     });
-    expect(await msgs.dequeue()).toMatchObject({tag: 'commit'});
+    expect(await dequeueNonRelation(msgs)).toMatchObject({tag: 'commit'});
   });
 
   test('acks', async () => {
