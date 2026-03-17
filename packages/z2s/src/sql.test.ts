@@ -589,6 +589,75 @@ describe('string arg packing', () => {
       `);
     });
 
+    test.each(['json', 'jsonb'] as const)(
+      'does not reuse placeholders across text and %s writes when the values are equal',
+      type => {
+        expect(
+          formatPgInternalConvert(
+            sql`INSERT INTO "foo" VALUES (${sqlConvertColumnArg(
+              {isArray: false, isEnum: false, type: 'text'},
+              '',
+              false,
+              false,
+            )}, ${sqlConvertColumnArg(
+              {isArray: false, isEnum: false, type},
+              '',
+              false,
+              false,
+            )})`,
+          ),
+        ).toEqual({
+          text: `INSERT INTO "foo" VALUES ($1::text::text, $2::text::${type})`,
+          values: ['', '""'],
+        });
+      },
+    );
+
+    test.each(['json', 'jsonb'] as const)(
+      'does not reuse placeholders across %s and text writes when the values are equal',
+      type => {
+        expect(
+          formatPgInternalConvert(
+            sql`INSERT INTO "foo" VALUES (${sqlConvertColumnArg(
+              {isArray: false, isEnum: false, type},
+              '',
+              false,
+              false,
+            )}, ${sqlConvertColumnArg(
+              {isArray: false, isEnum: false, type: 'text'},
+              '',
+              false,
+              false,
+            )})`,
+          ),
+        ).toEqual({
+          text: `INSERT INTO "foo" VALUES ($1::text::${type}, $2::text::text)`,
+          values: ['""', ''],
+        });
+      },
+    );
+
+    test('does not conflate different object values across jsonb columns', () => {
+      expect(
+        formatPgInternalConvert(
+          sql`INSERT INTO "foo" VALUES (${sqlConvertColumnArg(
+            {isArray: false, isEnum: false, type: 'jsonb'},
+            {a: 1},
+            false,
+            false,
+          )}, ${sqlConvertColumnArg(
+            {isArray: false, isEnum: false, type: 'jsonb'},
+            {b: 2},
+            false,
+            false,
+          )})`,
+        ),
+      ).toEqual({
+        text: `INSERT INTO "foo" VALUES ($1::text::jsonb, $2::text::jsonb)`,
+        values: ['{"a":1}', '{"b":2}'],
+      });
+    });
+
     test('insert text[]', () => {
       expect(
         formatPgInternalConvert(
