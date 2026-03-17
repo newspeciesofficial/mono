@@ -244,6 +244,7 @@ export class TableSource implements Source {
       debug,
       output: undefined,
       sort,
+      sortKey: JSON.stringify(sort),
       splitEditKeys,
       filters: transformedFilters.filters
         ? {

@@ -70,6 +70,8 @@ export type Connection = {
   input: Input;
   output: Output | undefined;
   sort: Ordering;
+  /** Pre-computed `JSON.stringify(sort)` used as the index map key. */
+  sortKey: string;
   splitEditKeys: Set<string> | undefined;
   compareRows: Comparator;
   filters:
@@ -94,6 +96,8 @@ export class MemorySource implements Source {
   readonly #columns: Record<string, SchemaValue>;
   readonly #primaryKey: PrimaryKey;
   readonly #primaryIndexSort: Ordering;
+  /** Pre-computed key for the primary index to avoid JSON.stringify on every access. */
+  readonly #primaryIndexKey: string;
   readonly #indexes: Map<string, Index> = new Map();
   readonly #connections: Connection[] = [];
 
@@ -110,8 +114,9 @@ export class MemorySource implements Source {
     this.#columns = columns;
     this.#primaryKey = primaryKey;
     this.#primaryIndexSort = primaryKey.map(k => [k, 'asc']);
+    this.#primaryIndexKey = JSON.stringify(this.#primaryIndexSort);
     const comparator = makeBoundComparator(this.#primaryIndexSort);
-    this.#indexes.set(JSON.stringify(this.#primaryIndexSort), {
+    this.#indexes.set(this.#primaryIndexKey, {
       comparator,
       data: primaryIndexData ?? new BTreeSet<Row>(comparator),
       usedBy: new Set(),
@@ -176,6 +181,7 @@ export class MemorySource implements Source {
       input,
       output: undefined,
       sort,
+      sortKey: JSON.stringify(sort),
       splitEditKeys,
       compareRows: makeComparator(sort),
       filters: transformedFilters.filters
@@ -207,13 +213,12 @@ export class MemorySource implements Source {
   }
 
   #getPrimaryIndex(): Index {
-    const index = this.#indexes.get(JSON.stringify(this.#primaryIndexSort));
+    const index = this.#indexes.get(this.#primaryIndexKey);
     assert(index, 'Primary index not found');
     return index;
   }
 
-  #getOrCreateIndex(sort: Ordering, usedBy: Connection): Index {
-    const key = JSON.stringify(sort);
+  #getOrCreateIndex(sort: Ordering, key: string, usedBy: Connection): Index {
     const index = this.#indexes.get(key);
     // Future optimization could use existing index if it's the same just sorted
     // in reverse of needed.
@@ -264,47 +269,53 @@ export class MemorySource implements Source {
     // so swap out to that if it exists.
     const fetchOrPkConstraint = pkConstraint ?? req.constraint;
 
-    // If there is a constraint, we need an index sorted by it first.
-    const indexSort: OrderPart[] = [];
-    if (fetchOrPkConstraint) {
+    const startAt = req.start?.row;
+
+    let index: Index;
+    let scanStart: RowBound | undefined;
+
+    if (!fetchOrPkConstraint) {
+      // Fast path: no constraint — the index sort is exactly the connection
+      // sort, so we can use the pre-computed key and skip building a temporary
+      // array.
+      index = this.#getOrCreateIndex(requestedSort, conn.sortKey, conn);
+      scanStart = startAt;
+    } else {
+      // Slow path: a constraint changes the required index sort — build the
+      // index sort dynamically.
+
+      // If there is a constraint, we need an index sorted by it first.
+      const indexSort: OrderPart[] = [];
       for (const key of Object.keys(fetchOrPkConstraint)) {
         indexSort.push([key, 'asc']);
       }
-    }
 
-    // For the special case of constraining by PK, we don't need to worry about
-    // any requested sort since there can only be one result. Otherwise we also
-    // need the index sorted by the requested sort.
-    if (
-      this.#primaryKey.length > 1 ||
-      !fetchOrPkConstraint ||
-      !constraintMatchesPrimaryKey(fetchOrPkConstraint, this.#primaryKey)
-    ) {
-      indexSort.push(...requestedSort);
-    }
+      // For the special case of constraining by PK, we don't need to worry
+      // about any requested sort since there can only be one result. Otherwise
+      // we also need the index sorted by the requested sort.
+      if (
+        this.#primaryKey.length > 1 ||
+        !constraintMatchesPrimaryKey(fetchOrPkConstraint, this.#primaryKey)
+      ) {
+        indexSort.push(...requestedSort);
+      }
 
-    const index = this.#getOrCreateIndex(indexSort, conn);
-    const {data, comparator: compare} = index;
-    // Avoid allocating a new closure when not reversing (the common case).
-    const indexComparator: Comparator = req.reverse
-      ? (r1, r2) => -compare(r1, r2)
-      : compare;
+      index = this.#getOrCreateIndex(
+        indexSort,
+        JSON.stringify(indexSort),
+        conn,
+      );
 
-    const startAt = req.start?.row;
-
-    // If there is a constraint, we want to start our scan at the first row that
-    // matches the constraint. But because the next OrderPart can be `desc`,
-    // it's not true that {[constraintKey]: constraintValue} is the first
-    // matching row. Because in that case, the other fields will all be
-    // `undefined`, and in Zero `undefined` is always less than any other value.
-    // So if the second OrderPart is descending then `undefined` values will
-    // actually be the *last* row. We need a way to stay "start at the first row
-    // with this constraint value". RowBound with the corresponding compareBound
-    // comparator accomplishes this. The right thing is probably to teach the
-    // btree library to support this concept.
-    let scanStart: RowBound | undefined;
-
-    if (fetchOrPkConstraint) {
+      // If there is a constraint, we want to start our scan at the first row
+      // that matches the constraint. But because the next OrderPart can be
+      // `desc`, it's not true that {[constraintKey]: constraintValue} is the
+      // first matching row. Because in that case, the other fields will all be
+      // `undefined`, and in Zero `undefined` is always less than any other
+      // value. So if the second OrderPart is descending then `undefined` values
+      // will actually be the *last* row. We need a way to stay "start at the
+      // first row with this constraint value". RowBound with the corresponding
+      // compareBound comparator accomplishes this. The right thing is probably
+      // to teach the btree library to support this concept.
       scanStart = {};
       for (const [key, dir] of indexSort) {
         if (hasOwn(fetchOrPkConstraint, key)) {
@@ -317,9 +328,12 @@ export class MemorySource implements Source {
           }
         }
       }
-    } else {
-      scanStart = startAt;
     }
+    const {data, comparator: compare} = index;
+    // Avoid allocating a new closure when not reversing (the common case).
+    const indexComparator: Comparator = req.reverse
+      ? (r1, r2) => -compare(r1, r2)
+      : compare;
 
     const rowsIterable = generateRows(data, scanStart, req.reverse);
     const withOverlay = generateWithOverlay(
