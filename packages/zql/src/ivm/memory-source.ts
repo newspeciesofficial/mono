@@ -251,8 +251,10 @@ export class MemorySource implements Source {
 
   *#fetch(req: FetchRequest, conn: Connection): Stream<Node | 'yield'> {
     const {sort: requestedSort, compareRows} = conn;
-    const connectionComparator = (r1: Row, r2: Row) =>
-      compareRows(r1, r2) * (req.reverse ? -1 : 1);
+    // Avoid allocating a new closure when not reversing (the common case).
+    const connectionComparator: Comparator = req.reverse
+      ? (r1, r2) => -compareRows(r1, r2)
+      : compareRows;
 
     const pkConstraint = primaryKeyConstraintFromFilters(
       conn.filters?.condition,
@@ -283,8 +285,10 @@ export class MemorySource implements Source {
 
     const index = this.#getOrCreateIndex(indexSort, conn);
     const {data, comparator: compare} = index;
-    const indexComparator = (r1: Row, r2: Row) =>
-      compare(r1, r2) * (req.reverse ? -1 : 1);
+    // Avoid allocating a new closure when not reversing (the common case).
+    const indexComparator: Comparator = req.reverse
+      ? (r1, r2) => -compare(r1, r2)
+      : compare;
 
     const startAt = req.start?.row;
 
