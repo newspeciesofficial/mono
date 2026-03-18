@@ -1,4 +1,4 @@
-const FALLBACK_SENTINEL = 0xffffffff;
+const FALLBACK_SENTINEL = -1;
 const BASE_SHIFT = 10; // diacritic(9b) + case(1b)
 const DIAC_SHIFT = 1;
 
@@ -59,8 +59,8 @@ function buildASCIIPrimaryRank(collator: Intl.Collator): Uint16Array {
 function buildTable(
   collator: Intl.Collator,
   diacriticOrder: ReadonlyArray<string>,
-): Uint32Array {
-  const table = new Uint32Array(0x0250);
+): Int32Array {
+  const table = new Int32Array(0x0250);
   const asciiPrimaryRank = buildASCIIPrimaryRank(collator);
   const diacMap = new Map<string, number>(
     diacriticOrder.map((m, i): [string, number] => [m, i]),
@@ -127,11 +127,8 @@ export function createLocaleComparator(locale: string): (a: string, b: string) =
         return fallback(a, b);
       }
 
-      // | 0 sign-extends Uint32 values to signed integers, keeping them as
-      // SMIs in V8. FALLBACK_SENTINEL (0xffffffff) becomes -1, so `< 0` is
-      // the sentinel check. Legitimate packed weights never reach bit 31.
-      const aw = table[acp] | 0;
-      const bw = table[bcp] | 0;
+      const aw = table[acp];
+      const bw = table[bcp];
 
       if (aw < 0 || bw < 0) {
         return fallback(a, b);
@@ -158,7 +155,7 @@ export function createLocaleComparator(locale: string): (a: string, b: string) =
       const longerStr = al > bl ? a : b;
       const nextCp = longerStr.charCodeAt(minLen);
       if (nextCp >= 0x0250) return fallback(a, b);
-      const nw = table[nextCp] | 0;
+      const nw = table[nextCp];
       if (nw < 0) return fallback(a, b);
       return al > bl ? 1 : -1;
     }
