@@ -1,3 +1,17 @@
+/**
+ * Collation consistency tests between z2s (PostgreSQL), zqlite (SQLite), and
+ * zql (in-memory).
+ *
+ * These tests are effectively relaxed: z2s no longer adds COLLATE "ucs_basic"
+ * to queries, so PostgreSQL uses its native (locale-aware) collation which may
+ * order text and enum columns differently than SQLite/zql byte ordering.
+ *
+ * The tests currently verify:
+ * - zql and zqlite produce identical ordering (both use byte-order comparison)
+ * - PostgreSQL returns the same *set* of rows (but possibly in different order)
+ *
+ * Kept in case we eventually align collations across all three environments.
+ */
 import {Client} from 'pg';
 import {afterAll, beforeAll, describe, expect, test} from 'vitest';
 import {testLogConfig} from '../../otel/src/test-log-config.ts';
@@ -207,18 +221,28 @@ describe('collation behavior', () => {
       const memoryResult = await memoryQueryDelegate.run(
         memoryItemQuery.orderBy(col, 'asc'),
       );
-      expect(zqlResult).toEqualPg(pgResult);
-      expect(memoryResult).toEqualPg(pgResult);
+      // ZQL (SQLite) and memory should produce the same ordering
+      // (both use byte-order comparison).
+      expect(zqlResult).toEqualPg(memoryResult);
+      // PG should return the same set of rows (order may differ
+      // due to locale-aware collation for text/enum columns).
+      expect(zqlResult).toEqual(expect.arrayContaining(pgResult as unknown[]));
+      expect(pgResult).toEqual(expect.arrayContaining(zqlResult as unknown[]));
 
       function makeQuery(
         query: Query<'item', Schema>,
         i: number,
       ): Query<'item', Schema> {
         return query
-          .where(col, '>', memoryResult[i].name)
+          .where(col, '>', memoryResult[i][col])
           .limit(1)
           .orderBy(col, 'asc');
       }
+      // Cursor-style tests: only compare ZQL vs memory. PG is excluded
+      // because its locale-aware collation (e.g. en_US.UTF-8) orders
+      // strings differently than ZQL/memory byte ordering, so
+      // WHERE col > 'x' ORDER BY col LIMIT 1 may return a different
+      // "next row" from PG than from ZQL/memory.
       for (let i = 0; i < memoryResult.length - 1; i++) {
         const memResult = await memoryQueryDelegate.run(
           makeQuery(memoryItemQuery, i),
@@ -228,9 +252,7 @@ describe('collation behavior', () => {
           schema,
           'item',
         );
-        const pgResult = await runAsSQL(makeQuery(itemQuery, i), runPgQuery);
-        expect(zqlResult).toEqualPg(pgResult);
-        expect(memResult).toEqualPg(pgResult);
+        expect(zqlResult).toEqualPg(memResult);
       }
 
       return zqlResult;
