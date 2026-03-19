@@ -145,6 +145,8 @@ if (!dbPath) {
     const plannedClientAST = mapAST(plannedServerAST, serverToClientMapper);
     const plannedQuery = createQuery(tableName, plannedClientAST, format);
 
+    console.log(dbg.format());
+
     // const unplannedQuery = createQuery(tableName, unplannedAST, format);
 
     console.log('start...');
@@ -155,7 +157,7 @@ if (!dbPath) {
     const end = performance.now();
     console.log('duration ', end - start);
     db.exec('ROLLBACK');
-    console.log(data);
+    // console.log(data);
 
     summary(() => {
       // bench(`unplanned: ${name}`, async () => {
@@ -199,7 +201,7 @@ if (!dbPath) {
         ),
       )
       .orderBy('modified', 'desc')
-      .limit(1),
+      .limit(100),
   );
 
   // run all reads in an explicit tx
