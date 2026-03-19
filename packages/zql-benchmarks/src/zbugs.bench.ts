@@ -5,7 +5,7 @@ import {testLogConfig} from '../../otel/src/test-log-config.ts';
 import {createSilentLogContext} from '../../shared/src/logging-test-utils.ts';
 import {computeZqlSpecs} from '../../zero-cache/src/db/lite-tables.ts';
 import type {LiteAndZqlSpec} from '../../zero-cache/src/db/specs.ts';
-import type {AST, Condition} from '../../zero-protocol/src/ast.ts';
+import {mapAST, type AST, type Condition} from '../../zero-protocol/src/ast.ts';
 import {type Format} from '../../zql/src/ivm/default-format.ts';
 import {newQueryImpl} from '../../zql/src/query/query-impl.ts';
 import {asQueryInternals} from '../../zql/src/query/query-internals.ts';
@@ -13,6 +13,13 @@ import type {AnyQuery} from '../../zql/src/query/query.ts';
 import {Database} from '../../zqlite/src/db.ts';
 import {newQueryDelegate} from '../../zqlite/src/test/source-factory.ts';
 import {builder, schema} from './schema.ts';
+import {AccumulatorDebugger} from '../../zql/src/planner/planner-debug.ts';
+import {planQuery} from '../../zql/src/planner/planner-builder.ts';
+import {createSQLiteCostModel} from '../../zqlite/src/sqlite-cost-model.ts';
+import {
+  clientToServer,
+  serverToClient,
+} from '../../zero-schema/src/name-mapper.ts';
 
 const dbPath = process.env.ZBUGS_REPLICA_PATH;
 
@@ -26,7 +33,9 @@ if (!dbPath) {
   const lc = createSilentLogContext();
 
   // Run ANALYZE to populate SQLite statistics for cost model
-  db.exec('ANALYZE;');
+  console.log('analyze...');
+  // db.exec('ANALYZE;');
+  console.log('done analyze');
 
   // Get table specs using computeZqlSpecs
   const tableSpecs = new Map<string, LiteAndZqlSpec>();
@@ -38,9 +47,9 @@ if (!dbPath) {
   );
 
   // Create SQLite cost model
-  // const costModel = createSQLiteCostModel(db, tableSpecs);
-  // const clientToServerMapper = clientToServer(schema.tables);
-  // const serverToClientMapper = serverToClient(schema.tables);
+  const costModel = createSQLiteCostModel(db, tableSpecs);
+  const clientToServerMapper = clientToServer(schema.tables);
+  const serverToClientMapper = serverToClient(schema.tables);
 
   // Create SQLite delegate
   const delegate = newQueryDelegate(lc, testLogConfig, db, schema);
@@ -96,24 +105,28 @@ if (!dbPath) {
     TTable extends keyof typeof schema.tables & string,
   >(_name: string, query: AnyQuery) {
     const unplannedAST = asQueryInternals(query).ast;
+    const tableName = unplannedAST.table as TTable;
     const format = asQueryInternals(query).format;
 
-    // const mappedAST = mapAST(unplannedAST, clientToServerMapper);
-    // const mappedASTCopy = setFlipToFalseInAST(mappedAST);
-    // const dbg = new AccumulatorDebugger();
-    // const plannedServerAST = planQuery(mappedASTCopy, costModel, dbg);
-    // const plannedClientAST = mapAST(plannedServerAST, serverToClientMapper);
-    // const plannedQuery = createQuery(tableName, plannedClientAST);
+    let mappedAST = mapAST(unplannedAST, clientToServerMapper);
+    const resolved = resolveSimpleScalarSubqueries(mappedAST);
+    mappedAST = resolved.ast;
+    const mappedASTCopy = setFlipToFalseInAST(mappedAST);
+    const dbg = new AccumulatorDebugger();
+    const plannedServerAST = planQuery(mappedASTCopy, costModel, dbg);
+    const plannedClientAST = mapAST(plannedServerAST, serverToClientMapper);
+    const plannedQuery = createQuery(tableName, plannedClientAST, format);
 
-    const tableName = unplannedAST.table as TTable;
-    const unplannedQuery = createQuery(tableName, unplannedAST, format);
+    // const unplannedQuery = createQuery(tableName, unplannedAST, format);
 
+    console.log('start...');
     db.exec('BEGIN');
     const start = performance.now();
-    await delegate.run(unplannedQuery as AnyQuery);
+    const data = await delegate.run(plannedQuery as AnyQuery);
     const end = performance.now();
     console.log('duration ', end - start);
     db.exec('ROLLBACK');
+    console.log(data);
 
     summary(() => {
       // bench(`unplanned: ${name}`, async () => {
@@ -127,7 +140,11 @@ if (!dbPath) {
 
   await benchmarkQuery(
     'full issue scan + join',
-    builder.issue.related('creator').related('assignee'),
+    builder.issue
+      .whereExists('project', q => q.where('name', 'gatewaycore'), {
+        scalar: true,
+      })
+      .limit(100),
   );
 
   // run all reads in an explicit tx
