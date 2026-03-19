@@ -25,9 +25,7 @@ import {
   clientToServer,
   serverToClient,
 } from '../../zero-schema/src/name-mapper.ts';
-import {
-  buildPipeline,
-} from '../../zql/src/builder/builder.ts';
+import {buildPipeline} from '../../zql/src/builder/builder.ts';
 import type {Node} from '../../zql/src/ivm/data.ts';
 import {skipYields} from '../../zql/src/ivm/operator.ts';
 import {resolveSimpleScalarSubqueries} from '../../zqlite/src/resolve-scalar-subqueries.ts';
@@ -119,11 +117,12 @@ if (!dbPath) {
     const tableName = unplannedAST.table as TTable;
     const format = asQueryInternals(query).format;
 
-    let mappedAST = mapAST(unplannedAST, clientToServerMapper);
+    const mappedAST = mapAST(unplannedAST, clientToServerMapper);
     const executor = (
       subqueryAST: AST,
       childField: string,
     ): LiteralValue | null | undefined => {
+      console.log('RUNNING EXECUTOR');
       const input = buildPipeline(subqueryAST, delegate, 'scalar-subquery');
       let node: Node | undefined;
       for (const n of skipYields(input.fetch({}))) {
@@ -135,13 +134,12 @@ if (!dbPath) {
         : undefined;
     };
 
-    const resolved = resolveSimpleScalarSubqueries(
+    const {ast: resolvedAST} = resolveSimpleScalarSubqueries(
       mappedAST,
       tableSpecs,
       executor,
     );
-    mappedAST = resolved.ast;
-    const mappedASTCopy = setFlipToFalseInAST(mappedAST);
+    const mappedASTCopy = setFlipToFalseInAST(resolvedAST);
     const dbg = new AccumulatorDebugger();
     const plannedServerAST = planQuery(mappedASTCopy, costModel, dbg);
     const plannedClientAST = mapAST(plannedServerAST, serverToClientMapper);
@@ -150,6 +148,7 @@ if (!dbPath) {
     // const unplannedQuery = createQuery(tableName, unplannedAST, format);
 
     console.log('start...');
+    console.log(plannedClientAST);
     db.exec('BEGIN');
     const start = performance.now();
     const data = await delegate.run(plannedQuery as AnyQuery);
@@ -171,7 +170,7 @@ if (!dbPath) {
   await benchmarkQuery(
     'full issue scan + join',
     builder.issue
-      .whereExists('project', q => q.where('name', 'gatewaycore'), {
+      .whereExists('project', q => q.where('lowerCaseName', 'gatewaycore'), {
         scalar: true,
       })
       .limit(100),
