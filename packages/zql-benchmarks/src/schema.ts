@@ -140,6 +140,11 @@ const issueRelationships = relationships(issue, ({many, one}) => ({
     destField: ['id'],
     destSchema: project,
   }),
+  issueLabels: many({
+    sourceField: ['id'],
+    destField: ['issueID'],
+    destSchema: issueLabel,
+  }),
   labels: many(
     {
       sourceField: ['id'],
@@ -207,6 +212,11 @@ const issueLabelRelationships = relationships(issueLabel, ({one}) => ({
     sourceField: ['issueID'],
     destField: ['id'],
     destSchema: issue,
+  }),
+  label: one({
+    sourceField: ['labelID'],
+    destField: ['id'],
+    destSchema: label,
   }),
 }));
 

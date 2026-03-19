@@ -148,7 +148,7 @@ if (!dbPath) {
     // const unplannedQuery = createQuery(tableName, unplannedAST, format);
 
     console.log('start...');
-    console.log(plannedClientAST);
+    console.log(JSON.stringify(plannedClientAST, null, 2));
     db.exec('BEGIN');
     const start = performance.now();
     const data = await delegate.run(plannedQuery as AnyQuery);
@@ -173,7 +173,33 @@ if (!dbPath) {
       .whereExists('project', q => q.where('lowerCaseName', 'gatewaycore'), {
         scalar: true,
       })
-      .limit(100),
+      .where(({and, exists}) =>
+        and(
+          ...['test', 'api-versioning'].map(label =>
+            exists(
+              'issueLabels',
+              q =>
+                q.whereExists(
+                  'label',
+                  q =>
+                    q
+                      .where('name', label)
+                      .whereExists(
+                        'project',
+                        q => q.where('lowerCaseName', 'gatewaycore'),
+                        {scalar: true},
+                      ),
+                  {
+                    scalar: true,
+                  },
+                ),
+              {scalar: true},
+            ),
+          ),
+        ),
+      )
+      .orderBy('modified', 'desc')
+      .limit(1),
   );
 
   // run all reads in an explicit tx
