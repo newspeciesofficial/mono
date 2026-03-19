@@ -5,7 +5,12 @@ import {testLogConfig} from '../../otel/src/test-log-config.ts';
 import {createSilentLogContext} from '../../shared/src/logging-test-utils.ts';
 import {computeZqlSpecs} from '../../zero-cache/src/db/lite-tables.ts';
 import type {LiteAndZqlSpec} from '../../zero-cache/src/db/specs.ts';
-import {mapAST, type AST, type Condition} from '../../zero-protocol/src/ast.ts';
+import {
+  mapAST,
+  type AST,
+  type Condition,
+  type LiteralValue,
+} from '../../zero-protocol/src/ast.ts';
 import {type Format} from '../../zql/src/ivm/default-format.ts';
 import {newQueryImpl} from '../../zql/src/query/query-impl.ts';
 import {asQueryInternals} from '../../zql/src/query/query-internals.ts';
@@ -20,6 +25,12 @@ import {
   clientToServer,
   serverToClient,
 } from '../../zero-schema/src/name-mapper.ts';
+import {
+  buildPipeline,
+} from '../../zql/src/builder/builder.ts';
+import type {Node} from '../../zql/src/ivm/data.ts';
+import {skipYields} from '../../zql/src/ivm/operator.ts';
+import {resolveSimpleScalarSubqueries} from '../../zqlite/src/resolve-scalar-subqueries.ts';
 
 const dbPath = process.env.ZBUGS_REPLICA_PATH;
 
@@ -109,7 +120,26 @@ if (!dbPath) {
     const format = asQueryInternals(query).format;
 
     let mappedAST = mapAST(unplannedAST, clientToServerMapper);
-    const resolved = resolveSimpleScalarSubqueries(mappedAST);
+    const executor = (
+      subqueryAST: AST,
+      childField: string,
+    ): LiteralValue | null | undefined => {
+      const input = buildPipeline(subqueryAST, delegate, 'scalar-subquery');
+      let node: Node | undefined;
+      for (const n of skipYields(input.fetch({}))) {
+        node ??= n;
+      }
+      input.destroy();
+      return node
+        ? ((node.row[childField] as LiteralValue) ?? null)
+        : undefined;
+    };
+
+    const resolved = resolveSimpleScalarSubqueries(
+      mappedAST,
+      tableSpecs,
+      executor,
+    );
     mappedAST = resolved.ast;
     const mappedASTCopy = setFlipToFalseInAST(mappedAST);
     const dbg = new AccumulatorDebugger();
