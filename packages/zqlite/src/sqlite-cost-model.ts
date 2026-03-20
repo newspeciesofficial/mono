@@ -41,6 +41,10 @@ export function createSQLiteCostModel(
   tableSpecs: Map<string, {zqlSpec: Record<string, SchemaValue>}>,
 ): ConnectionCostModel {
   const fanoutEstimator = new SQLiteStatFanout(db);
+
+  // Cache the total row count per table for computing per-lookup overhead.
+  const tableRowCounts = new Map<string, number>();
+
   return (
     tableName: string,
     sort: Ordering,
@@ -86,8 +90,32 @@ export function createSQLiteCostModel(
       `Expected scanstatus to return at least one loop for query: ${sql}`,
     );
 
-    const ret = estimateCost(loops, (columns: string[]) =>
-      fanoutEstimator.getFanout(tableName, columns),
+    // Get the total row count for this table (cached).
+    let totalTableRows = tableRowCounts.get(tableName);
+    if (totalTableRows === undefined) {
+      const unconstrained = buildSelectQuery(
+        tableName,
+        zqlSpec,
+        undefined,
+        undefined,
+        sort,
+        undefined,
+        undefined,
+      );
+      const unconstrainedSQL = compileInline(unconstrained);
+      const unconstrainedStmt = db.prepare(unconstrainedSQL);
+      const unconstrainedLoops = getScanstatusLoops(unconstrainedStmt);
+      totalTableRows =
+        unconstrainedLoops.length > 0
+          ? unconstrainedLoops.find(l => l.parentId === 0)?.est ?? 0
+          : 0;
+      tableRowCounts.set(tableName, totalTableRows);
+    }
+
+    const ret = estimateCost(
+      loops,
+      (columns: string[]) => fanoutEstimator.getFanout(tableName, columns),
+      totalTableRows,
     );
 
     return ret;
@@ -173,6 +201,7 @@ function getScanstatusLoops(stmt: Statement): ScanstatusLoop[] {
 function estimateCost(
   scanstats: ScanstatusLoop[],
   fanout: CostModelCost['fanout'],
+  totalTableRows: number,
 ): CostModelCost {
   // Sort by selectId to process in execution order
   const sorted = [...scanstats].sort((a, b) => a.selectId - b.selectId);
@@ -199,6 +228,25 @@ function estimateCost(
         totalCost += btreeCost(totalRows);
       }
     }
+  }
+
+  // Add per-lookup startup cost for constrained (indexed) queries.
+  //
+  // When this query is used as the inner table of a join, each iteration
+  // requires an independent B-tree traversal. The traversal depth is
+  // proportional to log(tableRows). We use log2 as a proxy that naturally
+  // scales with table size.
+  //
+  // This cost is critical for the semi-join vs flipped-join decision:
+  // - Semi-joins amortize the child's startupCost (prepare once, reuse)
+  // - Flipped joins pay the parent's startupCost per-iteration (concurrent
+  //   iterators prevent statement reuse in the current FlippedJoin impl)
+  //
+  // Without this, the planner treats a PK lookup on a 10M-row table as
+  // equally cheap as one on a 100-row table, leading to bad flip decisions
+  // on large tables.
+  if (totalTableRows > 1 && totalRows < totalTableRows) {
+    totalCost += Math.log2(totalTableRows);
   }
 
   return {

@@ -63,33 +63,35 @@ if (!dbPath) {
   // Create SQLite delegate
   const delegate = newQueryDelegate(lc, testLogConfig, db, schema);
 
-  // Helper to set flip to false in all correlated subquery conditions
-  function setFlipToFalse(condition: Condition): Condition {
+  // Helper to clear flip in all correlated subquery conditions so
+  // the planner is free to decide.  flip must be `undefined` (not
+  // `false`) because `false` is an explicit "do not flip" override.
+  function clearFlip(condition: Condition): Condition {
     if (condition.type === 'correlatedSubquery') {
       return {
         ...condition,
-        flip: false,
+        flip: undefined,
         related: {
           ...condition.related,
-          subquery: setFlipToFalseInAST(condition.related.subquery),
+          subquery: clearFlipInAST(condition.related.subquery),
         },
       };
     } else if (condition.type === 'and' || condition.type === 'or') {
       return {
         ...condition,
-        conditions: condition.conditions.map(setFlipToFalse),
+        conditions: condition.conditions.map(clearFlip),
       };
     }
     return condition;
   }
 
-  function setFlipToFalseInAST(ast: AST): AST {
+  function clearFlipInAST(ast: AST): AST {
     return {
       ...ast,
-      where: ast.where ? setFlipToFalse(ast.where) : undefined,
+      where: ast.where ? clearFlip(ast.where) : undefined,
       related: ast.related?.map(r => ({
         ...r,
-        subquery: setFlipToFalseInAST(r.subquery),
+        subquery: clearFlipInAST(r.subquery),
       })),
     };
   }
@@ -139,7 +141,7 @@ if (!dbPath) {
       tableSpecs,
       executor,
     );
-    const mappedASTCopy = setFlipToFalseInAST(resolvedAST);
+    const mappedASTCopy = clearFlipInAST(resolvedAST);
     const dbg = new AccumulatorDebugger();
     const plannedServerAST = planQuery(mappedASTCopy, costModel, dbg);
     const plannedClientAST = mapAST(plannedServerAST, serverToClientMapper);

@@ -363,9 +363,13 @@ export class PlannerJoin {
                   ? 0
                   : parent.limit / downstreamChildSelectivity,
               ),
+        // In a semi-join the child prepared statement is reused across
+        // iterations (bind/step/reset), so its startupCost is amortized
+        // (paid once, not per parent row).
         cost:
           parent.cost +
-          parent.scanEst * (child.startupCost + child.cost + child.scanEst),
+          child.startupCost +
+          parent.scanEst * (child.cost + child.scanEst),
         returnedRows: parent.returnedRows * child.selectivity,
         selectivity: child.selectivity * parent.selectivity,
         limit: parent.limit,
@@ -383,6 +387,10 @@ export class PlannerJoin {
                   ? 0
                   : parent.limit / downstreamChildSelectivity,
               ),
+        // In a flipped join the parent's startupCost is paid per-iteration
+        // because FlippedJoin creates concurrent parent iterators that
+        // each require their own prepared statement (the statement cache
+        // cannot recycle statements still held by open iterators).
         cost:
           child.cost +
           child.scanEst * (parent.startupCost + parent.cost + parent.scanEst),
