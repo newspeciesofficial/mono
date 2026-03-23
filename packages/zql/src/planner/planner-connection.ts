@@ -70,6 +70,7 @@ export class PlannerConnection {
   readonly #baseConstraints: PlannerConstraint | undefined; // Constraints from parent correlation
   readonly #baseLimit: number | undefined; // Original limit from query structure (never modified)
   readonly selectivity: number; // Fraction of rows passing filters (1.0 = no filtering)
+  readonly filteredRowCount: number | undefined; // Raw filtered row count from cost model
   #output?: PlannerNode | undefined; // Set once during graph construction
 
   // ========================================================================
@@ -94,11 +95,13 @@ export class PlannerConnection {
   readonly #isRoot: boolean;
 
   /**
-   * Cached per-constraint costs to avoid redundant cost model calls.
-   * Maps constraint key (branch pattern string) to computed cost.
+   * Cached per-constraint base costs (dcs-independent fields) to avoid
+   * redundant cost model calls. scanEst is NOT cached here because it
+   * depends on downstreamChildSelectivity which varies between calls.
    * Invalidated when constraints change.
    */
-  #cachedConstraintCosts: Map<string, CostEstimate> = new Map();
+  #cachedConstraintCosts: Map<string, Omit<CostEstimate, 'scanEst'>> =
+    new Map();
 
   constructor(
     table: string,
@@ -130,9 +133,11 @@ export class PlannerConnection {
         costWithoutFilters.rows > 0
           ? costWithFilters.rows / costWithoutFilters.rows
           : 1.0;
+      this.filteredRowCount = costWithFilters.rows;
     } else {
       // Root connections or connections without filters
       this.selectivity = 1.0;
+      this.filteredRowCount = undefined;
     }
   }
 
@@ -192,38 +197,45 @@ export class PlannerConnection {
     // Branch pattern specified - return cost for this specific branch
     const key = branchPattern.join(',');
 
-    // Check per-constraint cache first
-    let cost = this.#cachedConstraintCosts.get(key);
-    if (cost !== undefined) {
-      return cost;
+    // Check per-constraint cache for dcs-independent fields
+    let baseCost = this.#cachedConstraintCosts.get(key);
+    if (!baseCost) {
+      // Cache miss - compute and cache
+      const constraint = this.#constraints.get(key);
+      // Merge base constraints with propagated constraints
+      const mergedConstraint = mergeConstraints(
+        this.#baseConstraints,
+        constraint,
+      );
+      const {startupCost, fanout, rows} = this.#model(
+        this.table,
+        this.#sort,
+        this.#filters,
+        mergedConstraint,
+      );
+      baseCost = {
+        startupCost,
+        cost: 0,
+        returnedRows: rows,
+        selectivity: this.selectivity,
+        limit: this.limit,
+        filteredRowCount: this.filteredRowCount,
+        fanout,
+      };
+      this.#cachedConstraintCosts.set(key, baseCost);
     }
 
-    // Cache miss - compute and cache
-    const constraint = this.#constraints.get(key);
-    // Merge base constraints with propagated constraints
-    const mergedConstraint = mergeConstraints(
-      this.#baseConstraints,
-      constraint,
-    );
-    const {startupCost, fanout, rows} = this.#model(
-      this.table,
-      this.#sort,
-      this.#filters,
-      mergedConstraint,
-    );
-    cost = {
-      startupCost,
+    // Compute scanEst fresh each call since it depends on dcs
+    const cost: CostEstimate = {
+      ...baseCost,
       scanEst:
         this.limit === undefined
-          ? rows
-          : Math.min(rows, this.limit / downstreamChildSelectivity),
-      cost: 0,
-      returnedRows: rows,
-      selectivity: this.selectivity,
-      limit: this.limit,
-      fanout,
+          ? baseCost.returnedRows
+          : Math.min(
+              baseCost.returnedRows,
+              baseCost.limit! / downstreamChildSelectivity,
+            ),
     };
-    this.#cachedConstraintCosts.set(key, cost);
 
     if (planDebugger) {
       planDebugger.log({
@@ -319,8 +331,9 @@ export class PlannerConnection {
   /** Get estimated cost for each constraint branch. */
   getConstraintCostsForDebug(): Record<string, CostEstimate> {
     const record: Record<string, CostEstimate> = {};
-    for (const [key, value] of this.#cachedConstraintCosts) {
-      record[key] = value;
+    for (const [key, baseCost] of this.#cachedConstraintCosts) {
+      // Add scanEst as returnedRows for debug display (scanEst without dcs)
+      record[key] = {...baseCost, scanEst: baseCost.returnedRows};
     }
     return record;
   }

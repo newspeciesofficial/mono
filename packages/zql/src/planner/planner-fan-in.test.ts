@@ -47,6 +47,7 @@ suite('PlannerFanIn', () => {
       returnedRows: 100,
       selectivity: 1.0,
       limit: undefined,
+      filteredRowCount: undefined,
       fanout: expect.any(Function),
     };
     expect(inputs[0].estimateCost(1, [])).toStrictEqual(baseCost);
@@ -66,6 +67,7 @@ suite('PlannerFanIn', () => {
       returnedRows: 100,
       selectivity: 1.0,
       limit: undefined,
+      filteredRowCount: undefined,
       fanout: expect.any(Function),
     };
     expect(inputs[0].estimateCost(1, [])).toStrictEqual(baseCost);

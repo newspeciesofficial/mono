@@ -1,6 +1,5 @@
 import {assert, unreachable} from '../../../shared/src/asserts.ts';
 import {binarySearch} from '../../../shared/src/binary-search.ts';
-import {emptyArray} from '../../../shared/src/sentinels.ts';
 import type {CompoundKey, System} from '../../../zero-protocol/src/ast.ts';
 import type {Value} from '../../../zero-protocol/src/data.ts';
 import type {Change} from './change.ts';
@@ -155,156 +154,103 @@ export class FlippedJoin implements Input {
       );
       childNodes.splice(insertPos, 0, removedNode);
     }
-    const parentIterators: Iterator<Node | 'yield'>[] = [];
-    let threw = false;
-    try {
-      for (const childNode of childNodes) {
-        // TODO: consider adding the ability to pass a set of
-        // ids to fetch, and have them applied to sqlite using IN.
-        const constraintFromChild = buildJoinConstraint(
-          childNode.row,
-          this.#childKey,
-          this.#parentKey,
-        );
-        if (
-          !constraintFromChild ||
-          (req.constraint &&
-            !constraintsAreCompatible(constraintFromChild, req.constraint))
-        ) {
-          parentIterators.push(emptyArray[Symbol.iterator]());
+    // Eagerly fetch parents one child at a time, grouping by parent PK.
+    // Each parent iterator is fully consumed before the next starts,
+    // so only 1 parent statement is active at a time → full cache reuse.
+    const pk = this.#parent.getSchema().primaryKey;
+    type CollectedParent = {parent: Node; childIndexes: number[]};
+    const parentsByKey = new Map<string, CollectedParent>();
+
+    for (let childIdx = 0; childIdx < childNodes.length; childIdx++) {
+      const childNode = childNodes[childIdx];
+      const constraintFromChild = buildJoinConstraint(
+        childNode.row,
+        this.#childKey,
+        this.#parentKey,
+      );
+      if (
+        !constraintFromChild ||
+        (req.constraint &&
+          !constraintsAreCompatible(constraintFromChild, req.constraint))
+      ) {
+        continue;
+      }
+
+      for (const parentNode of this.#parent.fetch({
+        ...req,
+        constraint: {...req.constraint, ...constraintFromChild},
+      })) {
+        if (parentNode === 'yield') {
+          yield 'yield';
+          continue;
+        }
+        const key = JSON.stringify(pk.map(k => parentNode.row[k]));
+        const existing = parentsByKey.get(key);
+        if (existing) {
+          existing.childIndexes.push(childIdx);
         } else {
-          const stream = this.#parent.fetch({
-            ...req,
-            constraint: {
-              ...req.constraint,
-              ...constraintFromChild,
-            },
-          });
-          const iterator = stream[Symbol.iterator]();
-          parentIterators.push(iterator);
+          parentsByKey.set(key, {parent: parentNode, childIndexes: [childIdx]});
         }
       }
-      const nextParentNodes: (Node | null)[] = [];
-      for (let i = 0; i < parentIterators.length; i++) {
-        const iter = parentIterators[i];
-        let result = iter.next();
-        // yield yields when initializing
-        while (!result.done && result.value === 'yield') {
-          yield result.value;
-          result = iter.next();
+    }
+
+    // Sort collected parents in output order.
+    const sortedParents = [...parentsByKey.values()];
+    const compare = this.#schema.compareRows;
+    sortedParents.sort(
+      (a, b) => compare(a.parent.row, b.parent.row) * (req.reverse ? -1 : 1),
+    );
+
+    // Yield sorted parents with overlay logic.
+    for (const {parent: minParentNode, childIndexes} of sortedParents) {
+      const relatedChildNodes: Node[] = childIndexes.map(i => childNodes[i]);
+
+      let overlaidRelatedChildNodes = relatedChildNodes;
+      if (
+        this.#inprogressChildChange &&
+        this.#inprogressChildChange.position &&
+        isJoinMatch(
+          this.#inprogressChildChange.change.node.row,
+          this.#childKey,
+          minParentNode.row,
+          this.#parentKey,
+        )
+      ) {
+        const hasInprogressChildChangeBeenPushedForMinParentNode =
+          this.#parent
+            .getSchema()
+            .compareRows(
+              minParentNode.row,
+              this.#inprogressChildChange.position,
+            ) <= 0;
+        if (this.#inprogressChildChange.change.type === 'remove') {
+          if (hasInprogressChildChangeBeenPushedForMinParentNode) {
+            // Remove from relatedChildNodes since the removed child
+            // was inserted into childNodes above.
+            overlaidRelatedChildNodes = relatedChildNodes.filter(
+              n => n !== this.#inprogressChildChange?.change.node,
+            );
+          }
+        } else if (!hasInprogressChildChangeBeenPushedForMinParentNode) {
+          overlaidRelatedChildNodes = [
+            ...generateWithOverlayNoYield(
+              relatedChildNodes,
+              this.#inprogressChildChange.change,
+              this.#child.getSchema(),
+            ),
+          ];
         }
-        nextParentNodes[i] = result.done ? null : (result.value as Node);
       }
 
-      while (true) {
-        let minParentNode = null;
-        let minParentNodeChildIndexes: number[] = [];
-        for (let i = 0; i < nextParentNodes.length; i++) {
-          const parentNode = nextParentNodes[i];
-          if (parentNode === null) {
-            continue;
-          }
-          if (minParentNode === null) {
-            minParentNode = parentNode;
-            minParentNodeChildIndexes.push(i);
-          } else {
-            const compareResult =
-              this.#schema.compareRows(parentNode.row, minParentNode.row) *
-              (req.reverse ? -1 : 1);
-            if (compareResult === 0) {
-              minParentNodeChildIndexes.push(i);
-            } else if (compareResult < 0) {
-              minParentNode = parentNode;
-              minParentNodeChildIndexes = [i];
-            }
-          }
-        }
-        if (minParentNode === null) {
-          return;
-        }
-        const relatedChildNodes: Node[] = [];
-        for (const minParentNodeChildIndex of minParentNodeChildIndexes) {
-          relatedChildNodes.push(childNodes[minParentNodeChildIndex]);
-          const iter = parentIterators[minParentNodeChildIndex];
-          let result = iter.next();
-          // yield yields when advancing
-          while (!result.done && result.value === 'yield') {
-            yield result.value;
-            result = iter.next();
-          }
-          nextParentNodes[minParentNodeChildIndex] = result.done
-            ? null
-            : (result.value as Node);
-        }
-        let overlaidRelatedChildNodes = relatedChildNodes;
-        if (
-          this.#inprogressChildChange &&
-          this.#inprogressChildChange.position &&
-          isJoinMatch(
-            this.#inprogressChildChange.change.node.row,
-            this.#childKey,
-            minParentNode.row,
-            this.#parentKey,
-          )
-        ) {
-          const hasInprogressChildChangeBeenPushedForMinParentNode =
-            this.#parent
-              .getSchema()
-              .compareRows(
-                minParentNode.row,
-                this.#inprogressChildChange.position,
-              ) <= 0;
-          if (this.#inprogressChildChange.change.type === 'remove') {
-            if (hasInprogressChildChangeBeenPushedForMinParentNode) {
-              // Remove form relatedChildNodes since the removed child
-              // was inserted into childNodes above.
-              overlaidRelatedChildNodes = relatedChildNodes.filter(
-                n => n !== this.#inprogressChildChange?.change.node,
-              );
-            }
-          } else if (!hasInprogressChildChangeBeenPushedForMinParentNode) {
-            overlaidRelatedChildNodes = [
-              ...generateWithOverlayNoYield(
-                relatedChildNodes,
-                this.#inprogressChildChange.change,
-                this.#child.getSchema(),
-              ),
-            ];
-          }
-        }
-
-        // yield node if after the overlay it still has relationship nodes
-        if (overlaidRelatedChildNodes.length > 0) {
-          yield {
-            ...minParentNode,
-            relationships: {
-              ...minParentNode.relationships,
-              [this.#relationshipName]: () => overlaidRelatedChildNodes,
-            },
-          };
-        }
-      }
-    } catch (e) {
-      threw = true;
-      for (const iter of parentIterators) {
-        try {
-          iter.throw?.(e);
-        } catch (_cleanupError) {
-          // error in the iter.throw cleanup,
-          // catch so other iterators are cleaned up
-        }
-      }
-      throw e;
-    } finally {
-      if (!threw) {
-        for (const iter of parentIterators) {
-          try {
-            iter.return?.();
-          } catch (_cleanupError) {
-            // error in the iter.return cleanup,
-            // catch so other iterators are cleaned up
-          }
-        }
+      // yield node if after the overlay it still has relationship nodes
+      if (overlaidRelatedChildNodes.length > 0) {
+        yield {
+          ...minParentNode,
+          relationships: {
+            ...minParentNode.relationships,
+            [this.#relationshipName]: () => overlaidRelatedChildNodes,
+          },
+        };
       }
     }
   }

@@ -47,6 +47,7 @@ suite('PlannerFanOut', () => {
       returnedRows: 100,
       selectivity: 1.0,
       limit: undefined,
+      filteredRowCount: undefined,
       fanout: expect.any(Function),
     });
   });

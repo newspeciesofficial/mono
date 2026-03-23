@@ -316,7 +316,7 @@ export class PlannerJoin {
     // likely to hit a comment compared to if an issue has 1 comment on average.
     // If an index is all nulls (no parents match any children)
     // this will collapse to 0.
-    const scaledChildSelectivity =
+    const formulaSelectivity =
       1 - Math.pow(1 - child.selectivity, fanoutFactor.fanout);
 
     // Why do we not need fanout in the other direction?
@@ -325,6 +325,33 @@ export class PlannerJoin {
     // Flipped-join already accounts for this because the child selectivity is implicitly accounted
     // for. The returned row estimate of the child is already representative of how many
     // rows the child will have post-filtering.
+
+    // For semi-joins, compute ratio-based selectivity to capture correlation
+    // between parent and child filters. The formula-based selectivity assumes
+    // independence, but when filters are correlated (e.g., project-scoped
+    // labels), the ratio child.filteredRowCount / parent.returnedRows gives
+    // a better estimate.
+    let scaledChildSelectivity = formulaSelectivity;
+    if (
+      this.#type === 'semi' &&
+      child.filteredRowCount !== undefined &&
+      child.filteredRowCount > 0
+    ) {
+      // Get parent estimate with only downstream selectivity (not this child's)
+      // to get the parent's returnedRows before this semi-join's filtering.
+      const parentInitial = this.#parent.estimateCost(
+        downstreamChildSelectivity,
+        branchPattern,
+        planDebugger,
+      );
+      if (parentInitial.returnedRows > 0) {
+        const ratioSelectivity = Math.min(
+          1,
+          child.filteredRowCount / parentInitial.returnedRows,
+        );
+        scaledChildSelectivity = Math.max(formulaSelectivity, ratioSelectivity);
+      }
+    }
 
     /**
      * How selective is the graph from this point forward?
@@ -337,7 +364,7 @@ export class PlannerJoin {
      * when trying to satisfy downstream constraints and a limit.
      *
      * NOTE: We do not know if the probabilities are correlated so we assume independence.
-     * This is a fundamental limitation of the planner.
+     * The ratio-based selectivity above partially mitigates this limitation.
      */
     const parent = this.#parent.estimateCost(
       // Selectivity flows up the graph from child to parent
@@ -370,9 +397,14 @@ export class PlannerJoin {
           parent.cost +
           child.startupCost +
           parent.scanEst * (child.cost + child.scanEst),
-        returnedRows: parent.returnedRows * child.selectivity,
-        selectivity: child.selectivity * parent.selectivity,
+        // Use scaledChildSelectivity (per-parent probability of having a
+        // matching child) rather than child.selectivity (per-row in child
+        // table). These are conceptually different — the semi-join
+        // selectivity IS the scaled value.
+        returnedRows: parent.returnedRows * scaledChildSelectivity,
+        selectivity: scaledChildSelectivity * parent.selectivity,
         limit: parent.limit,
+        filteredRowCount: child.filteredRowCount,
         fanout: parent.fanout,
       };
     } else {
@@ -387,18 +419,18 @@ export class PlannerJoin {
                   ? 0
                   : parent.limit / downstreamChildSelectivity,
               ),
-        // In a flipped join the parent's startupCost is paid per-iteration
-        // because FlippedJoin creates concurrent parent iterators that
-        // each require their own prepared statement (the statement cache
-        // cannot recycle statements still held by open iterators).
+        // After load-then-sort: parent statement is reused across iterations.
+        // startupCost is paid once, not per child row.
         cost:
           child.cost +
-          child.scanEst * (parent.startupCost + parent.cost + parent.scanEst),
+          parent.startupCost +
+          child.scanEst * (parent.cost + parent.scanEst),
         // the child selectivity is not relevant here because it has already been taken into account via the flipping.
         // I.e., `child.returnedRows` is the estimated number of rows produced by the child _after_ taking filtering into account.
         returnedRows: parent.returnedRows * child.returnedRows,
         selectivity: parent.selectivity * child.selectivity,
         limit: parent.limit,
+        filteredRowCount: child.filteredRowCount,
         fanout: parent.fanout,
       };
     }

@@ -92,6 +92,7 @@ suite('Planner Pipeline Integration', () => {
       returnedRows: 100,
       selectivity: 1.0,
       limit: undefined,
+      filteredRowCount: undefined,
       fanout: expect.any(Function),
     });
 
@@ -189,6 +190,7 @@ suite('Planner Pipeline Integration', () => {
       returnedRows: 100,
       selectivity: 1.0,
       limit: undefined,
+      filteredRowCount: undefined,
       fanout: expect.any(Function),
     });
 
@@ -285,6 +287,7 @@ suite('Planner Pipeline Integration', () => {
       returnedRows: 100,
       selectivity: 1.0,
       limit: undefined,
+      filteredRowCount: undefined,
       fanout: expect.any(Function),
     };
     expect(normalCost).toStrictEqual(baseCost);
@@ -508,6 +511,7 @@ suite('Planner Pipeline Integration', () => {
       returnedRows: 100,
       selectivity: 1.0,
       limit: undefined,
+      filteredRowCount: undefined,
       fanout: expect.any(Function),
     };
     expect(normalCost).toStrictEqual(baseCost);

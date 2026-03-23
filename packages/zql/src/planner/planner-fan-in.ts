@@ -92,6 +92,7 @@ export class PlannerFanIn {
       startupCost: 0,
       selectivity: 0,
       limit: undefined,
+      filteredRowCount: undefined,
       fanout: () => {
         throw new Error('Failed to set fanout model');
       },

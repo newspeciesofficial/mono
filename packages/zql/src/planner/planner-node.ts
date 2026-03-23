@@ -52,6 +52,15 @@ export type CostEstimate = {
   selectivity: number;
   limit: number | undefined;
 
+  /**
+   * The number of rows after applying filters (before limit/scan constraints).
+   * For connections with filters, this is the raw filtered row count from the
+   * cost model. Used by semi-join selectivity estimation to compute
+   * ratio-based selectivity (filteredRowCount / parentReturnedRows) which
+   * captures correlation between parent and child filters.
+   */
+  filteredRowCount: number | undefined;
+
   fanout: FanoutCostModel;
 };
 

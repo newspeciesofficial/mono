@@ -80,6 +80,7 @@ export function expectedCost(constraintCount: number): CostEstimate {
     returnedRows: c,
     selectivity: 1.0,
     limit: undefined,
+    filteredRowCount: undefined,
     fanout,
   };
 }
@@ -92,6 +93,7 @@ export function multCost(base: CostEstimate, factor: number): CostEstimate {
     returnedRows: base.returnedRows * factor,
     selectivity: base.selectivity,
     limit: base.limit,
+    filteredRowCount: base.filteredRowCount,
     fanout,
   };
 }

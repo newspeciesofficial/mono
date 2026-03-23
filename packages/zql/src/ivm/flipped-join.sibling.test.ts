@@ -154,30 +154,21 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
         ],
         [
           "0",
-          "fetch",
+          "fetchCount",
           {
             "constraint": {
               "id": "i1",
               "ownerId": "o2",
             },
           },
+          0,
         ],
         [
           "0",
           "fetch",
           {
             "constraint": {
-              "id": "i2",
-              "ownerId": "o2",
-            },
-          },
-        ],
-        [
-          "0",
-          "fetch",
-          {
-            "constraint": {
-              "id": "i2",
+              "id": "i1",
               "ownerId": "o2",
             },
           },
@@ -195,14 +186,13 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
         ],
         [
           "0",
-          "fetchCount",
+          "fetch",
           {
             "constraint": {
-              "id": "i1",
+              "id": "i2",
               "ownerId": "o2",
             },
           },
-          0,
         ],
         [
           "0",
@@ -214,6 +204,16 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
             },
           },
           1,
+        ],
+        [
+          "0",
+          "fetch",
+          {
+            "constraint": {
+              "id": "i2",
+              "ownerId": "o2",
+            },
+          },
         ],
         [
           "0",
@@ -457,30 +457,21 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
         ],
         [
           "0",
-          "fetch",
+          "fetchCount",
           {
             "constraint": {
               "id": "i1",
               "ownerId": "o2",
             },
           },
+          0,
         ],
         [
           "0",
           "fetch",
           {
             "constraint": {
-              "id": "i2",
-              "ownerId": "o2",
-            },
-          },
-        ],
-        [
-          "0",
-          "fetch",
-          {
-            "constraint": {
-              "id": "i2",
+              "id": "i1",
               "ownerId": "o2",
             },
           },
@@ -498,14 +489,13 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
         ],
         [
           "0",
-          "fetchCount",
+          "fetch",
           {
             "constraint": {
-              "id": "i1",
+              "id": "i2",
               "ownerId": "o2",
             },
           },
-          0,
         ],
         [
           "0",
@@ -517,6 +507,16 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
             },
           },
           1,
+        ],
+        [
+          "0",
+          "fetch",
+          {
+            "constraint": {
+              "id": "i2",
+              "ownerId": "o2",
+            },
+          },
         ],
         [
           "0",
@@ -992,30 +992,21 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
           ],
           [
             "0",
-            "fetch",
+            "fetchCount",
             {
               "constraint": {
                 "id": "i1",
                 "ownerId": "o2",
               },
             },
+            0,
           ],
           [
             "0",
             "fetch",
             {
               "constraint": {
-                "id": "i2",
-                "ownerId": "o2",
-              },
-            },
-          ],
-          [
-            "0",
-            "fetch",
-            {
-              "constraint": {
-                "id": "i2",
+                "id": "i1",
                 "ownerId": "o2",
               },
             },
@@ -1033,14 +1024,13 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
           ],
           [
             "0",
-            "fetchCount",
+            "fetch",
             {
               "constraint": {
-                "id": "i1",
+                "id": "i2",
                 "ownerId": "o2",
               },
             },
-            0,
           ],
           [
             "0",
@@ -1052,6 +1042,16 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
               },
             },
             1,
+          ],
+          [
+            "0",
+            "fetch",
+            {
+              "constraint": {
+                "id": "i2",
+                "ownerId": "o2",
+              },
+            },
           ],
           [
             "0",
