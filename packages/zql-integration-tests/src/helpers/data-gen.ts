@@ -96,6 +96,10 @@ export function getDataForType(faker: Faker, rng: Rng, column: ColumnInfo) {
     }
   }
 
+  if (column.isEnum) {
+    return faker.string.alphanumeric(10);
+  }
+
   // remove the length of the type e.g., char(10) -> char
   const type = column.pgType.replace(/\(.*\)/, '');
   switch (type) {

@@ -152,12 +152,15 @@ function augmentQuery(
       }
 
       let detailedType: string | undefined;
+      let isEnum = false;
       if (serverSchema) {
         const serverTable = schema.tables[tableName].serverName ?? tableName;
         const serverColumn =
           schema.tables[tableName].columns[columnName].serverName ?? columnName;
 
-        detailedType = serverSchema[serverTable]?.[serverColumn]?.type;
+        const serverColumnSchema = serverSchema[serverTable]?.[serverColumn];
+        detailedType = serverColumnSchema?.type;
+        isEnum = serverColumnSchema?.isEnum ?? false;
       }
 
       const value =
@@ -168,7 +171,7 @@ function augmentQuery(
             ? getDataForType(faker, rng, {
                 optional: !!column.optional,
                 pgType: detailedType,
-                isEnum: false,
+                isEnum,
                 isPrimaryKey: false,
                 name: columnName,
               })
