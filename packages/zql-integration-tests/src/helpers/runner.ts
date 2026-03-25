@@ -982,20 +982,25 @@ function assignRandomValues(
     if (schema.primaryKey.includes(col)) {
       continue;
     }
+    const serverCol =
+      mapper && tableName ? mapper.columnName(tableName, col) : undefined;
+    const serverColSchema =
+      serverCol && serverTableSchema
+        ? serverTableSchema[serverCol]
+        : undefined;
+
     // Enum columns must keep their existing value since PG rejects
     // invalid enum literals.
-    if (serverTableSchema && mapper && tableName) {
-      const serverCol = mapper.columnName(tableName, col);
-      if (serverTableSchema[serverCol]?.isEnum) {
-        continue;
-      }
+    if (serverColSchema?.isEnum) {
+      continue;
     }
+
     switch (colSchema.type) {
       case 'boolean':
         newRow[col] = Math.random() > 0.5;
         break;
       case 'number':
-        newRow[col] = Math.floor(Math.random() * 100);
+        newRow[col] = randomNumber(serverColSchema?.type);
         break;
       case 'string':
         newRow[col] = Math.random().toString(36).substring(7);
@@ -1011,6 +1016,41 @@ function assignRandomValues(
     }
   }
   return newRow;
+}
+
+/**
+ * Generates a random number compatible with the given PG type.
+ * Without PG type info, generates a small integer.
+ */
+function randomNumber(pgType: string | undefined): number {
+  switch (pgType) {
+    case 'date':
+      // Dates truncate to day boundaries. Generate a random day as
+      // milliseconds since epoch (multiple of 86400000).
+      return Math.floor(Math.random() * 20000) * 86_400_000;
+    case 'timestamp':
+    case 'timestamptz':
+    case 'timestamp with time zone':
+    case 'timestamp without time zone':
+      // Timestamps must be integers (milliseconds since epoch).
+      return Math.floor(Math.random() * 2_000_000_000_000);
+    case 'int2':
+    case 'smallint':
+      return Math.floor(Math.random() * 65535) - 32768;
+    case 'int4':
+    case 'integer':
+    case 'int':
+    case 'serial':
+    case 'serial4':
+      return Math.floor(Math.random() * 2_000_000) - 1_000_000;
+    case 'int8':
+    case 'bigint':
+    case 'bigserial':
+    case 'serial8':
+      return Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
+    default:
+      return Math.floor(Math.random() * 100);
+  }
 }
 
 async function checkEditToMatch(
