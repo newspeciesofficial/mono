@@ -55,7 +55,7 @@ export function fuzzHydrationTests(
       rng,
       query: generateShrinkableQuery(
         schema,
-        {},
+        Object.fromEntries(harness.dbs.raw),
         rng,
         faker,
         harness.delegates.pg.serverSchema,

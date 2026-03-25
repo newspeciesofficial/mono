@@ -27,7 +27,10 @@ import {executePostgresQuery} from '../../../zero-server/src/pg-query-executor.t
 import {getServerSchema} from '../../../zero-server/src/schema.ts';
 import {Transaction} from '../../../zero-server/src/test/util.ts';
 import type {Schema} from '../../../zero-types/src/schema.ts';
-import type {ServerSchema} from '../../../zero-types/src/server-schema.ts';
+import type {
+  ServerSchema,
+  ServerTableSchema,
+} from '../../../zero-types/src/server-schema.ts';
 import type {Change} from '../../../zql/src/ivm/change.ts';
 import type {Node} from '../../../zql/src/ivm/data.ts';
 import {
@@ -921,7 +924,15 @@ async function checkEditToRandom(
   async function run(table: string, row: Row) {
     seen.add(pullPrimaryKey(zqlSchema, table, row));
     const tableSchema = zqlSchema.tables[table];
-    const editedRow = assignRandomValues(tableSchema, row);
+    const serverTableName = delegates.mapper.tableName(table);
+    const serverTableSchema = delegates.pg.serverSchema[serverTableName];
+    const editedRow = assignRandomValues(
+      tableSchema,
+      row,
+      serverTableSchema,
+      delegates.mapper,
+      table,
+    );
     editedRows.push([table, [row, editedRow]]);
     const mappedRow = mapRow(row, table, delegates.mapper);
     const mappedEditedRow = mapRow(editedRow, table, delegates.mapper);
@@ -959,11 +970,25 @@ async function checkEditToRandom(
   return editedRows;
 }
 
-function assignRandomValues(schema: TableSchema, row: Row): Row {
+function assignRandomValues(
+  schema: TableSchema,
+  row: Row,
+  serverTableSchema: ServerTableSchema | undefined,
+  mapper: NameMapper | undefined,
+  tableName: string | undefined,
+): Row {
   const newRow: Record<string, ReadonlyJSONValue | undefined> = {...row};
   for (const [col, colSchema] of Object.entries(schema.columns)) {
     if (schema.primaryKey.includes(col)) {
       continue;
+    }
+    // Enum columns must keep their existing value since PG rejects
+    // invalid enum literals.
+    if (serverTableSchema && mapper && tableName) {
+      const serverCol = mapper.columnName(tableName, col);
+      if (serverTableSchema[serverCol]?.isEnum) {
+        continue;
+      }
     }
     switch (colSchema.type) {
       case 'boolean':

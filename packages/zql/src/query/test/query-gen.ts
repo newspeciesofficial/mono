@@ -9,7 +9,7 @@ import type {AnyQuery} from '../query.ts';
 import {newStaticQuery} from '../static-query.ts';
 import {randomValueForType, selectRandom, shuffle, type Rng} from './util.ts';
 export type Dataset = {
-  [table: string]: Row[];
+  [table: string]: readonly Row[];
 };
 
 export function generateQuery(
@@ -146,11 +146,6 @@ function augmentQuery(
       const tableData = data[tableName];
       const columnName = selectRandom(rng, columnNames);
       const column = table.columns[columnName];
-      const operator = selectRandom(rng, operatorsByType[column.type]);
-      if (!operator) {
-        continue;
-      }
-
       let detailedType: string | undefined;
       let isEnum = false;
       if (serverSchema) {
@@ -163,9 +158,23 @@ function augmentQuery(
         isEnum = serverColumnSchema?.isEnum ?? false;
       }
 
+      const allOperators = operatorsByType[column.type];
+      // PG enums don't support LIKE/ILIKE operators.
+      const operator = selectRandom(
+        rng,
+        isEnum
+          ? allOperators.filter(op => op !== 'LIKE' && op !== 'ILIKE')
+          : allOperators,
+      );
+      if (!operator) {
+        continue;
+      }
+
       const value =
-        // TODO: all these constants should be tunable.
-        rng() > 0.1 && tableData && tableData.length > 0
+        // Enum columns must use existing data since PG rejects
+        // invalid enum literals even in WHERE comparisons.
+        // For non-enum columns, 90% of the time use existing data.
+        (isEnum || rng() > 0.1) && tableData && tableData.length > 0
           ? selectRandom(rng, tableData)[columnName]
           : detailedType
             ? getDataForType(faker, rng, {
