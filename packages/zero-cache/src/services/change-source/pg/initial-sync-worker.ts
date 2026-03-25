@@ -174,10 +174,14 @@ async function runInit(initMsg: InitSyncRequest<'init'>) {
       } satisfies InitSyncResponse<'init'>);
 
       // Process commands from the main thread within the migration transaction.
-      await processCommands(lc, tx, must(pgParsers), tables);
+      // Returns the request id of the 'done' message so we can respond
+      // AFTER the migration framework commits.
+      doneRequestId = await processCommands(lc, tx, must(pgParsers), tables);
     },
     minSafeVersion: 1,
   };
+
+  let doneRequestId: number | undefined;
 
   try {
     await runSchemaMigrations(
@@ -187,6 +191,16 @@ async function runInit(initMsg: InitSyncRequest<'init'>) {
       setupMigration,
       schemaVersionMigrationMap,
     );
+
+    // Migration committed, ANALYZE complete, DB closed.
+    // Now it's safe to signal 'done' to the main thread.
+    if (doneRequestId !== undefined) {
+      port.postMessage({
+        id: doneRequestId,
+        method: 'done',
+        result: undefined,
+      } satisfies InitSyncResponse<'done'>);
+    }
   } catch (e) {
     port.postMessage({
       initSyncError: e instanceof Error ? e : new Error(String(e)),
@@ -203,18 +217,15 @@ async function processCommands(
   tx: Database,
   pgParsers: TypeParsers,
   tables: Map<string, TableCopyState>,
-) {
+): Promise<number> {
   for (;;) {
     const msg = await nextMessage();
     try {
       const result = handleCommand(lc, tx, pgParsers, tables, msg);
       if (msg.method === 'done') {
-        port.postMessage({
-          id: msg.id,
-          method: msg.method,
-          result: undefined,
-        } satisfies InitSyncResponse);
-        return; // Return from migrateSchema → migration framework commits
+        // Don't respond yet — the migration framework needs to COMMIT first.
+        // Return the request id so runInit can respond after commit.
+        return msg.id;
       }
       if (msg.method === 'abort') {
         throw new AbortSignal();
@@ -308,7 +319,14 @@ function handleCommand(
     }
 
     case 'writeChunk': {
-      const [tableName, chunk] = msg.args as InitSyncArgsMap['writeChunk'];
+      const [tableName, rawChunk] = msg.args as InitSyncArgsMap['writeChunk'];
+      // postMessage serializes Buffer as Uint8Array; wrap it back into a
+      // Buffer so TsvParser.parse() can call .toString('utf8', l, r).
+      const chunk = Buffer.from(
+        rawChunk.buffer,
+        rawChunk.byteOffset,
+        rawChunk.byteLength,
+      );
       const state = must(tables.get(tableName));
       const rowsBefore = state.totalRows;
 
