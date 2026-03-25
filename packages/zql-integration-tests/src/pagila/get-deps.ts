@@ -72,6 +72,21 @@ export async function getPagila(): Promise<string> {
     // Remove all pg_catalog function calls (set_config, setval, etc.)
     .replace(/SELECT pg_catalog\.[^;]+;/g, '');
 
+  // The fulltext column on film is NOT NULL and was populated by a trigger
+  // we stripped. Drop the constraint so push tests can re-insert film rows
+  // without providing it.
+  processedSchema +=
+    '\nALTER TABLE film ALTER COLUMN fulltext DROP NOT NULL;\n';
+
+  // Drop check constraints (e.g. year_check on the year domain).
+  // Push tests generate random values that may violate these constraints,
+  // and we're testing IVM correctness, not PG constraint validation.
+  // Match CONSTRAINT name CHECK (...) handling nested parentheses.
+  processedSchema = processedSchema.replace(
+    /CONSTRAINT\s+\w+\s+CHECK\s*\((?:[^()]*|\((?:[^()]*|\([^()]*\))*\))*\)/g,
+    '',
+  );
+
   // Combine schema and data
   const content = processedSchema + '\n\n' + processedData;
 
