@@ -21,7 +21,7 @@ const byKeys = (a: [string, unknown], b: [string, unknown]) =>
   a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
 
 export class ReplicationStatusPublisher {
-  readonly #db: Database;
+  readonly #db: Database | undefined;
   readonly #publish: typeof publishCriticalEvent;
   #timer: NodeJS.Timeout | undefined;
 
@@ -29,7 +29,7 @@ export class ReplicationStatusPublisher {
     return new ReplicationStatusPublisher(db ?? new Database(lc, ':memory:'));
   }
 
-  constructor(db: Database, publishFn = publishCriticalEvent) {
+  constructor(db: Database | undefined, publishFn = publishCriticalEvent) {
     this.#db = db;
     this.#publish = publishFn;
   }

@@ -1,5 +1,6 @@
 import type {LogContext} from '@rocicorp/logger';
 import {SqliteError} from '@rocicorp/zero-sqlite3';
+import type {LogConfig} from '../../../../../shared/src/logging.ts';
 import type {Database} from '../../../../../zqlite/src/db.ts';
 import {listTables} from '../../../db/lite-tables.ts';
 import {
@@ -13,6 +14,8 @@ import {
   CREATE_RUNTIME_EVENTS_TABLE,
   recordEvent,
 } from '../../replicator/schema/replication-state.ts';
+import type {InitSyncWriter} from '../pg/initial-sync.ts';
+import {InitSyncWorkerClient} from '../pg/initial-sync-worker-client.ts';
 
 export async function initReplica(
   log: LogContext,
@@ -38,6 +41,38 @@ export async function initReplica(
       throw new AutoResetSignal(e.message);
     }
     throw e;
+  }
+}
+
+/**
+ * Like {@link initReplica}, but runs the migration and all SQLite writes
+ * in a worker thread so that the main event loop stays free for PG I/O.
+ */
+export async function initReplicaWithWorker(
+  log: LogContext,
+  debugName: string,
+  dbPath: string,
+  upstreamURI: string,
+  doInitialSync: (lc: LogContext, writer: InitSyncWriter) => Promise<void>,
+  logConfig: LogConfig,
+): Promise<void> {
+  const worker = new InitSyncWorkerClient();
+  try {
+    await worker.init(dbPath, debugName, upstreamURI, logConfig);
+    await doInitialSync(log, worker);
+    await worker.done();
+  } catch (e) {
+    try {
+      worker.abort();
+    } catch {
+      /* ignore */
+    }
+    if (e instanceof SqliteError && e.code === 'SQLITE_CORRUPT') {
+      throw new AutoResetSignal(e.message);
+    }
+    throw e;
+  } finally {
+    await worker.terminate();
   }
 }
 

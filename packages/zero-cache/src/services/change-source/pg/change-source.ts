@@ -5,6 +5,7 @@ import {
 import type {LogContext} from '@rocicorp/logger';
 import postgres from 'postgres';
 import {AbortError} from '../../../../../shared/src/abort-error.ts';
+import type {LogConfig} from '../../../../../shared/src/logging.ts';
 import {stringify} from '../../../../../shared/src/bigint-json.ts';
 import {deepEqual} from '../../../../../shared/src/json.ts';
 import {must} from '../../../../../shared/src/must.ts';
@@ -53,7 +54,7 @@ import {
   ChangeStreamMultiplexer,
   type Listener,
 } from '../common/change-stream-multiplexer.ts';
-import {initReplica} from '../common/replica-schema.ts';
+import {initReplica, initReplicaWithWorker} from '../common/replica-schema.ts';
 import type {BackfillRequest, JSONObject} from '../protocol/current.ts';
 import type {
   ColumnAdd,
@@ -117,13 +118,29 @@ export async function initializePostgresChangeSource(
   replicaDbFile: string,
   syncOptions: InitialSyncOptions,
   context: ServerContext,
+  logConfig?: LogConfig | undefined,
 ): Promise<{subscriptionState: SubscriptionState; changeSource: ChangeSource}> {
-  await initReplica(
-    lc,
-    `replica-${shard.appID}-${shard.shardNum}`,
-    replicaDbFile,
-    (log, tx) => initialSync(log, shard, tx, upstreamURI, syncOptions, context),
-  );
+  if (logConfig) {
+    // Production path: run SQLite writes in a worker thread for pipelining.
+    await initReplicaWithWorker(
+      lc,
+      `replica-${shard.appID}-${shard.shardNum}`,
+      replicaDbFile,
+      upstreamURI,
+      (log, writer) =>
+        initialSync(log, shard, writer, upstreamURI, syncOptions, context),
+      logConfig,
+    );
+  } else {
+    // Direct path: in-process SQLite writes (used by tests).
+    await initReplica(
+      lc,
+      `replica-${shard.appID}-${shard.shardNum}`,
+      replicaDbFile,
+      (log, tx) =>
+        initialSync(log, shard, tx, upstreamURI, syncOptions, context),
+    );
+  }
 
   const replica = new Database(lc, replicaDbFile);
   const subscriptionState = getSubscriptionStateAndContext(

@@ -22,7 +22,7 @@ import {
   mapPostgresToLite,
   mapPostgresToLiteIndex,
 } from '../../../db/pg-to-lite.ts';
-import {getTypeParsers} from '../../../db/pg-type-parser.ts';
+import {getTypeParsers, type TypeParsers} from '../../../db/pg-type-parser.ts';
 import {runTx} from '../../../db/run-transaction.ts';
 import type {IndexSpec, PublishedTableSpec} from '../../../db/specs.ts';
 import {importSnapshot, TransactionPool} from '../../../db/transaction-pool.ts';
@@ -65,10 +65,59 @@ export type InitialSyncOptions = {
 /** Server context to store with the initial sync metadata for debugging. */
 export type ServerContext = JSONObject;
 
+// ── InitSyncWriter interface ──────────────────────────────────────────
+
+export type InitTableColumn = {
+  name: string;
+  typeOID: number;
+  dataType: string;
+};
+
+export type WriteChunkResult = {rowsFlushed: number};
+export type FinalizeTableResult = {rows: number; flushTime: number};
+
+/**
+ * Abstraction over the SQLite write operations during initial sync.
+ * Implementations:
+ * - {@link DirectInitSyncWriter}: writes to a local Database (in-process)
+ * - Worker-based impl (see initial-sync-worker-client.ts): delegates to a worker thread
+ */
+export interface InitSyncWriter {
+  createTables(
+    tables: PublishedTableSpec[],
+    initialVersion: string,
+  ): void | Promise<void>;
+  initReplicationState(
+    publications: string[],
+    watermark: string,
+    context: JSONObject,
+  ): void | Promise<void>;
+  initTable(
+    tableName: string,
+    columns: InitTableColumn[],
+  ): void | Promise<void>;
+  writeChunk(
+    tableName: string,
+    chunk: Buffer,
+  ): Promise<WriteChunkResult> | WriteChunkResult;
+  finalizeTable(
+    tableName: string,
+  ): Promise<FinalizeTableResult> | FinalizeTableResult;
+  createIndexes(indexes: IndexSpec[]): void | Promise<void>;
+}
+
+/**
+ * Runs initial sync: PG setup (replication slot, schema validation) and
+ * data copy from PostgreSQL to SQLite.
+ *
+ * Accepts either a `Database` (direct, in-process writes) or an
+ * `InitSyncWriter` (worker-based writes). When a `Database` is passed,
+ * a {@link DirectInitSyncWriter} is created internally.
+ */
 export async function initialSync(
   lc: LogContext,
   shard: ShardConfig,
-  tx: Database,
+  txOrWriter: Database | InitSyncWriter,
   upstreamURI: string,
   syncOptions: InitialSyncOptions,
   context: ServerContext,
@@ -78,6 +127,10 @@ export async function initialSync(
       'The App ID may only consist of lower-case letters, numbers, and the underscore character',
     );
   }
+  // Distinguish between Database (direct mode) and InitSyncWriter (worker mode).
+  const directDb =
+    'writeChunk' in txOrWriter ? undefined : (txOrWriter as Database);
+
   const {tableCopyWorkers, profileCopy} = syncOptions;
   const copyProfiler = profileCopy ? await CpuProfiler.connect() : null;
   const sql = pgClient(lc, upstreamURI);
@@ -86,7 +139,7 @@ export async function initialSync(
     connection: {replication: 'database'}, // https://www.postgresql.org/docs/current/protocol-replication.html
   });
   const slotName = newReplicationSlot(shard);
-  const statusPublisher = new ReplicationStatusPublisher(tx).publish(
+  const statusPublisher = new ReplicationStatusPublisher(directDb).publish(
     lc,
     'Initializing',
   );
@@ -138,8 +191,6 @@ export async function initialSync(
     const {snapshot_name: snapshot, consistent_point: lsn} = slot;
     const initialVersion = toStateVersionString(lsn);
 
-    initReplicationState(tx, publications, initialVersion, context);
-
     // Run up to MAX_WORKERS to copy of tables at the replication slot's snapshot.
     const start = performance.now();
     // Retrieve the published schema at the consistent_point.
@@ -181,7 +232,11 @@ export async function initialSync(
       numTables,
     );
     try {
-      createLiteTables(tx, tables, initialVersion);
+      const writer = directDb
+        ? new DirectInitSyncWriter(directDb, copyPool, lc)
+        : (txOrWriter as InitSyncWriter);
+      writer.initReplicationState(publications, initialVersion, context);
+      writer.createTables(tables, initialVersion);
       const downloads = await Promise.all(
         tables.map(spec =>
           copiers.processReadTask((db, lc) =>
@@ -200,9 +255,7 @@ export async function initialSync(
       void copyProfiler?.start();
       const rowCounts = await Promise.all(
         downloads.map(table =>
-          copiers.processReadTask((db, lc) =>
-            copy(lc, table, copyPool, db, tx),
-          ),
+          copiers.processReadTask((db, lc) => copy(lc, table, db, writer)),
         ),
       );
       void copyProfiler?.stopAndDispose(lc, 'initial-copy');
@@ -223,7 +276,7 @@ export async function initialSync(
         5000,
       );
       const indexStart = performance.now();
-      createLiteIndices(tx, indexes);
+      writer.createIndexes(indexes);
       const index = performance.now() - indexStart;
       lc.info?.(`Created indexes (${index.toFixed(3)} ms)`);
 
@@ -405,6 +458,170 @@ function createLiteIndices(tx: Database, indices: IndexSpec[]) {
   }
 }
 
+// ── DirectInitSyncWriter (in-process implementation) ──────────────────
+
+type TableCopyState = {
+  tsvParser: TsvParser;
+  parsers: ((val: string) => LiteValueType)[];
+  insertStmt: ReturnType<Database['prepare']>;
+  insertBatchStmt: ReturnType<Database['prepare']>;
+  pendingValues: LiteValueType[];
+  pendingRows: number;
+  pendingSize: number;
+  valuesPerRow: number;
+  valuesPerBatch: number;
+  totalRows: number;
+  flushTime: number;
+  col: number;
+};
+
+/**
+ * In-process implementation of {@link InitSyncWriter} that writes directly
+ * to a local SQLite {@link Database}. Used by tests and the direct
+ * (non-worker) code path.
+ */
+export class DirectInitSyncWriter implements InitSyncWriter {
+  readonly #db: Database;
+  readonly #dbClient: PostgresDB;
+  readonly #lc: LogContext;
+  #pgParsers: TypeParsers | undefined;
+  readonly #tables = new Map<string, TableCopyState>();
+
+  constructor(db: Database, dbClient: PostgresDB, lc: LogContext) {
+    this.#db = db;
+    this.#dbClient = dbClient;
+    this.#lc = lc;
+  }
+
+  createTables(tables: PublishedTableSpec[], initialVersion: string) {
+    createLiteTables(this.#db, tables, initialVersion);
+  }
+
+  initReplicationState(
+    publications: string[],
+    watermark: string,
+    context: JSONObject,
+  ) {
+    initReplicationState(this.#db, publications, watermark, context);
+  }
+
+  async initTable(tableName: string, columns: InitTableColumn[]) {
+    if (!this.#pgParsers) {
+      this.#pgParsers = await getTypeParsers(this.#dbClient, {
+        returnJsonAsString: true,
+      });
+    }
+
+    const columnNames = columns.map(c => c.name);
+    const insertColumnList = columnNames.map(c => id(c)).join(',');
+    const valuesSql =
+      columnNames.length > 0
+        ? `(${'?,'.repeat(columnNames.length - 1)}?)`
+        : '()';
+    const insertSql = /*sql*/ `
+      INSERT INTO "${tableName}" (${insertColumnList}) VALUES ${valuesSql}`;
+
+    const valuesPerRow = columns.length;
+
+    const parsers = columns.map(c => {
+      const pgParse = must(this.#pgParsers).getTypeParser(c.typeOID);
+      return (val: string) =>
+        liteValue(
+          pgParse(val) as PostgresValueType,
+          c.dataType,
+          JSON_STRINGIFIED,
+        );
+    });
+
+    this.#tables.set(tableName, {
+      tsvParser: new TsvParser(),
+      parsers,
+      insertStmt: this.#db.prepare(insertSql),
+      insertBatchStmt: this.#db.prepare(
+        insertSql + `,${valuesSql}`.repeat(INSERT_BATCH_SIZE - 1),
+      ),
+      pendingValues: Array.from({length: MAX_BUFFERED_ROWS * valuesPerRow}),
+      pendingRows: 0,
+      pendingSize: 0,
+      valuesPerRow,
+      valuesPerBatch: valuesPerRow * INSERT_BATCH_SIZE,
+      totalRows: 0,
+      flushTime: 0,
+      col: 0,
+    });
+  }
+
+  writeChunk(tableName: string, chunk: Buffer): WriteChunkResult {
+    const state = must(this.#tables.get(tableName));
+    const rowsBefore = state.totalRows;
+
+    for (const text of state.tsvParser.parse(chunk)) {
+      state.pendingSize += text === null ? 4 : text.length;
+      state.pendingValues[state.pendingRows * state.valuesPerRow + state.col] =
+        text === null ? null : state.parsers[state.col](text);
+
+      if (++state.col === state.parsers.length) {
+        state.col = 0;
+        if (
+          ++state.pendingRows >= MAX_BUFFERED_ROWS - state.valuesPerRow ||
+          state.pendingSize >= BUFFERED_SIZE_THRESHOLD
+        ) {
+          this.#flush(tableName, state);
+        }
+      }
+    }
+
+    return {rowsFlushed: state.totalRows - rowsBefore};
+  }
+
+  finalizeTable(tableName: string): FinalizeTableResult {
+    const state = must(this.#tables.get(tableName));
+    if (state.pendingRows > 0) {
+      this.#flush(tableName, state);
+    }
+    const result = {rows: state.totalRows, flushTime: state.flushTime};
+    this.#tables.delete(tableName);
+    return result;
+  }
+
+  createIndexes(indexes: IndexSpec[]) {
+    createLiteIndices(this.#db, indexes);
+  }
+
+  #flush(tableName: string, state: TableCopyState) {
+    const start = performance.now();
+    const flushedRows = state.pendingRows;
+    const flushedSize = state.pendingSize;
+
+    let l = 0;
+    for (
+      ;
+      state.pendingRows > INSERT_BATCH_SIZE;
+      state.pendingRows -= INSERT_BATCH_SIZE
+    ) {
+      state.insertBatchStmt.run(
+        state.pendingValues.slice(l, (l += state.valuesPerBatch)),
+      );
+    }
+    for (; state.pendingRows > 0; state.pendingRows--) {
+      state.insertStmt.run(
+        state.pendingValues.slice(l, (l += state.valuesPerRow)),
+      );
+    }
+    for (let i = 0; i < flushedRows; i++) {
+      state.pendingValues[i] = undefined as unknown as LiteValueType;
+    }
+    state.pendingSize = 0;
+    state.totalRows += flushedRows;
+
+    const elapsed = performance.now() - start;
+    state.flushTime += elapsed;
+    this.#lc.debug?.(
+      `flushed ${flushedRows} ${tableName} rows (${flushedSize} bytes) in ${elapsed.toFixed(3)} ms`,
+    );
+  }
+}
+
 // Verified empirically that batches of 50 seem to be the sweet spot,
 // similar to the report in https://sqlite.org/forum/forumpost/8878a512d3652655
 //
@@ -483,84 +700,26 @@ async function getInitialDownloadState(
 async function copy(
   lc: LogContext,
   {spec: table, status}: DownloadState,
-  dbClient: PostgresDB,
   from: PostgresTransaction,
-  to: Database,
+  writer: InitSyncWriter,
 ) {
   const start = performance.now();
-  let flushTime = 0;
-
   const tableName = liteTableName(table);
   const orderedColumns = Object.entries(table.columns);
-
   const columnNames = orderedColumns.map(([c]) => c);
-  const columnSpecs = orderedColumns.map(([_name, spec]) => spec);
-  const insertColumnList = columnNames.map(c => id(c)).join(',');
 
-  // (?,?,?,?,?)
-  const valuesSql =
-    columnNames.length > 0 ? `(${'?,'.repeat(columnNames.length - 1)}?)` : '()';
-  const insertSql = /*sql*/ `
-    INSERT INTO "${tableName}" (${insertColumnList}) VALUES ${valuesSql}`;
-  const insertStmt = to.prepare(insertSql);
-  // INSERT VALUES (?,?,?,?,?),... x INSERT_BATCH_SIZE
-  const insertBatchStmt = to.prepare(
-    insertSql + `,${valuesSql}`.repeat(INSERT_BATCH_SIZE - 1),
-  );
+  const columns: InitTableColumn[] = orderedColumns.map(([name, spec]) => ({
+    name,
+    typeOID: spec.typeOID,
+    dataType: spec.dataType,
+  }));
+
+  await writer.initTable(tableName, columns);
 
   const {select} = makeDownloadStatements(table, columnNames);
-  const valuesPerRow = columnSpecs.length;
-  const valuesPerBatch = valuesPerRow * INSERT_BATCH_SIZE;
-
-  // Preallocate the buffer of values to reduce memory allocation churn.
-  const pendingValues: LiteValueType[] = Array.from({
-    length: MAX_BUFFERED_ROWS * valuesPerRow,
-  });
-  let pendingRows = 0;
-  let pendingSize = 0;
-
-  function flush() {
-    const start = performance.now();
-    const flushedRows = pendingRows;
-    const flushedSize = pendingSize;
-
-    let l = 0;
-    for (; pendingRows > INSERT_BATCH_SIZE; pendingRows -= INSERT_BATCH_SIZE) {
-      insertBatchStmt.run(pendingValues.slice(l, (l += valuesPerBatch)));
-    }
-    // Insert the remaining rows individually.
-    for (; pendingRows > 0; pendingRows--) {
-      insertStmt.run(pendingValues.slice(l, (l += valuesPerRow)));
-    }
-    for (let i = 0; i < flushedRows; i++) {
-      // Reuse the array and unreference the values to allow GC.
-      // This is faster than allocating a new array every time.
-      pendingValues[i] = undefined as unknown as LiteValueType;
-    }
-    pendingSize = 0;
-    status.rows += flushedRows;
-
-    const elapsed = performance.now() - start;
-    flushTime += elapsed;
-    lc.debug?.(
-      `flushed ${flushedRows} ${tableName} rows (${flushedSize} bytes) in ${elapsed.toFixed(3)} ms`,
-    );
-  }
-
   lc.info?.(`Starting copy stream of ${tableName}:`, select);
-  const pgParsers = await getTypeParsers(dbClient, {returnJsonAsString: true});
-  const parsers = columnSpecs.map(c => {
-    const pgParse = pgParsers.getTypeParser(c.typeOID);
-    return (val: string) =>
-      liteValue(
-        pgParse(val) as PostgresValueType,
-        c.dataType,
-        JSON_STRINGIFIED,
-      );
-  });
 
-  const tsvParser = new TsvParser();
-  let col = 0;
+  let copyResult: FinalizeTableResult | undefined;
 
   await pipeline(
     await from.unsafe(`COPY (${select}) TO STDOUT`).readable(),
@@ -572,43 +731,31 @@ async function copy(
         _encoding: string,
         callback: (error?: Error) => void,
       ) {
-        try {
-          for (const text of tsvParser.parse(chunk)) {
-            pendingSize += text === null ? 4 : text.length;
-            pendingValues[pendingRows * valuesPerRow + col] =
-              text === null ? null : parsers[col](text);
-
-            if (++col === parsers.length) {
-              col = 0;
-              if (
-                ++pendingRows >= MAX_BUFFERED_ROWS - valuesPerRow ||
-                pendingSize >= BUFFERED_SIZE_THRESHOLD
-              ) {
-                flush();
-              }
-            }
-          }
-          callback();
-        } catch (e) {
-          callback(e instanceof Error ? e : new Error(String(e)));
-        }
+        Promise.resolve(writer.writeChunk(tableName, chunk))
+          .then(({rowsFlushed}) => {
+            status.rows += rowsFlushed;
+            callback();
+          })
+          .catch(e => callback(e instanceof Error ? e : new Error(String(e))));
       },
 
-      final: (callback: (error?: Error) => void) => {
-        try {
-          flush();
-          callback();
-        } catch (e) {
-          callback(e instanceof Error ? e : new Error(String(e)));
-        }
+      final(callback: (error?: Error) => void) {
+        Promise.resolve(writer.finalizeTable(tableName))
+          .then(result => {
+            copyResult = result;
+            status.rows = result.rows;
+            callback();
+          })
+          .catch(e => callback(e instanceof Error ? e : new Error(String(e))));
       },
     }),
   );
 
+  const result = must(copyResult);
   const elapsed = performance.now() - start;
   lc.info?.(
-    `Finished copying ${status.rows} rows into ${tableName} ` +
-      `(flush: ${flushTime.toFixed(3)} ms) (total: ${elapsed.toFixed(3)} ms) `,
+    `Finished copying ${result.rows} rows into ${tableName} ` +
+      `(flush: ${result.flushTime.toFixed(3)} ms) (total: ${elapsed.toFixed(3)} ms) `,
   );
-  return {rows: status.rows, flushTime};
+  return result;
 }

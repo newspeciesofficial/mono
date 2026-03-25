@@ -93,6 +93,7 @@ export default async function runWorker(
               replica.file,
               initialSync,
               context,
+              config.log,
             )
           : await initializeCustomChangeSource(
               lc,
