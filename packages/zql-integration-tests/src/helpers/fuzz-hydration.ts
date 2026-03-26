@@ -39,6 +39,13 @@ class FuzzTimeoutError extends Error {
   }
 }
 
+class PlannerMismatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PlannerMismatchError';
+  }
+}
+
 function createCheckAbort(
   startTime: number,
   timeoutMs: number,
@@ -161,12 +168,26 @@ export function fuzzHydrationTests(
 
         // Also test with planner-decided join strategies
         const planned = planForFuzz(query[0]);
-        await runAndCompare(schema, delegates, planned, undefined);
+        try {
+          await runAndCompare(schema, delegates, planned, undefined);
+        } catch (plannerError) {
+          throw new PlannerMismatchError(
+            'Planner mismatch. Repro seed: ' +
+              seed +
+              '\n' +
+              (plannerError instanceof Error
+                ? plannerError.message
+                : String(plannerError)),
+          );
+        }
       }, sourceWrapper);
     } catch (e) {
       if (e instanceof FuzzTimeoutError) {
         console.warn(`⚠️ ${e.message} - passing anyway`);
         return;
+      }
+      if (e instanceof PlannerMismatchError) {
+        throw e;
       }
 
       const zql = await shrink(query[1], seed);
