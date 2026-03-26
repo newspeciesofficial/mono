@@ -4,6 +4,7 @@
     "jsx": "react-jsx",
     "rootDir": "..",
     "outDir": "out",
+    "rootDir": "../",
     "noEmit": false,
     "emitDeclarationOnly": true
   },

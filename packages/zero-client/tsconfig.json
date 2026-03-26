@@ -3,6 +3,7 @@
   "compilerOptions": {
     "rootDir": "..",
     "outDir": "out",
+    "rootDir": "../",
     "noEmit": false,
     "emitDeclarationOnly": true
   },
