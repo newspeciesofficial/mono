@@ -277,12 +277,11 @@ export class TableSource implements Source {
     const sqlAndBindings = format(query);
 
     const cachedStatement = this.#stmts.cache.get(sqlAndBindings.text);
+    cachedStatement.statement.safeIntegers(true);
+    const rowIterator = cachedStatement.statement.iterate<Row>(
+      ...sqlAndBindings.values,
+    );
     try {
-      cachedStatement.statement.safeIntegers(true);
-      const rowIterator = cachedStatement.statement.iterate<Row>(
-        ...sqlAndBindings.values,
-      );
-
       const comparator = makeComparator(sort, req.reverse);
 
       debug?.initQuery(this.#table, sqlAndBindings.text);
@@ -309,6 +308,8 @@ export class TableSource implements Source {
         comparator,
       );
     } finally {
+      // Ensure the SQLite iterate() is closed.
+      rowIterator.return?.();
       if (debug) {
         let totalNvisit = 0;
         let i = 0;
@@ -339,27 +340,23 @@ export class TableSource implements Source {
     debug: DebugDelegate | undefined,
   ): IterableIterator<Row> {
     let result;
-    try {
-      do {
-        result = timeSampled(
-          this.#lc,
-          ++eventCount,
-          this.#logConfig.ivmSampling,
-          () => rowIterator.next(),
-          this.#logConfig.slowRowThreshold,
-          () =>
-            `table-source.next took too long for ${query}. Are you missing an index?`,
-        );
-        if (result.done) {
-          break;
-        }
-        const row = fromSQLiteTypes(valueTypes, result.value, this.#table);
-        debug?.rowVended(this.#table, query, row);
-        yield row;
-      } while (!result.done);
-    } finally {
-      rowIterator.return?.();
-    }
+    do {
+      result = timeSampled(
+        this.#lc,
+        ++eventCount,
+        this.#logConfig.ivmSampling,
+        () => rowIterator.next(),
+        this.#logConfig.slowRowThreshold,
+        () =>
+          `table-source.next took too long for ${query}. Are you missing an index?`,
+      );
+      if (result.done) {
+        break;
+      }
+      const row = fromSQLiteTypes(valueTypes, result.value, this.#table);
+      debug?.rowVended(this.#table, query, row);
+      yield row;
+    } while (!result.done);
   }
 
   *push(change: SourceChange): Stream<'yield'> {
