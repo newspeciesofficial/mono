@@ -54,7 +54,7 @@
     "expo-sqlite": ">=15",
     "playwright": "^1.53.2",
     "shared": "0.0.0",
-    "typescript": "~5.9.3",
+    "typescript": "~6.0.2",
     "vitest": "4.1.0"
   },
   "peerDependencies": {
