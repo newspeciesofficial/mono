@@ -985,9 +985,7 @@ function assignRandomValues(
     const serverCol =
       mapper && tableName ? mapper.columnName(tableName, col) : undefined;
     const serverColSchema =
-      serverCol && serverTableSchema
-        ? serverTableSchema[serverCol]
-        : undefined;
+      serverCol && serverTableSchema ? serverTableSchema[serverCol] : undefined;
 
     // Enum columns must keep their existing value since PG rejects
     // invalid enum literals.

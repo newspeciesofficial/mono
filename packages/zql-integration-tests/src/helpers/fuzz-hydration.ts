@@ -9,6 +9,21 @@ import {asQueryInternals} from '../../../zql/src/query/query-internals.ts';
 import type {AnyQuery} from '../../../zql/src/query/query.ts';
 import {generateShrinkableQuery} from '../../../zql/src/query/test/query-gen.ts';
 import type {Schema} from '../../../zero-types/src/schema.ts';
+import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
+import {computeZqlSpecs} from '../../../zero-cache/src/db/lite-tables.ts';
+import {
+  type AST,
+  type Condition,
+  mapAST,
+} from '../../../zero-protocol/src/ast.ts';
+import {
+  clientToServer,
+  serverToClient,
+} from '../../../zero-schema/src/name-mapper.ts';
+import {planQuery} from '../../../zql/src/planner/planner-builder.ts';
+import {completeOrdering} from '../../../zql/src/query/complete-ordering.ts';
+import {newQueryImpl} from '../../../zql/src/query/query-impl.ts';
+import {createSQLiteCostModel} from '../../../zqlite/src/sqlite-cost-model.ts';
 import '../helpers/comparePg.ts';
 import {type bootstrap, checkPush, runAndCompare} from '../helpers/runner.ts';
 
@@ -37,11 +52,72 @@ function createCheckAbort(
   };
 }
 
+function stripFlips(ast: AST): AST {
+  return {
+    ...ast,
+    where: ast.where ? stripFlipsCondition(ast.where) : undefined,
+    related: ast.related?.map(r => ({
+      ...r,
+      subquery: stripFlips(r.subquery),
+    })),
+  };
+}
+
+function stripFlipsCondition(condition: Condition): Condition {
+  if (condition.type === 'simple') {
+    return condition;
+  }
+  if (condition.type === 'correlatedSubquery') {
+    return {
+      ...condition,
+      flip: undefined,
+      related: {
+        ...condition.related,
+        subquery: stripFlips(condition.related.subquery),
+      },
+    };
+  }
+  return {
+    ...condition,
+    conditions: condition.conditions.map(stripFlipsCondition),
+  };
+}
+
 export function fuzzHydrationTests(
   schema: Schema,
   harness: Awaited<ReturnType<typeof bootstrap>>,
   reproSeed?: number | undefined,
 ) {
+  // Set up planner infrastructure for testing planned queries
+  harness.dbs.sqlite.exec('ANALYZE;');
+  const tableSpecs = computeZqlSpecs(
+    createSilentLogContext(),
+    harness.dbs.sqlite,
+    {includeBackfillingColumns: false},
+  );
+  const costModel = createSQLiteCostModel(harness.dbs.sqlite, tableSpecs);
+  const c2sMapper = clientToServer(schema.tables);
+  const s2cMapper = serverToClient(schema.tables);
+
+  function planForFuzz(query: AnyQuery): AnyQuery {
+    const qi = asQueryInternals(query);
+    const ast = stripFlips(qi.ast);
+    const completed = completeOrdering(
+      ast,
+      tableName => schema.tables[tableName].primaryKey,
+    );
+    const serverAst = mapAST(completed, c2sMapper);
+    const plannedServerAst = planQuery(serverAst, costModel);
+    const plannedClientAst = mapAST(plannedServerAst, s2cMapper);
+    return newQueryImpl(
+      schema,
+      qi.ast.table,
+      plannedClientAst,
+      qi.format,
+      'test',
+    );
+  }
+
   function createCase(seed?: number) {
     seed = seed ?? Date.now() ^ (Math.random() * 0x100000000);
     const randomizer = generateMersenne53Randomizer(seed);
@@ -82,6 +158,10 @@ export function fuzzHydrationTests(
       await harness.transact(async delegates => {
         await runAndCompare(schema, delegates, query[0], undefined);
         await checkPush(schema, delegates, query[0], 10);
+
+        // Also test with planner-decided join strategies
+        const planned = planForFuzz(query[0]);
+        await runAndCompare(schema, delegates, planned, undefined);
       }, sourceWrapper);
     } catch (e) {
       if (e instanceof FuzzTimeoutError) {
