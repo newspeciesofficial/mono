@@ -63,9 +63,10 @@ export class Take implements Operator {
     partitionKey?: PartitionKey,
   ) {
     assert(limit >= 0, 'Limit must be non-negative');
-    const {sort} = input.getSchema();
-    assert(sort !== undefined, 'Take requires sorted input');
-    assertOrderingIncludesPK(sort, input.getSchema().primaryKey);
+    assertOrderingIncludesPK(
+      input.getSchema().sort,
+      input.getSchema().primaryKey,
+    );
     input.setOutput(this);
     this.#input = input;
     this.#storage = storage as TakeStorage;
@@ -734,7 +735,7 @@ function getTakeStateKey(
   return JSON.stringify(['take', ...partitionValues]);
 }
 
-export function constraintMatchesPartitionKey(
+function constraintMatchesPartitionKey(
   constraint: Constraint | undefined,
   partitionKey: PartitionKey | undefined,
 ): boolean {
@@ -752,9 +753,7 @@ export function constraintMatchesPartitionKey(
   return true;
 }
 
-export function makePartitionKeyComparator(
-  partitionKey: PartitionKey,
-): Comparator {
+function makePartitionKeyComparator(partitionKey: PartitionKey): Comparator {
   return (a, b) => {
     for (const key of partitionKey) {
       const cmp = compareValues(a[key], b[key]);

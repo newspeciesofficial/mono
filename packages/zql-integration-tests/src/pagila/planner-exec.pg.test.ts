@@ -71,9 +71,9 @@ describe('Pagila planner execution cost validation', () => {
         a.where('lastName', 'GUINESS'),
       ),
       validations: [
-        ['correlation', 0.2],
+        ['correlation', 0.4],
         ['within-optimal', 1],
-        ['within-baseline', 0.025],
+        ['within-baseline', 0.013],
       ],
     },
 
@@ -95,9 +95,9 @@ describe('Pagila planner execution cost validation', () => {
         .whereExists('actors', a => a.where('lastName', 'GUINESS'))
         .whereExists('categories', c => c.where('name', 'Action')),
       validations: [
-        ['correlation', -0.09],
+        ['correlation', -0.08],
         ['within-optimal', 1],
-        ['within-baseline', 0.07],
+        ['within-baseline', 0.04],
       ],
     },
 

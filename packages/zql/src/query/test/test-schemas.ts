@@ -84,11 +84,6 @@ const issueRelationships = relationships(issue, ({one, many}) => ({
     destField: ['issueId'],
     destSchema: comment,
   }),
-  ownerComments: many({
-    sourceField: ['ownerId'],
-    destField: ['authorId'],
-    destSchema: comment,
-  }),
   labels: many(
     {
       sourceField: ['id'],

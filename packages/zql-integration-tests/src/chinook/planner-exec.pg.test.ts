@@ -224,13 +224,13 @@ describe('Chinook planner execution cost validation', () => {
         .limit(15),
       validations: [
         ['correlation', 0],
-        ['within-optimal', 1.75],
-        ['within-baseline', 1.75],
+        ['within-optimal', 1.7],
+        ['within-baseline', 1.7],
       ],
       extraIndexValidations: [
         ['correlation', 0],
-        ['within-optimal', 1.75],
-        ['within-baseline', 1.75],
+        ['within-optimal', 1.7],
+        ['within-baseline', 1.7],
       ],
     },
 
@@ -255,7 +255,7 @@ describe('Chinook planner execution cost validation', () => {
       extraIndexValidations: [
         ['correlation', 0.8],
         ['within-optimal', 1],
-        ['within-baseline', 0.04],
+        ['within-baseline', 0.025],
       ],
     },
 
@@ -425,12 +425,12 @@ describe('Chinook planner execution cost validation', () => {
         .where('name', 'LIKE', 'Music%')
         .whereExists('tracks', t => t.where('name', 'LIKE', 'A%')),
       validations: [
-        ['correlation', 0.4],
+        ['correlation', 0.8],
         ['within-optimal', 1],
         ['within-baseline', 1],
       ],
       extraIndexValidations: [
-        ['correlation', 0.4],
+        ['correlation', 0.8],
         ['within-optimal', 1],
         ['within-baseline', 1],
       ],

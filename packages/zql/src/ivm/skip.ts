@@ -1,4 +1,3 @@
-import {assert} from '../../../shared/src/asserts.ts';
 import type {Row} from '../../../zero-protocol/src/data.ts';
 import type {AddChange, Change, ChildChange, RemoveChange} from './change.ts';
 import type {Comparator, Node} from './data.ts';
@@ -31,8 +30,6 @@ export class Skip implements Operator {
   #output: Output = throwOutput;
 
   constructor(input: Input, bound: Bound) {
-    const {sort} = input.getSchema();
-    assert(sort !== undefined, 'Skip requires sorted input');
     this.#input = input;
     this.#bound = bound;
     this.#comparator = input.getSchema().compareRows;
