@@ -3,7 +3,9 @@ import type {LogContext} from '@rocicorp/logger';
 import type {IncomingMessage} from 'node:http';
 import WebSocket from 'ws';
 import {assert} from '../../../../shared/src/asserts.ts';
+import {type JSONValue} from '../../../../shared/src/bigint-json.ts';
 import {must} from '../../../../shared/src/must.ts';
+import type * as v from '../../../../shared/src/valita.ts';
 import type {ZeroConfig} from '../../config/zero-config.ts';
 import type {IncomingMessageSubset} from '../../types/http.ts';
 import {pgClient, type PostgresDB} from '../../types/pg.ts';
@@ -239,22 +241,34 @@ export class ChangeStreamerHttpClient implements ChangeStreamer {
     return uri;
   }
 
-  async reserveSnapshot(taskID: string): Promise<Source<SnapshotMessage>> {
-    const uri = await this.#resolveChangeStreamer(SNAPSHOT_PATH);
-
-    const params = new URLSearchParams({taskID});
+  async #connect<T extends JSONValue>(
+    path: string,
+    params: URLSearchParams,
+    schema: v.Type<T>,
+  ): Promise<Source<T>> {
+    const uri = await this.#resolveChangeStreamer(path);
     const ws = new WebSocket(uri + `?${params.toString()}`);
 
-    return streamIn(this.#lc, ws, snapshotMessageSchema);
+    try {
+      return await streamIn(this.#lc, ws, schema);
+    } catch (err) {
+      throw new Error(
+        `Unable to connect to change-streamer at ${uri}; it may still be starting, restarting, or restoring from backup`,
+        {cause: err},
+      );
+    }
   }
 
-  async subscribe(ctx: SubscriberContext): Promise<Source<Downstream>> {
-    const uri = await this.#resolveChangeStreamer(CHANGES_PATH);
+  reserveSnapshot(taskID: string): Promise<Source<SnapshotMessage>> {
+    return this.#connect(
+      SNAPSHOT_PATH,
+      new URLSearchParams({taskID}),
+      snapshotMessageSchema,
+    );
+  }
 
-    const params = getParams(ctx);
-    const ws = new WebSocket(uri + `?${params.toString()}`);
-
-    return streamIn(this.#lc, ws, downstreamSchema);
+  subscribe(ctx: SubscriberContext): Promise<Source<Downstream>> {
+    return this.#connect(CHANGES_PATH, getParams(ctx), downstreamSchema);
   }
 }
 
