@@ -1,3 +1,4 @@
+import {createServer} from 'node:net';
 import type {LogContext} from '@rocicorp/logger';
 import {resolver} from '@rocicorp/resolver';
 import Fastify from 'fastify';
@@ -148,6 +149,61 @@ describe('change-streamer/http', () => {
     }
     return drained;
   }
+
+  async function getClosedPort(): Promise<number> {
+    const server = createServer();
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => resolve());
+    });
+
+    const address = server.address();
+    if (!address || typeof address === 'string') {
+      throw new Error('expected TCP address');
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      server.close(err => (err ? reject(err) : resolve()));
+    });
+
+    return address.port;
+  }
+
+  test('wraps initial connection failures', async () => {
+    const port = await getClosedPort();
+    const address = `127.0.0.1:${port}`;
+    await setChangeStreamerAddress(address);
+
+    for (const [path, connect] of [
+      [
+        `/replication/v${PROTOCOL_VERSION}/snapshot`,
+        () => changeStreamerClient.reserveSnapshot('foo-task'),
+      ],
+      [
+        `/replication/v${PROTOCOL_VERSION}/changes`,
+        () =>
+          changeStreamerClient.subscribe({
+            protocolVersion: PROTOCOL_VERSION,
+            taskID: 'foo-task',
+            id: 'foo',
+            mode: 'serving',
+            replicaVersion: 'abc',
+            watermark: '123',
+            initial: true,
+          }),
+      ],
+    ] as const) {
+      await expect(connect()).rejects.toMatchObject({
+        message:
+          `Unable to connect to change-streamer at ` +
+          `ws://${address}${path}; it may still be starting, restarting, ` +
+          `or restoring from backup`,
+        cause: expect.objectContaining({
+          code: 'ECONNREFUSED',
+        }),
+      });
+    }
+  });
 
   test('health checks and keepalives', async () => {
     const [parent] = inProcChannel();
