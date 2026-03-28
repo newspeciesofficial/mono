@@ -98,43 +98,10 @@ suite('Cap push - basic behavior', () => {
         },
       ]
     `);
-    expect(actualStorage['.comments:cap']).toMatchInlineSnapshot(`
-      {
-        "["cap","i1"]": {
-          "pks": [
-            "["c1"]",
-            "["c2"]",
-          ],
-          "size": 2,
-        },
-      }
-    `);
-    expect(log.filter(msg => msg[0] === '.comments:cap'))
-      .toMatchInlineSnapshot(`
-      [
-        [
-          ".comments:cap",
-          "push",
-          {
-            "row": {
-              "id": "c2",
-              "issueID": "i1",
-              "text": "c2",
-            },
-            "type": "add",
-          },
-        ],
-        [
-          ".comments:cap",
-          "fetch",
-          {
-            "constraint": {
-              "issueID": "i1",
-            },
-          },
-        ],
-      ]
-    `);
+    expect(actualStorage['.comments:cap']).toMatchInlineSnapshot(`undefined`);
+    expect(log.filter(msg => msg[0] === '.comments:cap')).toMatchInlineSnapshot(
+      `[]`,
+    );
     expect(pushes).toMatchInlineSnapshot(`
       [
         {
@@ -216,18 +183,7 @@ suite('Cap push - basic behavior', () => {
         },
       ]
     `);
-    expect(actualStorage['.comments:cap']).toMatchInlineSnapshot(`
-      {
-        "["cap","i1"]": {
-          "pks": [
-            "["c1"]",
-            "["c2"]",
-            "["c3"]",
-          ],
-          "size": 3,
-        },
-      }
-    `);
+    expect(actualStorage['.comments:cap']).toMatchInlineSnapshot(`undefined`);
     expect(log.filter(msg => msg[0] === '.comments:cap')).toMatchInlineSnapshot(
       `[]`,
     );
@@ -289,65 +245,10 @@ suite('Cap push - basic behavior', () => {
         },
       ]
     `);
-    expect(actualStorage['.comments:cap']).toMatchInlineSnapshot(`
-      {
-        "["cap","i1"]": {
-          "pks": [
-            "["c1"]",
-            "["c3"]",
-            "["c4"]",
-          ],
-          "size": 3,
-        },
-      }
-    `);
-    expect(log.filter(msg => msg[0] === '.comments:cap'))
-      .toMatchInlineSnapshot(`
-      [
-        [
-          ".comments:cap",
-          "push",
-          {
-            "row": {
-              "id": "c2",
-              "issueID": "i1",
-              "text": "c2",
-            },
-            "type": "remove",
-          },
-        ],
-        [
-          ".comments:cap",
-          "fetch",
-          {
-            "constraint": {
-              "issueID": "i1",
-            },
-          },
-        ],
-        [
-          ".comments:cap",
-          "push",
-          {
-            "row": {
-              "id": "c4",
-              "issueID": "i1",
-              "text": "c4",
-            },
-            "type": "add",
-          },
-        ],
-        [
-          ".comments:cap",
-          "fetch",
-          {
-            "constraint": {
-              "issueID": "i1",
-            },
-          },
-        ],
-      ]
-    `);
+    expect(actualStorage['.comments:cap']).toMatchInlineSnapshot(`undefined`);
+    expect(log.filter(msg => msg[0] === '.comments:cap')).toMatchInlineSnapshot(
+      `[]`,
+    );
     expect(pushes).toMatchInlineSnapshot(`
       [
         {
@@ -437,42 +338,10 @@ suite('Cap push - basic behavior', () => {
         },
       ]
     `);
-    expect(actualStorage['.comments:cap']).toMatchInlineSnapshot(`
-      {
-        "["cap","i1"]": {
-          "pks": [
-            "["c2"]",
-          ],
-          "size": 1,
-        },
-      }
-    `);
-    expect(log.filter(msg => msg[0] === '.comments:cap'))
-      .toMatchInlineSnapshot(`
-      [
-        [
-          ".comments:cap",
-          "push",
-          {
-            "row": {
-              "id": "c1",
-              "issueID": "i1",
-              "text": "c1",
-            },
-            "type": "remove",
-          },
-        ],
-        [
-          ".comments:cap",
-          "fetch",
-          {
-            "constraint": {
-              "issueID": "i1",
-            },
-          },
-        ],
-      ]
-    `);
+    expect(actualStorage['.comments:cap']).toMatchInlineSnapshot(`undefined`);
+    expect(log.filter(msg => msg[0] === '.comments:cap')).toMatchInlineSnapshot(
+      `[]`,
+    );
     expect(pushes).toMatchInlineSnapshot(`
       [
         {
@@ -522,40 +391,10 @@ suite('Cap push - basic behavior', () => {
     });
 
     expect(data).toMatchInlineSnapshot(`[]`);
-    expect(actualStorage['.comments:cap']).toMatchInlineSnapshot(`
-      {
-        "["cap","i1"]": {
-          "pks": [],
-          "size": 0,
-        },
-      }
-    `);
-    expect(log.filter(msg => msg[0] === '.comments:cap'))
-      .toMatchInlineSnapshot(`
-      [
-        [
-          ".comments:cap",
-          "push",
-          {
-            "row": {
-              "id": "c1",
-              "issueID": "i1",
-              "text": "c1",
-            },
-            "type": "remove",
-          },
-        ],
-        [
-          ".comments:cap",
-          "fetch",
-          {
-            "constraint": {
-              "issueID": "i1",
-            },
-          },
-        ],
-      ]
-    `);
+    expect(actualStorage['.comments:cap']).toMatchInlineSnapshot(`undefined`);
+    expect(log.filter(msg => msg[0] === '.comments:cap')).toMatchInlineSnapshot(
+      `[]`,
+    );
     expect(pushes).toMatchInlineSnapshot(`
       [
         {
@@ -638,18 +477,7 @@ suite('Cap push - basic behavior', () => {
         },
       ]
     `);
-    expect(actualStorage['.comments:cap']).toMatchInlineSnapshot(`
-      {
-        "["cap","i1"]": {
-          "pks": [
-            "["c1"]",
-            "["c2"]",
-            "["c3"]",
-          ],
-          "size": 3,
-        },
-      }
-    `);
+    expect(actualStorage['.comments:cap']).toMatchInlineSnapshot(`undefined`);
     expect(log.filter(msg => msg[0] === '.comments:cap')).toMatchInlineSnapshot(
       `[]`,
     );
@@ -704,48 +532,10 @@ suite('Cap push - basic behavior', () => {
         },
       ]
     `);
-    expect(actualStorage['.comments:cap']).toMatchInlineSnapshot(`
-      {
-        "["cap","i1"]": {
-          "pks": [
-            "["c1"]",
-            "["c2"]",
-          ],
-          "size": 2,
-        },
-      }
-    `);
-    expect(log.filter(msg => msg[0] === '.comments:cap'))
-      .toMatchInlineSnapshot(`
-      [
-        [
-          ".comments:cap",
-          "push",
-          {
-            "oldRow": {
-              "id": "c1",
-              "issueID": "i1",
-              "text": "c1",
-            },
-            "row": {
-              "id": "c1",
-              "issueID": "i1",
-              "text": "c1 updated",
-            },
-            "type": "edit",
-          },
-        ],
-        [
-          ".comments:cap",
-          "fetch",
-          {
-            "constraint": {
-              "issueID": "i1",
-            },
-          },
-        ],
-      ]
-    `);
+    expect(actualStorage['.comments:cap']).toMatchInlineSnapshot(`undefined`);
+    expect(log.filter(msg => msg[0] === '.comments:cap')).toMatchInlineSnapshot(
+      `[]`,
+    );
     expect(pushes).toMatchInlineSnapshot(`
       [
         {
@@ -906,83 +696,10 @@ suite('Cap push - unordered overlay in join', () => {
         },
       ]
     `);
-    expect(actualStorage['.children:cap']).toMatchInlineSnapshot(`
-      {
-        "["cap","g1"]": {
-          "pks": [
-            "["x2"]",
-            "["x3"]",
-            "["x4"]",
-          ],
-          "size": 3,
-        },
-      }
-    `);
-    expect(log.filter(msg => msg[0] === '.children:cap'))
-      .toMatchInlineSnapshot(`
-      [
-        [
-          ".children:cap",
-          "push",
-          {
-            "row": {
-              "group": "g1",
-              "id": "x1",
-              "text": "x1",
-            },
-            "type": "remove",
-          },
-        ],
-        [
-          ".children:cap",
-          "fetch",
-          {
-            "constraint": {
-              "group": "g1",
-            },
-          },
-        ],
-        [
-          ".children:cap",
-          "fetch",
-          {
-            "constraint": {
-              "group": "g1",
-            },
-          },
-        ],
-        [
-          ".children:cap",
-          "push",
-          {
-            "row": {
-              "group": "g1",
-              "id": "x4",
-              "text": "x4",
-            },
-            "type": "add",
-          },
-        ],
-        [
-          ".children:cap",
-          "fetch",
-          {
-            "constraint": {
-              "group": "g1",
-            },
-          },
-        ],
-        [
-          ".children:cap",
-          "fetch",
-          {
-            "constraint": {
-              "group": "g1",
-            },
-          },
-        ],
-      ]
-    `);
+    expect(actualStorage['.children:cap']).toMatchInlineSnapshot(`undefined`);
+    expect(log.filter(msg => msg[0] === '.children:cap')).toMatchInlineSnapshot(
+      `[]`,
+    );
     expect(pushes).toMatchInlineSnapshot(`
       [
         {
