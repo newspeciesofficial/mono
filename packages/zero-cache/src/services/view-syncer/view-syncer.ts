@@ -487,7 +487,15 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
             if (result === 'success') {
               return;
             }
-            lc.info?.(`resetting pipelines: ${result.message}`);
+            const breakdown = this.#pipelines.hydrationBudgetBreakdown();
+            lc.warn?.(
+              `resetting pipelines: ${result.message} | budget=${this.#pipelines.totalHydrationTimeMs().toFixed(0)}ms ` +
+                `queries=${breakdown.length} | top contributors: ` +
+                breakdown
+                  .slice(0, 10)
+                  .map(q => `${q.table}[${q.id.substring(0, 8)}]=${q.ms.toFixed(0)}ms`)
+                  .join(', '),
+            );
             this.#pipelines.reset(clientSchema);
             this.#pipelinesSynced = false;
           }

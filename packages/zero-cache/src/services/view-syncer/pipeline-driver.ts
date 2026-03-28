@@ -333,6 +333,13 @@ export class PipelineDriver {
     return total;
   }
 
+  /** Returns per-query hydration times for diagnostics. */
+  hydrationBudgetBreakdown(): {id: string; table: string; ms: number}[] {
+    return [...this.#pipelines.entries()]
+      .map(([id, p]) => ({id, table: p.transformedAst.table, ms: p.hydrationTimeMs}))
+      .sort((a, b) => b.ms - a.ms);
+  }
+
   #resolveScalarSubqueries(ast: AST): {
     ast: AST;
     companionRows: {table: string; row: Row}[];
@@ -700,6 +707,13 @@ export class PipelineDriver {
         }
 
         const elapsed = timer.totalElapsed() - start;
+        if (elapsed > 50) {
+          this.#lc.info?.(
+            `slow advance change: table=${table} pos=${this.#advanceContext.pos}/${numChanges} ` +
+              `changeTime=${elapsed.toFixed(0)}ms totalElapsed=${timer.totalElapsed().toFixed(0)}ms ` +
+              `budget=${totalHydrationTimeMs.toFixed(0)}ms`,
+          );
+        }
         this.#advanceTime.record(elapsed / 1000, {
           table,
           type,
