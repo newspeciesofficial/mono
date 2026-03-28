@@ -749,7 +749,8 @@ export class CVRQueryDrivenUpdater extends CVRUpdater {
   ): CVRVersion {
     assert(
       cmpVersions(this._orig.version, this._cvr.version) < 0,
-      `Expected CVR version to have been bumped above original` +
+      () =>
+        `Expected CVR version to have been bumped above original` +
         ` (orig=${versionString(this._orig.version)},` +
         ` curr=${versionString(this._cvr.version)}).` +
         ` Row ${JSON.stringify(rowID)}:` +
