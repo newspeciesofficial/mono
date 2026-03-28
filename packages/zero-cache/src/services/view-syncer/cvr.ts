@@ -614,6 +614,13 @@ export class CVRQueryDrivenUpdater extends CVRUpdater {
       // The error will surface when this.#existingRows is awaited.
       void this.#existingRows.then(() => {});
 
+      const versionBumped =
+        cmpVersions(this._orig.version, this._cvr.version) < 0;
+      lc.info?.(
+        `trackQueries: ${executed.length} executed, ${removed.length} removed, ` +
+          `version ${versionBumped ? 'bumped' : 'unchanged'}`,
+      );
+
       return {
         newVersion: this._cvr.version,
         queryPatches: queryPatches.map(patch => ({
