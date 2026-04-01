@@ -619,6 +619,16 @@ export const zeroOptions = {
     ],
   },
 
+  numPoolThreads: {
+    type: v.number().default(0),
+    desc: [
+      `The number of IVM pool worker threads per syncer process.`,
+      `When set to 0 (default), IVM runs on the syncer's main thread (current behavior).`,
+      `When > 0, each syncer spawns this many worker_threads for parallel IVM computation.`,
+      `Queries are distributed across threads round-robin by least-loaded.`,
+    ],
+  },
+
   autoReset: {
     type: v.boolean().default(true),
     desc: [

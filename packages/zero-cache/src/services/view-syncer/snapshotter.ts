@@ -175,9 +175,17 @@ export class Snapshotter {
   advance(
     syncableTables: Map<string, LiteAndZqlSpec>,
     allTableNames: Set<string>,
+    upperBound?: string | undefined,
   ): SnapshotDiff {
     const {prev, curr} = this.advanceWithoutDiff();
-    return new Diff(this.#appID, syncableTables, allTableNames, prev, curr);
+    return new Diff(
+      this.#appID,
+      syncableTables,
+      allTableNames,
+      prev,
+      curr,
+      upperBound,
+    );
   }
 
   advanceWithoutDiff() {
@@ -314,9 +322,20 @@ class Snapshot {
     return count;
   }
 
-  changesSince(prevVersion: string) {
+  changesSince(prevVersion: string, upperBound?: string | undefined) {
     // Note: The queried fields are constrained to only those that are relevant
     // to the snapshot diff, i.e. those defined in the changeLogEntrySchema.
+    if (upperBound !== undefined) {
+      const cached = this.db.statementCache.get(
+        `SELECT "stateVersion", "table", "rowKey", "op" FROM "_zero.changeLog2"
+           WHERE "stateVersion" > ? AND "stateVersion" <= ?
+           ORDER BY "stateVersion" ASC, "pos" ASC`,
+      );
+      return {
+        changes: cached.statement.iterate(prevVersion, upperBound),
+        cleanup: () => this.db.statementCache.return(cached),
+      };
+    }
     const cached = this.db.statementCache.get(
       `SELECT "stateVersion", "table", "rowKey", "op" FROM "_zero.changeLog2"
          WHERE "stateVersion" > ? ORDER BY "stateVersion" ASC, "pos" ASC`,
@@ -390,6 +409,7 @@ class Diff implements SnapshotDiff {
   readonly #permissionsTable: string;
   readonly #syncableTables: Map<string, LiteAndZqlSpec>;
   readonly #allTableNames: Set<string>;
+  readonly #upperBound: string | undefined;
   readonly prev: Snapshot;
   readonly curr: Snapshot;
   readonly changes: number;
@@ -400,17 +420,22 @@ class Diff implements SnapshotDiff {
     allTableNames: Set<string>,
     prev: Snapshot,
     curr: Snapshot,
+    upperBound?: string | undefined,
   ) {
     this.#permissionsTable = `${appID}.permissions`;
     this.#syncableTables = syncableTables;
     this.#allTableNames = allTableNames;
+    this.#upperBound = upperBound;
     this.prev = prev;
     this.curr = curr;
     this.changes = curr.numChangesSince(prev.version);
   }
 
   [Symbol.iterator](): Iterator<Change> {
-    const {changes, cleanup: done} = this.curr.changesSince(this.prev.version);
+    const {changes, cleanup: done} = this.curr.changesSince(
+      this.prev.version,
+      this.#upperBound,
+    );
 
     const cleanup = () => {
       try {
