@@ -47,9 +47,14 @@ import {initReplicationState} from '../replicator/schema/replication-state.ts';
 import {fakeReplicator, ReplicationMessages} from '../replicator/test-utils.ts';
 import {DrainCoordinator} from './drain-coordinator.ts';
 import {PipelineDriver} from './pipeline-driver.ts';
+import type {PipelineDriverInterface} from './pipeline-driver.ts';
+import {RemotePipelineDriver} from './remote-pipeline-driver.ts';
 import {initViewSyncerSchema} from './schema/init.ts';
 import {Snapshotter} from './snapshotter.ts';
 import {type SyncContext, ViewSyncerService} from './view-syncer.ts';
+import {Worker as WorkerThread} from 'node:worker_threads';
+import type {PoolThreadWorkerData} from '../../server/pool-thread.ts';
+import {POOL_THREAD_URL} from '../../server/worker-urls.ts';
 
 export const APP_ID = 'this_app';
 export const SHARD_NUM = 2;
@@ -581,6 +586,7 @@ export async function setup(
   testName: string,
   permissions: PermissionsConfig | undefined,
   validateLegacyJWT: ValidateLegacyJWT | undefined = undefined,
+  usePoolThreads = false,
 ) {
   const lc = createSilentLogContext();
   const storageDB = new Database(lc, ':memory:');
@@ -719,14 +725,36 @@ export async function setup(
 
   const inspectorDelegate = new InspectorDelegate(customQueryTransformer);
   const authSession = new AuthSessionImpl(lc, serviceID, validateLegacyJWT);
-  const vs = new ViewSyncerService(
-    config,
-    lc,
-    SHARD,
-    TASK_ID,
-    serviceID,
-    cvrDB,
-    new PipelineDriver(
+
+  let pipelineDriver: PipelineDriverInterface;
+  let poolThreads: WorkerThread[] = [];
+
+  if (usePoolThreads) {
+    const workerData: PoolThreadWorkerData = {
+      replicaFile: replicaDbFile.path,
+      shardID: SHARD,
+      logConfig: testLogConfig,
+      yieldThresholdMs: YIELD_THRESHOLD_MS,
+      enableQueryPlanner: undefined,
+    };
+    // Spawn 2 pool threads for tests.
+    // Worker threads need tsx to load .ts files.
+    for (let i = 0; i < 2; i++) {
+      poolThreads.push(
+        new WorkerThread(POOL_THREAD_URL, {
+          workerData,
+          execArgv: ['--experimental-strip-types', '--no-warnings'],
+        }),
+      );
+    }
+    pipelineDriver = new RemotePipelineDriver(
+      lc.withContext('component', 'remote-pipeline-driver'),
+      poolThreads,
+      replicaDbFile.path,
+      SHARD,
+    );
+  } else {
+    pipelineDriver = new PipelineDriver(
       lc.withContext('component', 'pipeline-driver'),
       testLogConfig,
       new Snapshotter(lc, replicaDbFile.path, SHARD),
@@ -735,7 +763,17 @@ export async function setup(
       'view-syncer.pg.test.ts',
       inspectorDelegate,
       () => YIELD_THRESHOLD_MS,
-    ),
+    );
+  }
+
+  const vs = new ViewSyncerService(
+    config,
+    lc,
+    SHARD,
+    TASK_ID,
+    serviceID,
+    cvrDB,
+    pipelineDriver,
     stateChanges,
     drainCoordinator,
     100,
@@ -810,6 +848,7 @@ export async function setup(
     setTimeoutFn,
     inspectorDelegate,
     customQueryTransformer,
+    poolThreads,
   };
 }
 

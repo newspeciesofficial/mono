@@ -124,9 +124,47 @@ export type Timer = {
 const MIN_ADVANCEMENT_TIME_LIMIT_MS = 50;
 
 /**
+ * The interface that ViewSyncer uses to interact with pipelines.
+ * Implemented by both PipelineDriver (local, same process) and
+ * RemotePipelineDriver (delegates to pool worker threads).
+ */
+export interface PipelineDriverInterface {
+  readonly replicaVersion: string;
+
+  initialized(): boolean;
+  init(clientSchema: ClientSchema): void | Promise<void>;
+  reset(clientSchema: ClientSchema): void | Promise<void>;
+  advanceWithoutDiff(): string | Promise<string>;
+  currentVersion(): string;
+  currentPermissions(): LoadedPermissions | null;
+  totalHydrationTimeMs(): number;
+  queries(): ReadonlyMap<string, QueryInfo>;
+  addQuery(
+    transformationHash: string,
+    queryID: string,
+    query: AST,
+    timer: Timer,
+  ): Iterable<RowChange | 'yield'> | Promise<Iterable<RowChange | 'yield'>>;
+  removeQuery(queryID: string): void;
+  getRow(table: string, pk: RowKey): Row | undefined;
+  advance(timer: Timer):
+    | {
+        version: string;
+        numChanges: number;
+        changes: Iterable<RowChange | 'yield'>;
+      }
+    | Promise<{
+        version: string;
+        numChanges: number;
+        changes: Iterable<RowChange | 'yield'>;
+      }>;
+  destroy(): void;
+}
+
+/**
  * Manages the state of IVM pipelines for a given ViewSyncer (i.e. client group).
  */
-export class PipelineDriver {
+export class PipelineDriver implements PipelineDriverInterface {
   readonly #tables = new Map<string, TableSource>();
   // Query id to pipeline
   readonly #pipelines = new Map<string, Pipeline>();
@@ -596,7 +634,10 @@ export class PipelineDriver {
    *         `changes` must be iterated over in their entirety in order to
    *         advance the database snapshot.
    */
-  advance(timer: Timer): {
+  advance(
+    timer: Timer,
+    upperBound?: string | undefined,
+  ): {
     version: string;
     numChanges: number;
     changes: Iterable<RowChange | 'yield'>;
@@ -608,6 +649,7 @@ export class PipelineDriver {
     const diff = this.#snapshotter.advance(
       this.#tableSpecs,
       this.#allTableNames,
+      upperBound,
     );
     const {prev, curr, changes} = diff;
     this.#lc.debug?.(

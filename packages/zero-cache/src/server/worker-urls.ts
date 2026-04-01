@@ -19,3 +19,4 @@ export const REAPER_URL = resolve('./reaper.ts');
 export const REPLICATOR_URL = resolve('./replicator.ts');
 export const SYNCER_URL = resolve('./syncer.ts');
 export const WRITE_WORKER_URL = resolve('./write-worker.ts');
+export const POOL_THREAD_URL = resolve('./pool-thread.ts');
