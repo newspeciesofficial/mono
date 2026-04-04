@@ -158,6 +158,18 @@ export interface PipelineDriverInterface {
         numChanges: number;
         changes: Iterable<RowChange | 'yield'>;
       }>;
+  advanceWithRecovery(
+    clientSchema: ClientSchema,
+    timer: Timer,
+    upperBound?: string | undefined,
+  ):
+    | {version: string; numChanges: number; changes: RowChange[]; didReset: boolean}
+    | Promise<{
+        version: string;
+        numChanges: number;
+        changes: RowChange[];
+        didReset: boolean;
+      }>;
   destroy(): void;
 }
 
@@ -661,6 +673,85 @@ export class PipelineDriver implements PipelineDriverInterface {
       numChanges: changes,
       changes: this.#advance(diff, timer, changes),
     };
+  }
+
+  /**
+   * Advances pipelines and collects all changes. If the circuit breaker
+   * fires (ResetPipelinesSignal), handles recovery internally: resets
+   * pipelines, advances snapshot, re-hydrates all queries, and returns
+   * the re-hydrated changes. The caller never sees the signal.
+   *
+   * This is the same recovery flow as ViewSyncer's run loop (line 485-513).
+   * Both the ViewSyncer and pool worker threads use this method.
+   */
+  advanceWithRecovery(
+    clientSchema: ClientSchema,
+    timer: Timer,
+    upperBound?: string | undefined,
+  ): {
+    version: string;
+    numChanges: number;
+    changes: RowChange[];
+    didReset: boolean;
+  } {
+    const {version, numChanges, changes} = this.advance(timer, upperBound);
+
+    try {
+      const collected: RowChange[] = [];
+      for (const change of changes) {
+        if (change === 'yield') {
+          continue;
+        }
+        collected.push(change);
+      }
+      return {version, numChanges, changes: collected, didReset: false};
+    } catch (e) {
+      if (e instanceof ResetPipelinesSignal) {
+        this.#lc.info?.(`resetting pipelines: ${e.message}`);
+
+        // Save query info before reset clears #pipelines.
+        const queryInfos = new Map<
+          string,
+          {transformationHash: string; ast: AST}
+        >();
+        for (const [id, pipeline] of this.#pipelines.entries()) {
+          queryInfos.set(id, {
+            transformationHash: pipeline.transformationHash,
+            ast: pipeline.transformedAst,
+          });
+        }
+
+        // Same recovery as ViewSyncer run loop (line 490-513):
+        // 1. Reset — destroys pipelines, re-reads table specs
+        this.reset(clientSchema);
+
+        // 2. Advance snapshot to head without computing diff
+        const newVersion = this.advanceWithoutDiff();
+
+        // 3. Re-hydrate all queries from scratch
+        const rehydrated: RowChange[] = [];
+        for (const [queryID, info] of queryInfos.entries()) {
+          for (const change of this.addQuery(
+            info.transformationHash,
+            queryID,
+            info.ast,
+            timer,
+          )) {
+            if (change !== 'yield') {
+              rehydrated.push(change);
+            }
+          }
+        }
+
+        return {
+          version: newVersion,
+          numChanges: 0,
+          changes: rehydrated,
+          didReset: true,
+        };
+      }
+      throw e;
+    }
   }
 
   *#advance(
