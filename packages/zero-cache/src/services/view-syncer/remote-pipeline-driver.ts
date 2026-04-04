@@ -91,6 +91,10 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
         const pending = queue.shift();
         if (pending) {
           if (msg.type === 'error') {
+            this.#lc.warn?.(
+              `RemotePipelineDriver received error from pool thread: ` +
+                `name=${msg.name} message=${msg.message}`,
+            );
             const error =
               msg.name === 'ResetPipelinesSignal'
                 ? new ResetPipelinesSignal(msg.message)
@@ -322,14 +326,26 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
       threadsWithQueries.add(thread);
     }
 
-    const results = await Promise.all(
-      [...threadsWithQueries].map(thread =>
-        this.#sendAndWait(thread, {
-          type: 'advance',
-          targetVersion,
-        }),
-      ),
-    );
+    let results: PoolWorkerResult[];
+    try {
+      results = await Promise.all(
+        [...threadsWithQueries].map(thread =>
+          this.#sendAndWait(thread, {
+            type: 'advance',
+            targetVersion,
+          }),
+        ),
+      );
+    } catch (e) {
+      const elapsed = performance.now() - start;
+      const error = e instanceof Error ? e : new Error(String(e));
+      this.#lc.error?.(
+        `RemotePipelineDriver advance FAILED after ${elapsed.toFixed(1)}ms: ` +
+          `${error.name}: ${error.message} ` +
+          `(${this.#queryAssignments.size} queries on ${threadsWithQueries.size} threads)`,
+      );
+      throw e;
+    }
 
     // Merge results.
     const allChanges: RowChange[] = [];
@@ -351,6 +367,33 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
       version: targetVersion,
       numChanges: totalNumChanges,
       changes: allChanges,
+    };
+  }
+
+  async advanceWithRecovery(
+    _clientSchema: ClientSchema,
+    timer: Timer,
+    _upperBound?: string | undefined,
+  ): Promise<{
+    version: string;
+    numChanges: number;
+    changes: RowChange[];
+    didReset: boolean;
+  }> {
+    // Pool threads handle ResetPipelinesSignal internally via
+    // PipelineDriver.advanceWithRecovery(). The syncer never sees the error.
+    const result = await this.advance(timer);
+    const changes: RowChange[] = [];
+    for (const change of result.changes) {
+      if (change !== 'yield') {
+        changes.push(change);
+      }
+    }
+    return {
+      version: result.version,
+      numChanges: result.numChanges,
+      changes,
+      didReset: false,
     };
   }
 

@@ -11,10 +11,7 @@ import {
   type RowChange,
   type Timer,
 } from '../services/view-syncer/pipeline-driver.ts';
-import {
-  ResetPipelinesSignal,
-  Snapshotter,
-} from '../services/view-syncer/snapshotter.ts';
+import {Snapshotter} from '../services/view-syncer/snapshotter.ts';
 import {DatabaseStorage} from '../../../zqlite/src/database-storage.ts';
 import type {LogConfig} from '../config/zero-config.ts';
 import type {ShardID} from '../types/shards.ts';
@@ -124,7 +121,8 @@ port.on('message', (msg: PoolWorkerMsg) => {
 
         lc.info?.(
           `pool-thread hydrated query=${queryID} rows=${changes.length} ` +
-            `time=${timer.totalElapsed().toFixed(1)}ms version=${driver.currentVersion()}`,
+            `time=${timer.totalElapsed().toFixed(1)}ms version=${driver.currentVersion()} ` +
+            `totalQueriesOnThread=${drivers.size}`,
         );
 
         send({
@@ -139,6 +137,7 @@ port.on('message', (msg: PoolWorkerMsg) => {
       }
 
       case 'advance': {
+        assert(clientSchema !== null, 'Must send init before advance');
         const {targetVersion} = msg;
         const allChanges: RowChange[] = [];
         let version = targetVersion;
@@ -146,27 +145,39 @@ port.on('message', (msg: PoolWorkerMsg) => {
         const start = performance.now();
 
         for (const [queryID, {driver}] of drivers) {
-          try {
-            const result = driver.advance(createTimer(), targetVersion);
-            version = result.version;
-            totalNumChanges += result.numChanges;
-            allChanges.push(...collectChanges(result.changes));
-          } catch (e) {
-            if (e instanceof ResetPipelinesSignal) {
-              lc.info?.(
-                `pool-thread ResetPipelinesSignal for query=${queryID}: ${e.message}`,
-              );
-              throw e;
-            }
-            throw e;
-          }
+          const t0 = performance.now();
+
+          // Same advance + error recovery as ViewSyncer's run loop.
+          // If ResetPipelinesSignal fires, recovery (reset + re-hydrate)
+          // happens inside advanceWithRecovery. We never see the error.
+          const result = driver.advanceWithRecovery(
+            clientSchema,
+            createTimer(),
+            targetVersion,
+          );
+
+          version = result.version;
+          totalNumChanges += result.numChanges;
+          const changesBefore = allChanges.length;
+          allChanges.push(...result.changes);
+          const queryRows = allChanges.length - changesBefore;
+          const elapsed = performance.now() - t0;
+
+          lc.info?.(
+            `pool-thread TIMING query=${queryID} ` +
+              `total=${elapsed.toFixed(2)}ms ` +
+              `numChanges=${result.numChanges} ` +
+              `rows=${queryRows} ` +
+              `didReset=${result.didReset} ` +
+              `hydrationTimeMs=${driver.totalHydrationTimeMs().toFixed(2)}`,
+          );
         }
 
         const elapsed = performance.now() - start;
-        lc.debug?.(
+        lc.info?.(
           `pool-thread advanced ${drivers.size} queries to=${version} ` +
             `changes=${totalNumChanges} resultRows=${allChanges.length} ` +
-            `time=${elapsed.toFixed(1)}ms`,
+            `totalTime=${elapsed.toFixed(1)}ms`,
         );
 
         send({
