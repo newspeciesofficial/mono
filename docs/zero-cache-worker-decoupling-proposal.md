@@ -1171,3 +1171,52 @@ zbugs uses custom queries that require `ZERO_QUERY_URL` in `.env`. The deprecate
 | view-syncer-pool.pg.test (pool threads) | 3 | Pass |
 | zbugs end-to-end | Manual | Pass |
 | **Total** | **137 + manual** | **All pass** |
+
+### 17.11 Why SQLite Snapshot Isolation (WAL Lock) Cannot Be Removed
+
+**The temptation:** The `targetVersion` upper bound on the ChangeLog query seems sufficient for correctness. If we bound by `<= targetVersion`, we only process changes up to that version. So why do we need `beginConcurrent` to pin a snapshot?
+
+**The bug if you remove it:**
+
+The ChangeLog has a `UNIQUE("table", "rowKey")` constraint. When the replicator modifies row X at version 9, it does `INSERT OR REPLACE`, which REPLACES the version 8 entry. The old entry is gone.
+
+Without snapshot isolation:
+
+```
+Syncer reads targetVersion = 8
+Replicator commits version 9, replaces row X's ChangeLog entry from 8 to 9
+Pool thread reads ChangeLog <= 8: row X NOT FOUND (entry is now at version 9)
+→ Row X's change at version 8 is MISSED
+
+Next cycle: targetVersion = 9
+Replicator commits version 10, replaces row X's ChangeLog entry from 9 to 10
+Pool thread reads ChangeLog <= 9: row X NOT FOUND again
+→ Missed again
+```
+
+**Under sustained writes to the same row** (e.g., "last viewed at" on a busy channel, or a frequently edited message), the ChangeLog entry keeps getting replaced to a newer version before the bounded query runs. The client NEVER sees the update. It is perpetually one step behind.
+
+**With snapshot isolation (`beginConcurrent`):** The snapshot pins the ChangeLog at a fixed point in time. The version 8 entry exists in that snapshot even after the replicator replaces it in a later transaction. The bounded query finds it. No change is missed.
+
+**The old code (no pool threads) doesn't have this problem** because the Snapshotter does `beginConcurrent` before reading the ChangeLog. Both the version read and the ChangeLog read happen on the same snapshot — they're consistent.
+
+**The pool thread code initially had a gap:** the syncer read `targetVersion` on its own connection, then the pool thread did `beginConcurrent` on a separate connection at a potentially later version. This gap was safe because the `targetVersion` bound + UNIQUE constraint handle the version-ahead case correctly (proven in Section 7.2). But it would be UNSAFE without `beginConcurrent` entirely, because the ChangeLog entries themselves could be replaced between reads.
+
+**Conclusion:** The WAL lock (via `beginConcurrent`) is essential for correctness. It cannot be removed. The optimization path is to minimize the NUMBER of WAL locks — one Snapshotter per client group per thread (current implementation), not one per query (the initial bug).
+
+### 17.12 Shared PipelineDriver Per Client Group Eliminates WAL Contention
+
+**Initial implementation (wrong):** Each query on a pool thread got its own PipelineDriver with its own Snapshotter. 28 queries = 28 Snapshotters = 56 SQLite connections fighting for 4 WAL read-mark slots. `snapshotMs` was 40-45ms due to retry backoff.
+
+**Fixed implementation:** All queries for one client group share ONE PipelineDriver on the pool thread — exactly like the old code. One Snapshotter, one ChangeLog scan, shared TableSources.
+
+Results after fix:
+
+| Metric | Per-query PipelineDriver | Shared PipelineDriver |
+|---|---|---|
+| `snapshotMs` | 40-45ms | 0.14-2.46ms |
+| `totalMs` | 54ms | 5-17ms |
+| WAL lock acquisitions per advance | 28 | 1 |
+| SQLite connections per client group | 56 | 2 |
+
+**Why WAL2 has only 4 read-mark slots:** SQLite WAL mode uses file-level byte-range locks on the `-shm` file to register reader positions. WAL2 mode has 4 slots. When all slots are occupied and a new reader needs a different position, it retries with exponential backoff (up to 323ms per retry). With 28 Snapshotters, this contention was severe. With 1 per client group, it's gone.
