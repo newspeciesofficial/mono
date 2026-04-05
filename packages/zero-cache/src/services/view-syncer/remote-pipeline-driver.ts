@@ -308,26 +308,25 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
     numChanges: number;
     changes: Iterable<RowChange | 'yield'>;
   }> {
-    this.#refreshSpecs();
-    const targetVersion = this.currentVersion();
-
     if (!this.#assignedThread || this.#queryInfos.size === 0) {
-      return {version: targetVersion, numChanges: 0, changes: []};
+      return {version: this.currentVersion(), numChanges: 0, changes: []};
     }
 
     this.#lc.debug?.(
       `RemotePipelineDriver advancing clientGroup=${this.#clientGroupID} ` +
-        `${this.#queryInfos.size} queries to version=${targetVersion}`,
+        `${this.#queryInfos.size} queries`,
     );
 
     const start = performance.now();
 
     let result: PoolWorkerResult;
     try {
+      // Pool thread advances to head on its own — same as old code.
+      // No targetVersion. The pool thread's Snapshotter pins the snapshot
+      // and reads ChangeLog + row data consistently.
       result = await this.#sendAndWait(this.#assignedThread, {
         type: 'advance',
         clientGroupID: this.#clientGroupID,
-        targetVersion,
       });
     } catch (e) {
       const elapsed = performance.now() - start;
@@ -342,9 +341,13 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
 
     const advResult = result as AdvanceResult;
     const elapsed = performance.now() - start;
+
+    // Update syncer-side state with the version the pool thread advanced to.
+    this.#refreshSpecs();
+
     this.#lc.info?.(
       `RemotePipelineDriver advanced clientGroup=${this.#clientGroupID} ` +
-        `to=${targetVersion} changes=${advResult.numChanges} ` +
+        `to=${advResult.version} changes=${advResult.numChanges} ` +
         `rows=${advResult.changes.length} time=${elapsed.toFixed(1)}ms`,
     );
 

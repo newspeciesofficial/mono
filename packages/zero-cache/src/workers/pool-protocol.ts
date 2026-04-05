@@ -21,7 +21,6 @@ export type HydrateMsg = {
 export type AdvanceMsg = {
   type: 'advance';
   clientGroupID: string;
-  targetVersion: string;
 };
 
 export type DestroyQueryMsg = {

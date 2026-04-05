@@ -168,7 +168,7 @@ port.on('message', (msg: PoolWorkerMsg) => {
       }
 
       case 'advance': {
-        const {clientGroupID, targetVersion} = msg;
+        const {clientGroupID} = msg;
         const state = clientGroups.get(clientGroupID);
         assert(
           state !== undefined,
@@ -177,12 +177,12 @@ port.on('message', (msg: PoolWorkerMsg) => {
 
         const start = performance.now();
 
-        // One advance for ALL queries in this client group.
-        // One Snapshotter leapfrog, one ChangeLog scan, shared TableSources.
+        // Same advance as old code — Snapshotter advances to head,
+        // reads ChangeLog and row data from the same pinned snapshot.
+        // No targetVersion. Consistent reads guaranteed by snapshot.
         const result = state.driver.advanceWithRecovery(
           state.clientSchema,
           createTimer(),
-          targetVersion,
         );
 
         const elapsed = performance.now() - start;
