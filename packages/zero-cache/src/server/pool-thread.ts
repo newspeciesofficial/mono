@@ -96,8 +96,12 @@ port.on('message', (msg: PoolWorkerMsg) => {
         const {queryID, transformationHash, ast} = msg;
         lc.info?.(`pool-thread hydrating query=${queryID} table=${ast.table}`);
 
-        // Create a PipelineDriver + Snapshotter for this query.
+        // Step 1: Create Snapshotter (opens 1 SQLite connection)
+        const tH0 = performance.now();
         const snapshotter = new Snapshotter(lc, replicaFile, shardID);
+        const tHSnapshotter = performance.now();
+
+        // Step 2: Create PipelineDriver
         const driver = new PipelineDriver(
           lc.withContext('queryID', queryID),
           logConfig,
@@ -109,19 +113,30 @@ port.on('message', (msg: PoolWorkerMsg) => {
           () => yieldThresholdMs,
           enableQueryPlanner,
         );
+        const tHDriver = performance.now();
 
-        // Initialize and hydrate.
+        // Step 3: Init (opens snapshot, reads table specs)
         driver.init(clientSchema);
+        const tHInit = performance.now();
+
+        // Step 4: addQuery (builds IVM pipeline + full table scan)
         const timer = createTimer();
         const changes = collectChanges(
           driver.addQuery(transformationHash, queryID, ast, timer),
         );
+        const tHQuery = performance.now();
 
         drivers.set(queryID, {driver, snapshotter});
 
         lc.info?.(
-          `pool-thread hydrated query=${queryID} rows=${changes.length} ` +
-            `time=${timer.totalElapsed().toFixed(1)}ms version=${driver.currentVersion()} ` +
+          `pool-thread hydrated query=${queryID} ` +
+            `snapshotterMs=${(tHSnapshotter - tH0).toFixed(2)} ` +
+            `driverMs=${(tHDriver - tHSnapshotter).toFixed(2)} ` +
+            `initMs=${(tHInit - tHDriver).toFixed(2)} ` +
+            `addQueryMs=${(tHQuery - tHInit).toFixed(2)} ` +
+            `totalMs=${(tHQuery - tH0).toFixed(2)} ` +
+            `rows=${changes.length} ` +
+            `version=${driver.currentVersion()} ` +
             `totalQueriesOnThread=${drivers.size}`,
         );
 
