@@ -157,11 +157,16 @@ port.on('message', (msg: PoolWorkerMsg) => {
         const allChanges: RowChange[] = [];
         let version = targetVersion;
         let totalNumChanges = 0;
+        let totalResets = 0;
+        let slowestQueryId = '';
+        let slowestQueryMs = 0;
+        let totalSnapshotMs = 0;
+        let totalCollectMs = 0;
+        let totalDiffReadMs = 0;
+        let totalIvmPushMs = 0;
         const start = performance.now();
 
         for (const [queryID, {driver}] of drivers) {
-          const t0 = performance.now();
-
           // Same advance + error recovery as ViewSyncer's run loop.
           // If ResetPipelinesSignal fires, recovery (reset + re-hydrate)
           // happens inside advanceWithRecovery. We never see the error.
@@ -173,26 +178,31 @@ port.on('message', (msg: PoolWorkerMsg) => {
 
           version = result.version;
           totalNumChanges += result.numChanges;
-          const changesBefore = allChanges.length;
           allChanges.push(...result.changes);
-          const queryRows = allChanges.length - changesBefore;
-          const elapsed = performance.now() - t0;
+          if (result.didReset) totalResets++;
 
-          lc.info?.(
-            `pool-thread TIMING query=${queryID} ` +
-              `total=${elapsed.toFixed(2)}ms ` +
-              `numChanges=${result.numChanges} ` +
-              `rows=${queryRows} ` +
-              `didReset=${result.didReset} ` +
-              `hydrationTimeMs=${driver.totalHydrationTimeMs().toFixed(2)}`,
-          );
+          // Aggregate metrics
+          totalSnapshotMs += result.metrics.snapshotMs;
+          totalCollectMs += result.metrics.collectMs;
+          totalDiffReadMs += result.metrics.diffReadMs;
+          totalIvmPushMs += result.metrics.ivmPushMs;
+          if (result.metrics.totalMs > slowestQueryMs) {
+            slowestQueryMs = result.metrics.totalMs;
+            slowestQueryId = queryID;
+          }
         }
 
         const elapsed = performance.now() - start;
         lc.info?.(
-          `pool-thread advanced ${drivers.size} queries to=${version} ` +
-            `changes=${totalNumChanges} resultRows=${allChanges.length} ` +
-            `totalTime=${elapsed.toFixed(1)}ms`,
+          `pool-thread advanced queries=${drivers.size} to=${version} ` +
+            `changes=${totalNumChanges} rows=${allChanges.length} ` +
+            `resets=${totalResets} ` +
+            `snapshotMs=${totalSnapshotMs.toFixed(2)} ` +
+            `diffReadMs=${totalDiffReadMs.toFixed(2)} ` +
+            `ivmPushMs=${totalIvmPushMs.toFixed(2)} ` +
+            `collectMs=${totalCollectMs.toFixed(2)} ` +
+            `slowest=${slowestQueryId}@${slowestQueryMs.toFixed(2)}ms ` +
+            `totalMs=${elapsed.toFixed(1)}`,
         );
 
         send({

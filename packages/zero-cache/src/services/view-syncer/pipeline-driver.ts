@@ -212,15 +212,24 @@ export interface PipelineDriverInterface {
     timer: Timer,
     upperBound?: string | undefined,
   ):
-    | {version: string; numChanges: number; changes: RowChange[]; didReset: boolean}
-    | Promise<{
-        version: string;
-        numChanges: number;
-        changes: RowChange[];
-        didReset: boolean;
-      }>;
+    | AdvanceWithRecoveryResult
+    | Promise<AdvanceWithRecoveryResult>;
   destroy(): void;
 }
+
+export type AdvanceWithRecoveryResult = {
+  version: string;
+  numChanges: number;
+  changes: RowChange[];
+  didReset: boolean;
+  metrics: {
+    snapshotMs: number;
+    collectMs: number;
+    diffReadMs: number;
+    ivmPushMs: number;
+    totalMs: number;
+  };
+};
 
 /**
  * Manages the state of IVM pipelines for a given ViewSyncer (i.e. client group).
@@ -738,12 +747,7 @@ export class PipelineDriver implements PipelineDriverInterface {
     clientSchema: ClientSchema,
     timer: Timer,
     upperBound?: string | undefined,
-  ): {
-    version: string;
-    numChanges: number;
-    changes: RowChange[];
-    didReset: boolean;
-  } {
+  ): AdvanceWithRecoveryResult {
     // Step 1: Snapshotter leapfrog + Diff creation
     const t0 = performance.now();
     const {version, numChanges, changes} = this.advance(timer, upperBound);
@@ -760,32 +764,29 @@ export class PipelineDriver implements PipelineDriverInterface {
       }
       const tCollect = performance.now();
 
-      const metrics = this.#advanceMetrics;
-      this.#lc.info?.(
-        `advanceWithRecovery snapshotMs=${(tSnapshotAdvance - t0).toFixed(2)} ` +
-          `collectMs=${(tCollect - tSnapshotAdvance).toFixed(2)} ` +
-          `totalMs=${(tCollect - t0).toFixed(2)} ` +
-          `numChanges=${numChanges} rows=${collected.length} ` +
-          `${metrics ? metrics.toLogString() + ' ' : ''}` +
-          `hydrationTimeMs=${this.totalHydrationTimeMs().toFixed(2)} ` +
-          `didReset=false`,
-      );
+      const advMetrics = this.#advanceMetrics;
       this.#advanceMetrics = null;
+      const snapshotMs = tSnapshotAdvance - t0;
+      const collectMs = tCollect - tSnapshotAdvance;
 
-      return {version, numChanges, changes: collected, didReset: false};
+      return {
+        version,
+        numChanges,
+        changes: collected,
+        didReset: false,
+        metrics: {
+          snapshotMs,
+          collectMs,
+          diffReadMs: advMetrics?.diffReadMs ?? 0,
+          ivmPushMs: advMetrics?.ivmPushMs ?? 0,
+          totalMs: tCollect - t0,
+        },
+      };
     } catch (e) {
       const tError = performance.now();
       if (e instanceof ResetPipelinesSignal) {
-        const metrics = this.#advanceMetrics;
+        const resetMetrics = this.#advanceMetrics;
         this.#advanceMetrics = null;
-        this.#lc.info?.(
-          `advanceWithRecovery RESET snapshotMs=${(tSnapshotAdvance - t0).toFixed(2)} ` +
-            `collectMs=${(tError - tSnapshotAdvance).toFixed(2)} ` +
-            `totalBeforeReset=${(tError - t0).toFixed(2)} ` +
-            `${metrics ? metrics.toLogString() + ' ' : ''}` +
-            `hydrationTimeMs=${this.totalHydrationTimeMs().toFixed(2)} ` +
-            `reason=${e.message}`,
-        );
 
         // Save query info before reset clears #pipelines.
         const queryInfos = new Map<
@@ -799,19 +800,12 @@ export class PipelineDriver implements PipelineDriverInterface {
           });
         }
 
-        // Step 3: Reset — destroys pipelines, re-reads table specs
-        const tResetStart = performance.now();
+        // Same recovery as ViewSyncer run loop (line 490-513):
         this.reset(clientSchema);
-        const tResetEnd = performance.now();
-
-        // Step 4: Advance snapshot to head without computing diff
         const newVersion = this.advanceWithoutDiff();
-        const tAdvanceWithoutDiff = performance.now();
 
-        // Step 5: Re-hydrate all queries from scratch
         const rehydrated: RowChange[] = [];
         for (const [queryID, info] of queryInfos.entries()) {
-          const tQueryStart = performance.now();
           for (const change of this.addQuery(
             info.transformationHash,
             queryID,
@@ -822,30 +816,27 @@ export class PipelineDriver implements PipelineDriverInterface {
               rehydrated.push(change);
             }
           }
-          const tQueryEnd = performance.now();
-          this.#lc.info?.(
-            `advanceWithRecovery rehydrate query=${queryID} ` +
-              `rows=${rehydrated.length} time=${(tQueryEnd - tQueryStart).toFixed(2)}ms`,
-          );
         }
 
         const tDone = performance.now();
-        this.#lc.info?.(
-          `advanceWithRecovery RESET COMPLETE ` +
-            `resetMs=${(tResetEnd - tResetStart).toFixed(2)} ` +
-            `advanceWithoutDiffMs=${(tAdvanceWithoutDiff - tResetEnd).toFixed(2)} ` +
-            `rehydrateMs=${(tDone - tAdvanceWithoutDiff).toFixed(2)} ` +
-            `totalRecoveryMs=${(tDone - tError).toFixed(2)} ` +
-            `totalMs=${(tDone - t0).toFixed(2)} ` +
-            `rehydratedRows=${rehydrated.length} ` +
-            `didReset=true`,
-        );
+        const snapshotMs = tSnapshotAdvance - t0;
+        const collectMs = tError - tSnapshotAdvance;
+
+        // One log for the reset event — important for debugging.
+        this.#lc.info?.(`advanceWithRecovery RESET reason=${e.message}`);
 
         return {
           version: newVersion,
           numChanges: 0,
           changes: rehydrated,
           didReset: true,
+          metrics: {
+            snapshotMs,
+            collectMs,
+            diffReadMs: resetMetrics?.diffReadMs ?? 0,
+            ivmPushMs: resetMetrics?.ivmPushMs ?? 0,
+            totalMs: tDone - t0,
+          },
         };
       }
       throw e;

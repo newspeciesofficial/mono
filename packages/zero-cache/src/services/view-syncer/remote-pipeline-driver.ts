@@ -23,6 +23,7 @@ import type {
   PoolWorkerResult,
 } from '../../workers/pool-protocol.ts';
 import type {
+  AdvanceWithRecoveryResult,
   PipelineDriverInterface,
   RowChange,
   Timer,
@@ -374,12 +375,7 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
     _clientSchema: ClientSchema,
     timer: Timer,
     _upperBound?: string | undefined,
-  ): Promise<{
-    version: string;
-    numChanges: number;
-    changes: RowChange[];
-    didReset: boolean;
-  }> {
+  ): Promise<AdvanceWithRecoveryResult> {
     // Pool threads handle ResetPipelinesSignal internally via
     // PipelineDriver.advanceWithRecovery(). The syncer never sees the error.
     const result = await this.advance(timer);
@@ -394,6 +390,7 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
       numChanges: result.numChanges,
       changes,
       didReset: false,
+      metrics: {snapshotMs: 0, collectMs: 0, diffReadMs: 0, ivmPushMs: 0, totalMs: 0},
     };
   }
 
