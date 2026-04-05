@@ -6,11 +6,13 @@ import type {RowChange} from '../services/view-syncer/pipeline-driver.ts';
 
 export type InitMsg = {
   type: 'init';
+  clientGroupID: string;
   clientSchema: ClientSchema;
 };
 
 export type HydrateMsg = {
   type: 'hydrate';
+  clientGroupID: string;
   queryID: string;
   transformationHash: string;
   ast: AST;
@@ -18,16 +20,19 @@ export type HydrateMsg = {
 
 export type AdvanceMsg = {
   type: 'advance';
+  clientGroupID: string;
   targetVersion: string;
 };
 
 export type DestroyQueryMsg = {
   type: 'destroyQuery';
+  clientGroupID: string;
   queryID: string;
 };
 
 export type ResetMsg = {
   type: 'reset';
+  clientGroupID: string;
   clientSchema: ClientSchema;
 };
 

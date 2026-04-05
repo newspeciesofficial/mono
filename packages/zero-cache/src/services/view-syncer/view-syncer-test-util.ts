@@ -752,6 +752,7 @@ export async function setup(
       poolThreads,
       replicaDbFile.path,
       SHARD,
+      serviceID,
     );
   } else {
     pipelineDriver = new PipelineDriver(

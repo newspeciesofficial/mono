@@ -171,6 +171,7 @@ export default function runWorker(
         poolThreads,
         replicaFile,
         shard,
+        id, // clientGroupID
       );
       logger.info?.(
         `Using RemotePipelineDriver with ${poolThreads.length} pool threads`,

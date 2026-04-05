@@ -15,10 +15,7 @@ import {Snapshotter} from '../services/view-syncer/snapshotter.ts';
 import {DatabaseStorage} from '../../../zqlite/src/database-storage.ts';
 import type {LogConfig} from '../config/zero-config.ts';
 import type {ShardID} from '../types/shards.ts';
-import type {
-  PoolWorkerMsg,
-  PoolWorkerResult,
-} from '../workers/pool-protocol.ts';
+import type {PoolWorkerMsg, PoolWorkerResult} from '../workers/pool-protocol.ts';
 
 export type PoolThreadWorkerData = {
   replicaFile: string;
@@ -42,19 +39,20 @@ const operatorStorage = DatabaseStorage.create(
 );
 const inspectorDelegate = new InspectorDelegate(undefined);
 
-// Each query gets its own PipelineDriver + Snapshotter.
-const drivers = new Map<
-  string,
-  {driver: PipelineDriver; snapshotter: Snapshotter}
->();
-
-let clientSchema: ClientSchema | null = null;
+// One PipelineDriver per client group — same as the old code.
+// Multiple queries on the same client group share one Snapshotter + TableSources.
+type ClientGroupState = {
+  driver: PipelineDriver;
+  snapshotter: Snapshotter;
+  clientSchema: ClientSchema;
+  queryCount: number;
+};
+const clientGroups = new Map<string, ClientGroupState>();
 
 function send(msg: PoolWorkerResult) {
   port!.postMessage(msg);
 }
 
-// Simple timer for hydration/advance.
 function createTimer(): Timer {
   const start = performance.now();
   let lapStart = start;
@@ -71,12 +69,45 @@ function collectChanges(changes: Iterable<RowChange | 'yield'>): RowChange[] {
   const result: RowChange[] = [];
   for (const change of changes) {
     if (change === 'yield') {
-      // Pool worker runs on its own core -- no need to yield for IO.
       continue;
     }
     result.push(change);
   }
   return result;
+}
+
+function getOrCreateClientGroup(
+  clientGroupID: string,
+  clientSchema: ClientSchema,
+): ClientGroupState {
+  let state = clientGroups.get(clientGroupID);
+  if (state) {
+    return state;
+  }
+
+  const snapshotter = new Snapshotter(lc, replicaFile, shardID);
+  const driver = new PipelineDriver(
+    lc.withContext('clientGroupID', clientGroupID),
+    logConfig,
+    snapshotter,
+    shardID,
+    operatorStorage.createClientGroupStorage(clientGroupID),
+    clientGroupID,
+    inspectorDelegate,
+    () => yieldThresholdMs,
+    enableQueryPlanner,
+  );
+  driver.init(clientSchema);
+
+  state = {driver, snapshotter, clientSchema, queryCount: 0};
+  clientGroups.set(clientGroupID, state);
+
+  lc.info?.(
+    `pool-thread created PipelineDriver for clientGroup=${clientGroupID} ` +
+      `totalClientGroups=${clientGroups.size}`,
+  );
+
+  return state;
 }
 
 lc.info?.(`pool-thread started. replica=${replicaFile}`);
@@ -85,59 +116,44 @@ port.on('message', (msg: PoolWorkerMsg) => {
   try {
     switch (msg.type) {
       case 'init': {
-        lc.info?.('pool-thread received init');
-        clientSchema = msg.clientSchema;
+        // Pre-create the PipelineDriver for this client group
+        const {clientGroupID, clientSchema} = msg;
+        getOrCreateClientGroup(clientGroupID, clientSchema);
         send({type: 'initResult', version: '', replicaVersion: ''});
         break;
       }
 
       case 'hydrate': {
-        assert(clientSchema !== null, 'Must send init before hydrate');
-        const {queryID, transformationHash, ast} = msg;
-        lc.info?.(`pool-thread hydrating query=${queryID} table=${ast.table}`);
+        const {clientGroupID, queryID, transformationHash, ast} = msg;
 
-        // Step 1: Create Snapshotter (opens 1 SQLite connection)
-        const tH0 = performance.now();
-        const snapshotter = new Snapshotter(lc, replicaFile, shardID);
-        const tHSnapshotter = performance.now();
-
-        // Step 2: Create PipelineDriver
-        const driver = new PipelineDriver(
-          lc.withContext('queryID', queryID),
-          logConfig,
-          snapshotter,
-          shardID,
-          operatorStorage.createClientGroupStorage(queryID),
-          queryID,
-          inspectorDelegate,
-          () => yieldThresholdMs,
-          enableQueryPlanner,
+        // Get or create the shared PipelineDriver for this client group
+        const state = clientGroups.get(clientGroupID);
+        assert(
+          state !== undefined,
+          `Must send init for clientGroup=${clientGroupID} before hydrate`,
         );
-        const tHDriver = performance.now();
 
-        // Step 3: Init (opens snapshot, reads table specs)
-        driver.init(clientSchema);
-        const tHInit = performance.now();
+        lc.info?.(
+          `pool-thread hydrating query=${queryID} table=${ast.table} ` +
+            `clientGroup=${clientGroupID}`,
+        );
 
-        // Step 4: addQuery (builds IVM pipeline + full table scan)
+        const tH0 = performance.now();
         const timer = createTimer();
         const changes = collectChanges(
-          driver.addQuery(transformationHash, queryID, ast, timer),
+          state.driver.addQuery(transformationHash, queryID, ast, timer),
         );
-        const tHQuery = performance.now();
+        const tH1 = performance.now();
 
-        drivers.set(queryID, {driver, snapshotter});
+        state.queryCount++;
 
         lc.info?.(
           `pool-thread hydrated query=${queryID} ` +
-            `snapshotterMs=${(tHSnapshotter - tH0).toFixed(2)} ` +
-            `driverMs=${(tHDriver - tHSnapshotter).toFixed(2)} ` +
-            `initMs=${(tHInit - tHDriver).toFixed(2)} ` +
-            `addQueryMs=${(tHQuery - tHInit).toFixed(2)} ` +
-            `totalMs=${(tHQuery - tH0).toFixed(2)} ` +
+            `addQueryMs=${(tH1 - tH0).toFixed(2)} ` +
             `rows=${changes.length} ` +
-            `version=${driver.currentVersion()} ` +
-            `totalQueriesOnThread=${drivers.size}`,
+            `version=${state.driver.currentVersion()} ` +
+            `queriesInGroup=${state.queryCount} ` +
+            `clientGroup=${clientGroupID}`,
         );
 
         send({
@@ -145,104 +161,98 @@ port.on('message', (msg: PoolWorkerMsg) => {
           queryID,
           changes,
           hydrationTimeMs: timer.totalElapsed(),
-          version: driver.currentVersion(),
-          replicaVersion: driver.replicaVersion,
+          version: state.driver.currentVersion(),
+          replicaVersion: state.driver.replicaVersion,
         });
         break;
       }
 
       case 'advance': {
-        assert(clientSchema !== null, 'Must send init before advance');
-        const {targetVersion} = msg;
-        const allChanges: RowChange[] = [];
-        let version = targetVersion;
-        let totalNumChanges = 0;
-        let totalResets = 0;
-        let slowestQueryId = '';
-        let slowestQueryMs = 0;
-        let totalSnapshotMs = 0;
-        let totalCollectMs = 0;
-        let totalDiffReadMs = 0;
-        let totalIvmPushMs = 0;
+        const {clientGroupID, targetVersion} = msg;
+        const state = clientGroups.get(clientGroupID);
+        assert(
+          state !== undefined,
+          `No PipelineDriver for clientGroup=${clientGroupID}`,
+        );
+
         const start = performance.now();
 
-        for (const [queryID, {driver}] of drivers) {
-          // Same advance + error recovery as ViewSyncer's run loop.
-          // If ResetPipelinesSignal fires, recovery (reset + re-hydrate)
-          // happens inside advanceWithRecovery. We never see the error.
-          const result = driver.advanceWithRecovery(
-            clientSchema,
-            createTimer(),
-            targetVersion,
-          );
-
-          version = result.version;
-          totalNumChanges += result.numChanges;
-          allChanges.push(...result.changes);
-          if (result.didReset) totalResets++;
-
-          // Aggregate metrics
-          totalSnapshotMs += result.metrics.snapshotMs;
-          totalCollectMs += result.metrics.collectMs;
-          totalDiffReadMs += result.metrics.diffReadMs;
-          totalIvmPushMs += result.metrics.ivmPushMs;
-          if (result.metrics.totalMs > slowestQueryMs) {
-            slowestQueryMs = result.metrics.totalMs;
-            slowestQueryId = queryID;
-          }
-        }
+        // One advance for ALL queries in this client group.
+        // One Snapshotter leapfrog, one ChangeLog scan, shared TableSources.
+        const result = state.driver.advanceWithRecovery(
+          state.clientSchema,
+          createTimer(),
+          targetVersion,
+        );
 
         const elapsed = performance.now() - start;
         lc.info?.(
-          `pool-thread advanced queries=${drivers.size} to=${version} ` +
-            `changes=${totalNumChanges} rows=${allChanges.length} ` +
-            `resets=${totalResets} ` +
-            `snapshotMs=${totalSnapshotMs.toFixed(2)} ` +
-            `diffReadMs=${totalDiffReadMs.toFixed(2)} ` +
-            `ivmPushMs=${totalIvmPushMs.toFixed(2)} ` +
-            `collectMs=${totalCollectMs.toFixed(2)} ` +
-            `slowest=${slowestQueryId}@${slowestQueryMs.toFixed(2)}ms ` +
+          `pool-thread advanced clientGroup=${clientGroupID} ` +
+            `queries=${state.queryCount} to=${result.version} ` +
+            `changes=${result.numChanges} rows=${result.changes.length} ` +
+            `didReset=${result.didReset} ` +
+            `snapshotMs=${result.metrics.snapshotMs.toFixed(2)} ` +
+            `diffReadMs=${result.metrics.diffReadMs.toFixed(2)} ` +
+            `ivmPushMs=${result.metrics.ivmPushMs.toFixed(2)} ` +
+            `collectMs=${result.metrics.collectMs.toFixed(2)} ` +
             `totalMs=${elapsed.toFixed(1)}`,
         );
 
         send({
           type: 'advanceResult',
-          version,
-          numChanges: totalNumChanges,
-          changes: allChanges,
+          version: result.version,
+          numChanges: result.numChanges,
+          changes: result.changes,
         });
         break;
       }
 
       case 'destroyQuery': {
-        const {queryID} = msg;
-        lc.info?.(`pool-thread destroying query=${queryID}`);
-        const entry = drivers.get(queryID);
-        if (entry) {
-          entry.driver.destroy();
-          drivers.delete(queryID);
+        const {clientGroupID, queryID} = msg;
+        const state = clientGroups.get(clientGroupID);
+        if (state) {
+          lc.info?.(
+            `pool-thread destroying query=${queryID} clientGroup=${clientGroupID}`,
+          );
+          state.driver.removeQuery(queryID);
+          state.queryCount--;
+
+          // If no more queries, destroy the PipelineDriver
+          if (state.queryCount <= 0) {
+            lc.info?.(
+              `pool-thread destroying PipelineDriver for clientGroup=${clientGroupID}`,
+            );
+            state.driver.destroy();
+            clientGroups.delete(clientGroupID);
+          }
         }
         send({type: 'destroyQueryResult', queryID});
         break;
       }
 
       case 'reset': {
-        lc.info?.(`pool-thread reset with ${drivers.size} queries`);
-        clientSchema = msg.clientSchema;
-        for (const [, {driver}] of drivers) {
-          driver.reset(clientSchema);
+        const {clientGroupID, clientSchema} = msg;
+        const state = clientGroups.get(clientGroupID);
+        if (state) {
+          lc.info?.(
+            `pool-thread reset clientGroup=${clientGroupID} ` +
+              `queries=${state.queryCount}`,
+          );
+          state.driver.reset(clientSchema);
+          state.clientSchema = clientSchema;
         }
-        // Return empty version -- syncer reads version from its own connection.
         send({type: 'resetResult', version: '', replicaVersion: ''});
         break;
       }
 
       case 'shutdown': {
-        lc.info?.(`pool-thread shutting down with ${drivers.size} queries`);
-        for (const [, {driver}] of drivers) {
-          driver.destroy();
+        lc.info?.(
+          `pool-thread shutting down with ${clientGroups.size} client groups`,
+        );
+        for (const [, state] of clientGroups) {
+          state.driver.destroy();
         }
-        drivers.clear();
+        clientGroups.clear();
         operatorStorage.close();
         process.exit(0);
         break;

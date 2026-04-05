@@ -50,7 +50,11 @@ type PendingResponse = {
 export class RemotePipelineDriver implements PipelineDriverInterface {
   readonly #lc: LogContext;
   readonly #threads: PoolThread[];
-  readonly #queryAssignments = new Map<string, PoolThread>();
+  readonly #clientGroupID: string;
+  // All queries for this client group go to the same thread.
+  // The pool thread has ONE PipelineDriver for this client group,
+  // sharing one Snapshotter and TableSources across all queries.
+  #assignedThread: PoolThread | null = null;
   readonly #queryInfos = new Map<
     string,
     {transformedAst: AST; transformationHash: string}
@@ -67,7 +71,7 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
   #replicaVersion: string | null = null;
   #permissions: LoadedPermissions | null = null;
   #clientSchema: ClientSchema | null = null;
-  readonly #initializedThreads = new Set<Worker>();
+  #threadInitialized = false;
 
   // Pending response tracking per thread.
   readonly #pendingResponses = new Map<Worker, PendingResponse[]>();
@@ -77,9 +81,11 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
     threads: Worker[],
     replicaFile: string,
     shardID: ShardID,
+    clientGroupID: string,
   ) {
     this.#lc = lc.withContext('component', 'remote-pipeline-driver');
     this.#threads = threads.map(worker => ({worker, load: 0}));
+    this.#clientGroupID = clientGroupID;
     this.#replicaDb = new Database(lc, replicaFile);
     this.#stmtRunner = new StatementRunner(this.#replicaDb);
     this.#shardID = shardID;
@@ -164,18 +170,16 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
   async reset(clientSchema: ClientSchema): Promise<void> {
     this.#clientSchema = clientSchema;
 
-    // Destroy all queries on all threads.
-    const promises: Promise<unknown>[] = [];
-    for (const [queryID, thread] of this.#queryAssignments) {
-      promises.push(this.#sendAndWait(thread, {type: 'destroyQuery', queryID}));
-      thread.load--;
+    if (this.#assignedThread) {
+      await this.#sendAndWait(this.#assignedThread, {
+        type: 'reset',
+        clientGroupID: this.#clientGroupID,
+        clientSchema,
+      });
     }
-    await Promise.all(promises);
 
-    this.#queryAssignments.clear();
     this.#queryInfos.clear();
     this.#hydrationTimes.clear();
-    this.#initializedThreads.clear();
     this.#refreshSpecs();
     this.#lc.info?.('RemotePipelineDriver reset');
   }
@@ -228,31 +232,31 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
     query: AST,
     _timer: Timer,
   ): Promise<Iterable<RowChange | 'yield'>> {
-    // Remove existing if re-adding.
-    if (this.#queryAssignments.has(queryID)) {
-      this.removeQuery(queryID);
+    // All queries for this client group go to the same thread.
+    if (!this.#assignedThread) {
+      this.#assignedThread = this.#leastLoadedThread();
+      this.#assignedThread.load++;
     }
-
-    const thread = this.#leastLoadedThread();
-    this.#queryAssignments.set(queryID, thread);
-    thread.load++;
+    const thread = this.#assignedThread;
 
     this.#lc.info?.(
       `RemotePipelineDriver hydrating query=${queryID} table=${query.table} ` +
-        `on thread load=${thread.load}`,
+        `clientGroup=${this.#clientGroupID} on thread load=${thread.load}`,
     );
 
-    // Send init if this thread hasn't been initialized yet.
-    if (!this.#initializedThreads.has(thread.worker)) {
+    // Send init if this thread hasn't been initialized for this client group.
+    if (!this.#threadInitialized) {
       await this.#sendAndWait(thread, {
         type: 'init',
+        clientGroupID: this.#clientGroupID,
         clientSchema: this.#clientSchema!,
       });
-      this.#initializedThreads.add(thread.worker);
+      this.#threadInitialized = true;
     }
 
     const result = (await this.#sendAndWait(thread, {
       type: 'hydrate',
+      clientGroupID: this.#clientGroupID,
       queryID,
       transformationHash,
       ast: query,
@@ -274,16 +278,13 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
   }
 
   removeQuery(queryID: string): void {
-    const thread = this.#queryAssignments.get(queryID);
-    if (thread) {
+    if (this.#assignedThread) {
       this.#lc.info?.(`RemotePipelineDriver removing query=${queryID}`);
-      // Fire and forget.
-      thread.worker.postMessage({
+      this.#assignedThread.worker.postMessage({
         type: 'destroyQuery',
+        clientGroupID: this.#clientGroupID,
         queryID,
       } satisfies PoolWorkerMsg);
-      thread.load--;
-      this.#queryAssignments.delete(queryID);
       this.#queryInfos.delete(queryID);
       this.#hydrationTimes.delete(queryID);
     }
@@ -310,64 +311,47 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
     this.#refreshSpecs();
     const targetVersion = this.currentVersion();
 
-    if (this.#queryAssignments.size === 0) {
+    if (!this.#assignedThread || this.#queryInfos.size === 0) {
       return {version: targetVersion, numChanges: 0, changes: []};
     }
 
     this.#lc.debug?.(
-      `RemotePipelineDriver advancing ${this.#queryAssignments.size} queries ` +
-        `to version=${targetVersion}`,
+      `RemotePipelineDriver advancing clientGroup=${this.#clientGroupID} ` +
+        `${this.#queryInfos.size} queries to version=${targetVersion}`,
     );
 
     const start = performance.now();
 
-    // Fan out advance to all threads that have queries.
-    const threadsWithQueries = new Set<PoolThread>();
-    for (const thread of this.#queryAssignments.values()) {
-      threadsWithQueries.add(thread);
-    }
-
-    let results: PoolWorkerResult[];
+    let result: PoolWorkerResult;
     try {
-      results = await Promise.all(
-        [...threadsWithQueries].map(thread =>
-          this.#sendAndWait(thread, {
-            type: 'advance',
-            targetVersion,
-          }),
-        ),
-      );
+      result = await this.#sendAndWait(this.#assignedThread, {
+        type: 'advance',
+        clientGroupID: this.#clientGroupID,
+        targetVersion,
+      });
     } catch (e) {
       const elapsed = performance.now() - start;
       const error = e instanceof Error ? e : new Error(String(e));
       this.#lc.error?.(
         `RemotePipelineDriver advance FAILED after ${elapsed.toFixed(1)}ms: ` +
           `${error.name}: ${error.message} ` +
-          `(${this.#queryAssignments.size} queries on ${threadsWithQueries.size} threads)`,
+          `clientGroup=${this.#clientGroupID}`,
       );
       throw e;
     }
 
-    // Merge results.
-    const allChanges: RowChange[] = [];
-    let totalNumChanges = 0;
-    for (const result of results) {
-      const advResult = result as AdvanceResult;
-      totalNumChanges += advResult.numChanges;
-      allChanges.push(...advResult.changes);
-    }
-
+    const advResult = result as AdvanceResult;
     const elapsed = performance.now() - start;
     this.#lc.info?.(
-      `RemotePipelineDriver advanced ${threadsWithQueries.size} threads ` +
-        `to=${targetVersion} changes=${totalNumChanges} ` +
-        `resultRows=${allChanges.length} time=${elapsed.toFixed(1)}ms`,
+      `RemotePipelineDriver advanced clientGroup=${this.#clientGroupID} ` +
+        `to=${targetVersion} changes=${advResult.numChanges} ` +
+        `rows=${advResult.changes.length} time=${elapsed.toFixed(1)}ms`,
     );
 
     return {
-      version: targetVersion,
-      numChanges: totalNumChanges,
-      changes: allChanges,
+      version: advResult.version,
+      numChanges: advResult.numChanges,
+      changes: advResult.changes,
     };
   }
 
@@ -396,16 +380,20 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
 
   destroy(): void {
     this.#lc.info?.('RemotePipelineDriver destroying');
-    for (const [queryID, thread] of this.#queryAssignments) {
-      thread.worker.postMessage({
-        type: 'destroyQuery',
-        queryID,
-      } satisfies PoolWorkerMsg);
-      thread.load--;
+    if (this.#assignedThread) {
+      for (const queryID of this.#queryInfos.keys()) {
+        this.#assignedThread.worker.postMessage({
+          type: 'destroyQuery',
+          clientGroupID: this.#clientGroupID,
+          queryID,
+        } satisfies PoolWorkerMsg);
+      }
+      this.#assignedThread.load--;
+      this.#assignedThread = null;
     }
-    this.#queryAssignments.clear();
     this.#queryInfos.clear();
     this.#hydrationTimes.clear();
+    this.#threadInitialized = false;
     this.#replicaDb.close();
   }
 
