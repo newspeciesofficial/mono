@@ -112,6 +112,55 @@ type HydrateContext = {
   readonly timer: Timer;
 };
 
+/**
+ * Accumulates IO vs CPU timing during advance.
+ * Created at the start of *#advance, populated during the loop,
+ * read by advanceWithRecovery for logging.
+ */
+class AdvanceMetrics {
+  diffReadMs = 0; // IO: time in Diff iterator (ChangeLog + getRow/getRows)
+  ivmPushMs = 0; // CPU: time in #push (IVM operator graph)
+  changesProcessed = 0;
+
+  #phase: 'idle' | 'diffRead' | 'ivmPush' = 'idle';
+  #phaseStart = 0;
+
+  startDiffRead() {
+    this.#phase = 'diffRead';
+    this.#phaseStart = performance.now();
+  }
+
+  startIvmPush() {
+    this.#endPhase();
+    this.#phase = 'ivmPush';
+    this.#phaseStart = performance.now();
+  }
+
+  endChange() {
+    this.#endPhase();
+    this.changesProcessed++;
+  }
+
+  #endPhase() {
+    if (this.#phase === 'idle') return;
+    const elapsed = performance.now() - this.#phaseStart;
+    if (this.#phase === 'diffRead') {
+      this.diffReadMs += elapsed;
+    } else if (this.#phase === 'ivmPush') {
+      this.ivmPushMs += elapsed;
+    }
+    this.#phase = 'idle';
+  }
+
+  toLogString(): string {
+    return (
+      `diffReadMs=${this.diffReadMs.toFixed(2)} ` +
+      `ivmPushMs=${this.ivmPushMs.toFixed(2)} ` +
+      `changesProcessed=${this.changesProcessed}`
+    );
+  }
+}
+
 export type Timer = {
   elapsedLap: () => number;
   totalElapsed: () => number;
@@ -194,6 +243,7 @@ export class PipelineDriver implements PipelineDriverInterface {
   #streamer: Streamer | null = null;
   #hydrateContext: HydrateContext | null = null;
   #advanceContext: AdvanceContext | null = null;
+  #advanceMetrics: AdvanceMetrics | null = null;
   #replicaVersion: string | null = null;
   #primaryKeys: Map<string, PrimaryKey> | null = null;
   #permissions: LoadedPermissions | null = null;
@@ -710,23 +760,29 @@ export class PipelineDriver implements PipelineDriverInterface {
       }
       const tCollect = performance.now();
 
+      const metrics = this.#advanceMetrics;
       this.#lc.info?.(
         `advanceWithRecovery snapshotMs=${(tSnapshotAdvance - t0).toFixed(2)} ` +
-          `ivmPushMs=${(tCollect - tSnapshotAdvance).toFixed(2)} ` +
+          `collectMs=${(tCollect - tSnapshotAdvance).toFixed(2)} ` +
           `totalMs=${(tCollect - t0).toFixed(2)} ` +
           `numChanges=${numChanges} rows=${collected.length} ` +
+          `${metrics ? metrics.toLogString() + ' ' : ''}` +
           `hydrationTimeMs=${this.totalHydrationTimeMs().toFixed(2)} ` +
           `didReset=false`,
       );
+      this.#advanceMetrics = null;
 
       return {version, numChanges, changes: collected, didReset: false};
     } catch (e) {
       const tError = performance.now();
       if (e instanceof ResetPipelinesSignal) {
+        const metrics = this.#advanceMetrics;
+        this.#advanceMetrics = null;
         this.#lc.info?.(
           `advanceWithRecovery RESET snapshotMs=${(tSnapshotAdvance - t0).toFixed(2)} ` +
-            `ivmPushMs=${(tError - tSnapshotAdvance).toFixed(2)} ` +
+            `collectMs=${(tError - tSnapshotAdvance).toFixed(2)} ` +
             `totalBeforeReset=${(tError - t0).toFixed(2)} ` +
+            `${metrics ? metrics.toLogString() + ' ' : ''}` +
             `hydrationTimeMs=${this.totalHydrationTimeMs().toFixed(2)} ` +
             `reason=${e.message}`,
         );
@@ -817,7 +873,10 @@ export class PipelineDriver implements PipelineDriverInterface {
         `advancement time limited based on total hydration time of ` +
         `${totalHydrationTimeMs} ms.`,
     );
+    const metrics = new AdvanceMetrics();
+    this.#advanceMetrics = metrics;
     try {
+      metrics.startDiffRead();
       for (const {table, prevValues, nextValue} of diff) {
         // Advance progress is checked each time a row is fetched
         // from a TableSource during push processing, but some pushes
@@ -833,6 +892,7 @@ export class PipelineDriver implements PipelineDriverInterface {
           const tableSource = this.#tables.get(table);
           if (!tableSource) {
             // no pipelines read from this table, so no need to process the change
+            metrics.startDiffRead();
             continue;
           }
           const primaryKey = mustGetPrimaryKey(this.#primaryKeys, table);
@@ -850,6 +910,7 @@ export class PipelineDriver implements PipelineDriverInterface {
               if (nextValue) {
                 this.#conflictRowsDeleted.add(1);
               }
+              metrics.startIvmPush();
               yield* this.#push(tableSource, {
                 type: 'remove',
                 row: prevValue,
@@ -857,6 +918,7 @@ export class PipelineDriver implements PipelineDriverInterface {
             }
           }
           if (nextValue) {
+            metrics.startIvmPush();
             if (editOldRow) {
               yield* this.#push(tableSource, {
                 type: 'edit',
@@ -873,6 +935,9 @@ export class PipelineDriver implements PipelineDriverInterface {
         } finally {
           this.#advanceContext.pos++;
         }
+
+        metrics.endChange();
+        metrics.startDiffRead(); // next iteration starts with diff read
 
         const elapsed = timer.totalElapsed() - start;
         this.#advanceTime.record(elapsed / 1000, {
