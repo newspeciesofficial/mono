@@ -1220,3 +1220,25 @@ Results after fix:
 | SQLite connections per client group | 56 | 2 |
 
 **Why WAL2 has only 4 read-mark slots:** SQLite WAL mode uses file-level byte-range locks on the `-shm` file to register reader positions. WAL2 mode has 4 slots. When all slots are occupied and a new reader needs a different position, it retries with exponential backoff (up to 323ms per retry). With 28 Snapshotters, this contention was severe. With 1 per client group, it's gone.
+
+### 17.13 Why the ChangeLog Uses REPLACE Instead of Append-Only (and Why That Matters)
+
+**The ChangeLog is not append-only.** The `UNIQUE("table", "rowKey")` constraint + `INSERT OR REPLACE` means each row appears at most once. When row X changes at version 5 and again at version 7, the version 5 entry is replaced — not a second entry added.
+
+**Why REPLACE:** The IVM only cares about the FINAL state of each row. If row X went through 10 intermediate changes, the IVM only needs to push the last value through the operator graph. The intermediate states produce wasted work. REPLACE deduplicates at write time (once, by the replicator) instead of at read time (by every reader). With 100 client groups each advancing, that's 1 deduplication vs 100.
+
+**An append-only ChangeLog would eliminate the need for WAL locks entirely.** Old entries never disappear, so a reader can never miss them regardless of when it reads or whether the replicator writes between reads. No snapshot isolation needed.
+
+**The tradeoff:**
+
+| | REPLACE (current) | Append-only (alternative) |
+|---|---|---|
+| Write cost | Higher (REPLACE = delete + insert) | Lower (just INSERT) |
+| Read cost | Lower (already deduplicated) | Higher (readers must deduplicate) |
+| ChangeLog size | Bounded (one entry per row) | Unbounded (needs periodic cleanup) |
+| WAL lock needed | **Yes** (entries disappear, snapshot isolation required) | **No** (entries never disappear) |
+| Advance work | O(distinct rows changed) | O(distinct rows changed) after dedup |
+
+The Zero team chose REPLACE for efficiency — one writer deduplicates for all readers. The cost is that snapshot isolation (WAL locks) is required for correctness. This is a fundamental design decision that can't be changed without rethinking the ChangeLog.
+
+**Implication for pool threads:** Since the WAL lock is required, the optimization is to minimize the number of locks — one Snapshotter per client group per thread (Section 17.12). The pool thread architecture cannot eliminate WAL locks, only reduce them.
