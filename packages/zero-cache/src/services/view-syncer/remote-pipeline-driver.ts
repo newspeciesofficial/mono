@@ -28,6 +28,7 @@ type PoolThread = {
 };
 
 type PendingResponse = {
+  requestId: string;
   resolve: (result: PoolWorkerResult) => void;
   reject: (error: Error) => void;
 };
@@ -70,19 +71,23 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
 
     for (const thread of this.#threads) {
       this.#pendingResponses.set(thread.worker, []);
-      thread.worker.on('message', (msg: PoolWorkerResult) => {
-        const queue = this.#pendingResponses.get(thread.worker)!;
-        const pending = queue.shift();
-        if (pending) {
-          if (msg.type === 'error') {
-            pending.reject(
-              Object.assign(new Error(msg.message), {name: msg.name}),
-            );
-          } else {
-            pending.resolve(msg);
+      thread.worker.on(
+        'message',
+        (msg: PoolWorkerResult & {requestId?: string}) => {
+          const queue = this.#pendingResponses.get(thread.worker)!;
+          const idx = queue.findIndex(p => p.requestId === msg.requestId);
+          if (idx >= 0) {
+            const pending = queue.splice(idx, 1)[0];
+            if (msg.type === 'error') {
+              pending.reject(
+                Object.assign(new Error(msg.message), {name: msg.name}),
+              );
+            } else {
+              pending.resolve(msg);
+            }
           }
-        }
-      });
+        },
+      );
       thread.worker.on('error', (err: Error) => {
         this.#lc.error?.(`pool thread error: ${err.message}`);
         const queue = this.#pendingResponses.get(thread.worker)!;
@@ -99,13 +104,16 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
     );
   }
 
+  static #nextRequestId = 0;
+
   #sendAndWait(
     thread: PoolThread,
     msg: PoolWorkerMsg,
   ): Promise<PoolWorkerResult> {
+    const requestId = String(RemotePipelineDriver.#nextRequestId++);
     const {promise, resolve, reject} = resolver<PoolWorkerResult>();
-    this.#pendingResponses.get(thread.worker)!.push({resolve, reject});
-    thread.worker.postMessage(msg);
+    this.#pendingResponses.get(thread.worker)!.push({requestId, resolve, reject});
+    thread.worker.postMessage({...msg, requestId});
     return promise;
   }
 

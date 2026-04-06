@@ -50,8 +50,11 @@ type ClientGroupState = {
 };
 const clientGroups = new Map<string, ClientGroupState>();
 
+// Current request ID — echoed back in responses for correlation.
+let currentRequestId: string | undefined;
+
 function send(msg: PoolWorkerResult) {
-  port!.postMessage(msg);
+  port!.postMessage({...msg, requestId: currentRequestId});
 }
 
 function createTimer(): Timer {
@@ -111,7 +114,8 @@ function getOrCreateClientGroup(
 
 lc.info?.(`pool-thread started. replica=${replicaFile}`);
 
-port.on('message', (msg: PoolWorkerMsg) => {
+port.on('message', (msg: PoolWorkerMsg & {requestId?: string}) => {
+  currentRequestId = msg.requestId;
   try {
     switch (msg.type) {
       case 'init': {
