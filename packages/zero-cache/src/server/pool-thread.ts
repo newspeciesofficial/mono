@@ -47,6 +47,7 @@ type ClientGroupState = {
   driver: PipelineDriver;
   clientSchema: ClientSchema;
   queryCount: number;
+  generation: number;
 };
 const clientGroups = new Map<string, ClientGroupState>();
 
@@ -81,9 +82,16 @@ function getOrCreateClientGroup(
   clientGroupID: string,
   clientSchema: ClientSchema,
 ): ClientGroupState {
-  let state = clientGroups.get(clientGroupID);
-  if (state) {
-    return state;
+  const existing = clientGroups.get(clientGroupID);
+  if (existing) {
+    // Destroy old PipelineDriver and create fresh.
+    // This handles the case where old destroyQuery messages are still
+    // in the queue — the old PipelineDriver is gone, those messages
+    // will be no-ops because queryCount on the new state starts at 0.
+    lc.info?.(
+      `pool-thread replacing PipelineDriver for clientGroup=${clientGroupID}`,
+    );
+    existing.driver.destroy();
   }
 
   // SAME constructor as syncer.ts:174-188
@@ -101,7 +109,8 @@ function getOrCreateClientGroup(
   );
   driver.init(clientSchema);
 
-  state = {driver, clientSchema, queryCount: 0};
+  const generation = (existing?.generation ?? 0) + 1;
+  const state: ClientGroupState = {driver, clientSchema, queryCount: 0, generation};
   clientGroups.set(clientGroupID, state);
 
   lc.info?.(
@@ -126,6 +135,7 @@ port.on('message', (msg: PoolWorkerMsg & {requestId?: string}) => {
           version: state.driver.currentVersion(),
           replicaVersion: state.driver.replicaVersion,
           permissions: state.driver.currentPermissions(),
+          generation: state.generation,
         });
         break;
       }
@@ -208,15 +218,11 @@ port.on('message', (msg: PoolWorkerMsg & {requestId?: string}) => {
         const state = clientGroups.get(clientGroupID);
         if (state) {
           state.driver.removeQuery(queryID);
-          state.queryCount--;
-
-          if (state.queryCount <= 0) {
-            lc.info?.(
-              `pool-thread destroying PipelineDriver for clientGroup=${clientGroupID}`,
-            );
-            state.driver.destroy();
-            clientGroups.delete(clientGroupID);
-          }
+          state.queryCount = Math.max(0, state.queryCount - 1);
+          // Don't auto-destroy PipelineDriver when queryCount reaches 0.
+          // Old destroyQuery messages from a previous ViewSyncer can arrive
+          // after a new init has created a fresh PipelineDriver. The next
+          // init will destroy and replace it cleanly.
         }
         send({type: 'destroyQueryResult', queryID});
         break;
@@ -230,6 +236,28 @@ port.on('message', (msg: PoolWorkerMsg & {requestId?: string}) => {
           state.clientSchema = clientSchema;
         }
         send({type: 'resetResult'});
+        break;
+      }
+
+      case 'destroyClientGroup': {
+        const {clientGroupID, generation} = msg;
+        const state = clientGroups.get(clientGroupID);
+        // Only destroy if the generation matches. A newer init increments
+        // the generation — stale destroyClientGroup from old ViewSyncer
+        // has an older generation and is ignored.
+        if (state && state.generation === generation) {
+          lc.info?.(
+            `pool-thread destroying clientGroup=${clientGroupID} ` +
+              `generation=${generation} queries=${state.queryCount}`,
+          );
+          state.driver.destroy();
+          clientGroups.delete(clientGroupID);
+        } else if (state) {
+          lc.info?.(
+            `pool-thread ignoring stale destroyClientGroup=${clientGroupID} ` +
+              `msgGen=${generation} currentGen=${state.generation}`,
+          );
+        }
         break;
       }
 

@@ -51,6 +51,7 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
   #lastVersion = '00';
   #lastReplicaVersion = '';
   #lastPermissions: LoadedPermissions | null = null;
+  #generation = 0;
 
   readonly #queryInfos = new Map<
     string,
@@ -59,6 +60,10 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
   readonly #hydrationTimes = new Map<string, number>();
 
   readonly #pendingResponses = new Map<Worker, PendingResponse[]>();
+
+  // Store handler references so we can remove them on destroy.
+  readonly #messageHandlers = new Map<Worker, (msg: PoolWorkerResult & {requestId?: string}) => void>();
+  readonly #errorHandlers = new Map<Worker, (err: Error) => void>();
 
   constructor(
     lc: LogContext,
@@ -71,31 +76,37 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
 
     for (const thread of this.#threads) {
       this.#pendingResponses.set(thread.worker, []);
-      thread.worker.on(
-        'message',
-        (msg: PoolWorkerResult & {requestId?: string}) => {
-          const queue = this.#pendingResponses.get(thread.worker)!;
-          const idx = queue.findIndex(p => p.requestId === msg.requestId);
-          if (idx >= 0) {
-            const pending = queue.splice(idx, 1)[0];
-            if (msg.type === 'error') {
-              pending.reject(
-                Object.assign(new Error(msg.message), {name: msg.name}),
-              );
-            } else {
-              pending.resolve(msg);
-            }
+
+      const messageHandler = (
+        msg: PoolWorkerResult & {requestId?: string},
+      ) => {
+        const queue = this.#pendingResponses.get(thread.worker)!;
+        const idx = queue.findIndex(p => p.requestId === msg.requestId);
+        if (idx >= 0) {
+          const pending = queue.splice(idx, 1)[0];
+          if (msg.type === 'error') {
+            pending.reject(
+              Object.assign(new Error(msg.message), {name: msg.name}),
+            );
+          } else {
+            pending.resolve(msg);
           }
-        },
-      );
-      thread.worker.on('error', (err: Error) => {
+        }
+      };
+
+      const errorHandler = (err: Error) => {
         this.#lc.error?.(`pool thread error: ${err.message}`);
         const queue = this.#pendingResponses.get(thread.worker)!;
         for (const pending of queue) {
           pending.reject(err);
         }
         queue.length = 0;
-      });
+      };
+
+      thread.worker.on('message', messageHandler);
+      thread.worker.on('error', errorHandler);
+      this.#messageHandlers.set(thread.worker, messageHandler);
+      this.#errorHandlers.set(thread.worker, errorHandler);
     }
 
     this.#lc.info?.(
@@ -152,6 +163,7 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
       this.#lastVersion = initResult.version;
       this.#lastReplicaVersion = initResult.replicaVersion;
       this.#lastPermissions = initResult.permissions;
+      this.#generation = initResult.generation;
       this.#threadInitialized = true;
     }
 
@@ -347,16 +359,31 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
   destroy(): void {
     this.#lc.info?.('RemotePipelineDriver destroying');
     if (this.#assignedThread) {
-      for (const queryID of this.#queryInfos.keys()) {
-        this.#assignedThread.worker.postMessage({
-          type: 'destroyQuery',
-          clientGroupID: this.#clientGroupID,
-          queryID,
-        } satisfies PoolWorkerMsg);
-      }
+      // Send destroyClientGroup with generation — explicitly destroys the
+      // PipelineDriver on the pool thread. Only processed if generation matches
+      // (a newer init will have incremented the generation, making this stale).
+      this.#assignedThread.worker.postMessage({
+        type: 'destroyClientGroup',
+        clientGroupID: this.#clientGroupID,
+        generation: this.#generation,
+      } satisfies PoolWorkerMsg);
       this.#assignedThread.load--;
       this.#assignedThread = null;
     }
+
+    // Remove listeners to prevent memory leak.
+    // Each RemotePipelineDriver adds listeners in constructor.
+    // Without removal, client reconnections accumulate listeners.
+    for (const [worker, handler] of this.#messageHandlers) {
+      worker.removeListener('message', handler);
+    }
+    for (const [worker, handler] of this.#errorHandlers) {
+      worker.removeListener('error', handler);
+    }
+    this.#messageHandlers.clear();
+    this.#errorHandlers.clear();
+    this.#pendingResponses.clear();
+
     this.#queryInfos.clear();
     this.#hydrationTimes.clear();
     this.#threadInitialized = false;

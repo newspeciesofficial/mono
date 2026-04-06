@@ -44,6 +44,12 @@ export type GetRowMsg = {
   rowKey: Record<string, unknown>;
 };
 
+export type DestroyClientGroupMsg = {
+  type: 'destroyClientGroup';
+  clientGroupID: string;
+  generation: number;
+};
+
 export type ShutdownMsg = {
   type: 'shutdown';
 };
@@ -55,6 +61,7 @@ export type PoolWorkerMsg =
   | DestroyQueryMsg
   | ResetMsg
   | GetRowMsg
+  | DestroyClientGroupMsg
   | ShutdownMsg;
 
 // Messages from pool worker thread -> syncer
@@ -64,6 +71,7 @@ export type InitResult = {
   version: string;
   replicaVersion: string;
   permissions: LoadedPermissions | null;
+  generation: number;
 };
 
 export type HydrationResult = {
