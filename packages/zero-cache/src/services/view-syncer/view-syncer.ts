@@ -1269,7 +1269,11 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       }
     }
 
-    const transformedQueries: TransformedAndHashed[] = [];
+    const transformedQueries: {
+      id: string;
+      transformed: TransformedAndHashed;
+      name: string | undefined;
+    }[] = [];
     if (customQueries.size > 0 && !this.#customQueryTransformer) {
       lc.warn?.(
         'Custom/named queries were requested but no `ZERO_QUERY_URL` is configured for Zero Cache.',
@@ -1301,7 +1305,12 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
             !('error' in q) &&
             q.transformationHash === customQueries.get(q.id)?.transformationHash
           ) {
-            transformedQueries.push(q);
+            const origQuery = customQueries.get(q.id);
+            transformedQueries.push({
+              id: q.id,
+              transformed: q,
+              name: origQuery?.name,
+            });
           }
         }
       }
@@ -1322,14 +1331,17 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       if (transformed.transformationHash === q.transformationHash) {
         // only process queries that transformed to the same
         // transformationHash as in the CVR here
-        transformedQueries.push(transformed);
+        transformedQueries.push({
+          id: q.id,
+          transformed,
+          name: undefined,
+        });
       }
     }
 
     for (const {
       id: queryID,
-      transformationHash,
-      transformedAst,
+      transformed: {transformationHash, transformedAst},
     } of transformedQueries) {
       const timer = new TimeSliceTimer(lc);
       let count = 0;
@@ -1635,10 +1647,11 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
           .concat(erroredQueryIDs || []),
       );
       const addQueries = transformedQueries
-        .map(({id, transformed}) => ({
+        .map(({id, origQuery, transformed}) => ({
           id,
           ast: transformed.transformedAst,
           transformationHash: transformed.transformationHash,
+          name: origQuery.type === 'custom' ? origQuery.name : undefined,
         }))
         .filter(
           q =>
@@ -1707,7 +1720,12 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
   #addAndRemoveQueries(
     lc: LogContext,
     cvr: CVRSnapshot,
-    addQueries: {id: string; ast: AST; transformationHash: string}[],
+    addQueries: {
+      id: string;
+      ast: AST;
+      transformationHash: string;
+      name: string | undefined;
+    }[],
     removeQueries: {id: string}[],
   ): Promise<void> {
     return startAsyncSpan(tracer, 'vs.#addAndRemoveQueries', async () => {
@@ -1785,6 +1803,14 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
           if (elapsed > slowHydrateThreshold) {
             lc.warn?.('Slow query materialization', elapsed, q.ast);
           }
+
+          // Log query name and latency for observability
+          lc.info?.('Query hydration completed', {
+            queryID: q.id,
+            queryName: q.name ?? 'unnamed',
+            hydrationTimeMs: elapsed,
+          });
+
           manualSpan(tracer, 'vs.addAndConsumeQuery', elapsed, {
             hash: q.id,
             transformationHash: q.transformationHash,
