@@ -619,6 +619,17 @@ export const zeroOptions = {
     ],
   },
 
+  numPoolThreads: {
+    type: v.number().default(0),
+    desc: [
+      `The number of IVM pool worker threads per syncer process.`,
+      `When set to 0 (default), IVM runs on the syncer's main thread (current behavior).`,
+      `When > 0, each syncer spawns this many worker_threads for parallel IVM computation.`,
+      `Client groups are distributed across threads. Each thread runs the same`,
+      `PipelineDriver code as the syncer, just on a separate core.`,
+    ],
+  },
+
   autoReset: {
     type: v.boolean().default(true),
     desc: [

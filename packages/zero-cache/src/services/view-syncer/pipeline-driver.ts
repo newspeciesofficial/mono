@@ -124,9 +124,103 @@ export type Timer = {
 const MIN_ADVANCEMENT_TIME_LIMIT_MS = 50;
 
 /**
+ * Result of advanceWithRecovery — includes metrics for logging.
+ */
+export type AdvanceWithRecoveryResult = {
+  version: string;
+  numChanges: number;
+  changes: RowChange[];
+  didReset: boolean;
+  metrics: {
+    snapshotMs: number;
+    collectMs: number;
+    diffReadMs: number;
+    ivmPushMs: number;
+    totalMs: number;
+  };
+};
+
+/**
+ * Accumulates IO vs CPU timing during advance.
+ * Created at the start of *#advance, populated during the loop,
+ * read by advanceWithRecovery for logging.
+ */
+class AdvanceMetrics {
+  diffReadMs = 0;
+  ivmPushMs = 0;
+  changesProcessed = 0;
+
+  #phase: 'idle' | 'diffRead' | 'ivmPush' = 'idle';
+  #phaseStart = 0;
+
+  startDiffRead() {
+    this.#phase = 'diffRead';
+    this.#phaseStart = performance.now();
+  }
+
+  startIvmPush() {
+    this.#endPhase();
+    this.#phase = 'ivmPush';
+    this.#phaseStart = performance.now();
+  }
+
+  endChange() {
+    this.#endPhase();
+    this.changesProcessed++;
+  }
+
+  #endPhase() {
+    if (this.#phase === 'idle') return;
+    const elapsed = performance.now() - this.#phaseStart;
+    if (this.#phase === 'diffRead') {
+      this.diffReadMs += elapsed;
+    } else if (this.#phase === 'ivmPush') {
+      this.ivmPushMs += elapsed;
+    }
+    this.#phase = 'idle';
+  }
+}
+
+/**
+ * The interface that ViewSyncer uses to interact with pipelines.
+ * Implemented by both PipelineDriver (local, same process) and
+ * RemotePipelineDriver (delegates to pool worker threads).
+ */
+export interface PipelineDriverInterface {
+  readonly replicaVersion: string;
+
+  initialized(): boolean;
+  init(clientSchema: ClientSchema): void | Promise<void>;
+  reset(clientSchema: ClientSchema): void | Promise<void>;
+  advanceWithoutDiff(): string | Promise<string>;
+  currentVersion(): string;
+  currentPermissions(): LoadedPermissions | null;
+  totalHydrationTimeMs(): number;
+  queries(): ReadonlyMap<string, QueryInfo>;
+  addQuery(
+    transformationHash: string,
+    queryID: string,
+    query: AST,
+    timer: Timer,
+  ): Iterable<RowChange | 'yield'> | Promise<Iterable<RowChange | 'yield'>>;
+  removeQuery(queryID: string): void;
+  getRow(table: string, pk: RowKey): Row | undefined | Promise<Row | undefined>;
+  advance(timer: Timer):
+    | {version: string; numChanges: number; changes: Iterable<RowChange | 'yield'>}
+    | Promise<{version: string; numChanges: number; changes: Iterable<RowChange | 'yield'>}>;
+  advanceWithRecovery(
+    clientSchema: ClientSchema,
+    timer: Timer,
+  ):
+    | AdvanceWithRecoveryResult
+    | Promise<AdvanceWithRecoveryResult>;
+  destroy(): void;
+}
+
+/**
  * Manages the state of IVM pipelines for a given ViewSyncer (i.e. client group).
  */
-export class PipelineDriver {
+export class PipelineDriver implements PipelineDriverInterface {
   readonly #tables = new Map<string, TableSource>();
   // Query id to pipeline
   readonly #pipelines = new Map<string, Pipeline>();
@@ -144,6 +238,7 @@ export class PipelineDriver {
   #streamer: Streamer | null = null;
   #hydrateContext: HydrateContext | null = null;
   #advanceContext: AdvanceContext | null = null;
+  #advanceMetrics: AdvanceMetrics | null = null;
   #replicaVersion: string | null = null;
   #primaryKeys: Map<string, PrimaryKey> | null = null;
   #permissions: LoadedPermissions | null = null;
@@ -621,6 +716,105 @@ export class PipelineDriver {
     };
   }
 
+  /**
+   * Advances pipelines and collects all changes. If the circuit breaker
+   * fires (ResetPipelinesSignal), handles recovery internally: resets
+   * pipelines, advances snapshot, re-hydrates all queries, and returns
+   * the re-hydrated changes. The caller never sees the signal.
+   *
+   * This is the same recovery flow as ViewSyncer's run loop.
+   * Both the ViewSyncer and pool worker threads use this method.
+   */
+  advanceWithRecovery(
+    clientSchema: ClientSchema,
+    timer: Timer,
+  ): AdvanceWithRecoveryResult {
+    const t0 = performance.now();
+    const {version, numChanges, changes} = this.advance(timer);
+    const tSnapshotAdvance = performance.now();
+
+    try {
+      const collected: RowChange[] = [];
+      for (const change of changes) {
+        if (change === 'yield') {
+          continue;
+        }
+        collected.push(change);
+      }
+      const tCollect = performance.now();
+      const advMetrics = this.#advanceMetrics;
+      this.#advanceMetrics = null;
+
+      return {
+        version,
+        numChanges,
+        changes: collected,
+        didReset: false,
+        metrics: {
+          snapshotMs: tSnapshotAdvance - t0,
+          collectMs: tCollect - tSnapshotAdvance,
+          diffReadMs: advMetrics?.diffReadMs ?? 0,
+          ivmPushMs: advMetrics?.ivmPushMs ?? 0,
+          totalMs: tCollect - t0,
+        },
+      };
+    } catch (e) {
+      const tError = performance.now();
+      if (e instanceof ResetPipelinesSignal) {
+        const resetMetrics = this.#advanceMetrics;
+        this.#advanceMetrics = null;
+
+        // Save query info before reset clears #pipelines.
+        const queryInfos = new Map<
+          string,
+          {transformationHash: string; ast: AST}
+        >();
+        for (const [id, pipeline] of this.#pipelines.entries()) {
+          queryInfos.set(id, {
+            transformationHash: pipeline.transformationHash,
+            ast: pipeline.transformedAst,
+          });
+        }
+
+        // Same recovery as ViewSyncer run loop:
+        this.reset(clientSchema);
+        const newVersion = this.advanceWithoutDiff();
+
+        const rehydrated: RowChange[] = [];
+        for (const [queryID, info] of queryInfos.entries()) {
+          for (const change of this.addQuery(
+            info.transformationHash,
+            queryID,
+            info.ast,
+            timer,
+          )) {
+            if (change !== 'yield') {
+              rehydrated.push(change);
+            }
+          }
+        }
+
+        const tDone = performance.now();
+        this.#lc.info?.(`advanceWithRecovery RESET reason=${e.message}`);
+
+        return {
+          version: newVersion,
+          numChanges: 0,
+          changes: rehydrated,
+          didReset: true,
+          metrics: {
+            snapshotMs: tSnapshotAdvance - t0,
+            collectMs: tError - tSnapshotAdvance,
+            diffReadMs: resetMetrics?.diffReadMs ?? 0,
+            ivmPushMs: resetMetrics?.ivmPushMs ?? 0,
+            totalMs: tDone - t0,
+          },
+        };
+      }
+      throw e;
+    }
+  }
+
   *#advance(
     diff: SnapshotDiff,
     timer: Timer,
@@ -642,7 +836,10 @@ export class PipelineDriver {
         `advancement time limited based on total hydration time of ` +
         `${totalHydrationTimeMs} ms.`,
     );
+    const metrics = new AdvanceMetrics();
+    this.#advanceMetrics = metrics;
     try {
+      metrics.startDiffRead();
       for (const {table, prevValues, nextValue} of diff) {
         // Advance progress is checked each time a row is fetched
         // from a TableSource during push processing, but some pushes
@@ -658,6 +855,7 @@ export class PipelineDriver {
           const tableSource = this.#tables.get(table);
           if (!tableSource) {
             // no pipelines read from this table, so no need to process the change
+            metrics.startDiffRead();
             continue;
           }
           const primaryKey = mustGetPrimaryKey(this.#primaryKeys, table);
@@ -675,6 +873,7 @@ export class PipelineDriver {
               if (nextValue) {
                 this.#conflictRowsDeleted.add(1);
               }
+              metrics.startIvmPush();
               yield* this.#push(tableSource, {
                 type: 'remove',
                 row: prevValue,
@@ -682,6 +881,7 @@ export class PipelineDriver {
             }
           }
           if (nextValue) {
+            metrics.startIvmPush();
             if (editOldRow) {
               yield* this.#push(tableSource, {
                 type: 'edit',
@@ -698,6 +898,9 @@ export class PipelineDriver {
         } finally {
           this.#advanceContext.pos++;
         }
+
+        metrics.endChange();
+        metrics.startDiffRead();
 
         const elapsed = timer.totalElapsed() - start;
         this.#advanceTime.record(elapsed / 1000, {

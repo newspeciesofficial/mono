@@ -19,8 +19,13 @@ import {PusherService} from '../services/mutagen/pusher.ts';
 import type {ReplicaState} from '../services/replicator/replicator.ts';
 import type {DrainCoordinator} from '../services/view-syncer/drain-coordinator.ts';
 import {PipelineDriver} from '../services/view-syncer/pipeline-driver.ts';
+import type {PipelineDriverInterface} from '../services/view-syncer/pipeline-driver.ts';
+import {RemotePipelineDriver} from '../services/view-syncer/remote-pipeline-driver.ts';
 import {Snapshotter} from '../services/view-syncer/snapshotter.ts';
 import {ViewSyncerService} from '../services/view-syncer/view-syncer.ts';
+import {Worker as WorkerThread} from 'node:worker_threads';
+import type {PoolThreadWorkerData} from './pool-thread.ts';
+import {POOL_THREAD_URL} from './worker-urls.ts';
 import {pgClient} from '../types/pg.ts';
 import {
   parentWorker,
@@ -104,6 +109,26 @@ export default function runWorker(
 
   const shard = getShardID(config);
 
+  // Spawn pool worker threads if configured.
+  const poolThreads: WorkerThread[] = [];
+  if (config.numPoolThreads > 0) {
+    const poolThreadWorkerData: PoolThreadWorkerData = {
+      replicaFile,
+      shardID: shard,
+      logConfig: config.log,
+      yieldThresholdMs: config.yieldThresholdMs,
+      enableQueryPlanner: config.enableQueryPlanner,
+    };
+    for (let i = 0; i < config.numPoolThreads; i++) {
+      poolThreads.push(
+        new WorkerThread(POOL_THREAD_URL, {workerData: poolThreadWorkerData}),
+      );
+    }
+    lc.info?.(
+      `Spawned ${config.numPoolThreads} pool worker threads for IVM compute`,
+    );
+  }
+
   const viewSyncerFactory = (
     id: string,
     sub: Subscription<ReplicaState>,
@@ -138,14 +163,18 @@ export default function runWorker(
       validateLegacyJWT,
     );
 
-    return new ViewSyncerService(
-      config,
-      logger,
-      shard,
-      config.taskID,
-      id,
-      cvrDB,
-      new PipelineDriver(
+    let pipelineDriver: PipelineDriverInterface;
+    if (poolThreads.length > 0) {
+      pipelineDriver = new RemotePipelineDriver(
+        logger,
+        poolThreads,
+        id, // clientGroupID
+      );
+      logger.info?.(
+        `Using RemotePipelineDriver with ${poolThreads.length} pool threads`,
+      );
+    } else {
+      pipelineDriver = new PipelineDriver(
         logger,
         config.log,
         new Snapshotter(logger, replicaFile, shard),
@@ -159,7 +188,17 @@ export default function runWorker(
             : normalYieldThresholdMs,
         config.enableQueryPlanner,
         config,
-      ),
+      );
+    }
+
+    return new ViewSyncerService(
+      config,
+      logger,
+      shard,
+      config.taskID,
+      id,
+      cvrDB,
+      pipelineDriver,
       sub,
       drainCoordinator,
       config.log.slowHydrateThreshold,

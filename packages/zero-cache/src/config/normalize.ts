@@ -22,6 +22,7 @@ export type NormalizedZeroConfig = ZeroConfig & {
     port: number;
   };
   numSyncWorkers: number;
+  numPoolThreads: number;
 };
 
 export function isDevelopmentMode(): boolean {
@@ -131,5 +132,6 @@ export function normalizeZeroConfig(
     },
 
     numSyncWorkers: config.numSyncWorkers,
+    numPoolThreads: config.numPoolThreads,
   };
 }
