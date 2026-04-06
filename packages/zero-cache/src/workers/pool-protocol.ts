@@ -97,6 +97,32 @@ export type AdvanceResult = {
   };
 };
 
+// Streaming advance protocol: advanceBegin -> advanceChangeBatch* -> advanceComplete
+
+export type AdvanceBeginResult = {
+  type: 'advanceBegin';
+  version: string;
+  replicaVersion: string;
+  numChanges: number;
+};
+
+export type AdvanceChangeBatchResult = {
+  type: 'advanceChangeBatch';
+  changes: RowChange[];
+};
+
+export type AdvanceCompleteResult = {
+  type: 'advanceComplete';
+  didReset: boolean;
+  metrics: {
+    snapshotMs: number;
+    collectMs: number;
+    diffReadMs: number;
+    ivmPushMs: number;
+    totalMs: number;
+  };
+};
+
 export type DestroyQueryResult = {
   type: 'destroyQueryResult';
   queryID: string;
@@ -121,6 +147,9 @@ export type PoolWorkerResult =
   | InitResult
   | HydrationResult
   | AdvanceResult
+  | AdvanceBeginResult
+  | AdvanceChangeBatchResult
+  | AdvanceCompleteResult
   | DestroyQueryResult
   | ResetResult
   | GetRowResult

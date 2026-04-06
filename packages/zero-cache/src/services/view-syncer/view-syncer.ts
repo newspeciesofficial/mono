@@ -1960,9 +1960,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
   #processChanges(
     lc: LogContext,
     timer: TimeSliceTimer,
-    changes:
-      | Iterable<RowChange | 'yield'>
-      | AsyncIterable<RowChange | 'yield'>,
+    changes: Iterable<RowChange | 'yield'> | AsyncIterable<RowChange | 'yield'>,
     updater: CVRQueryDrivenUpdater,
     pokers: PokeHandler,
   ) {
@@ -2040,6 +2038,82 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
   }
 
   /**
+   * Process changes from pool thread streaming. No timer, no yield,
+   * no timeSliceQueue. The await on each async iteration naturally
+   * yields the event loop between batches.
+   */
+  #processChangesStreaming(
+    lc: LogContext,
+    changes: Iterable<RowChange | 'yield'> | AsyncIterable<RowChange | 'yield'>,
+    updater: CVRQueryDrivenUpdater,
+    pokers: PokeHandler,
+  ) {
+    return startAsyncSpan(tracer, 'vs.#processChangesStreaming', async () => {
+      const start = performance.now();
+      const rows = new CustomKeyMap<RowID, RowUpdate>(rowIDString);
+      let total = 0;
+      let batchCount = 0;
+
+      const processBatch = async () => {
+        total += rows.size;
+        batchCount++;
+        const patches = await updater.received(lc, rows);
+        for (const patch of patches) {
+          await pokers.addPatch(patch);
+        }
+        rows.clear();
+      };
+
+      for await (const change of changes) {
+        if (change === 'yield') {
+          continue;
+        }
+        const {type, queryID, table, rowKey, row} = change;
+        const rowID: RowID = {schema: '', table, rowKey: rowKey as RowKey};
+
+        let parsedRow = rows.get(rowID);
+        if (!parsedRow) {
+          parsedRow = {refCounts: {}};
+          rows.set(rowID, parsedRow);
+        }
+        parsedRow.refCounts[queryID] ??= 0;
+
+        const updateVersion = (row: Row) => {
+          const {version, contents} = contentsAndVersion(row);
+          parsedRow.version = version;
+          parsedRow.contents = contents;
+        };
+        switch (type) {
+          case 'add':
+            updateVersion(row);
+            parsedRow.refCounts[queryID]++;
+            break;
+          case 'edit':
+            updateVersion(row);
+            break;
+          case 'remove':
+            parsedRow.refCounts[queryID]--;
+            break;
+          default:
+            unreachable(type);
+        }
+
+        if (rows.size % CURSOR_PAGE_SIZE === 0) {
+          await processBatch();
+        }
+      }
+      if (rows.size) {
+        await processBatch();
+      }
+
+      const elapsed = performance.now() - start;
+      lc.debug?.(
+        `streaming processChanges: ${total} rows in ${batchCount} batches (${elapsed.toFixed(1)} ms)`,
+      );
+    });
+  }
+
+  /**
    * Advance to the current snapshot of the replica and apply / send
    * changes.
    *
@@ -2059,10 +2133,10 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       const start = performance.now();
 
       const timer = new TimeSliceTimer(lc);
-      const {version, numChanges, changes} = await this.#pipelines.advance(timer);
+      const {version, numChanges, changes} =
+        await this.#pipelines.advance(timer);
       lc = lc.withContext('newVersion', version);
 
-      // Probably need a new updater type. CVRAdvancementUpdater?
       const updater = new CVRQueryDrivenUpdater(
         this.#cvrStore,
         cvr,
@@ -2076,16 +2150,24 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
         this.#getClients(cvr.version),
         updater.updatedVersion(),
       );
-      lc.debug?.(`applying ${numChanges} to advance to ${version}`);
+
+      // When changes is an AsyncIterable (pool thread streaming), the await
+      // on each iteration naturally yields the event loop. No timeSliceQueue
+      // needed — IVM runs on pool thread, not on this event loop.
+      const isStreaming = Symbol.asyncIterator in Object(changes);
 
       try {
-        await this.#processChanges(
-          lc,
-          await timer.start(),
-          changes,
-          updater,
-          pokers,
-        );
+        if (isStreaming) {
+          await this.#processChangesStreaming(lc, changes, updater, pokers);
+        } else {
+          await this.#processChanges(
+            lc,
+            await timer.start(),
+            changes,
+            updater,
+            pokers,
+          );
+        }
       } catch (e) {
         if (e instanceof ResetPipelinesSignal) {
           await pokers.cancel();

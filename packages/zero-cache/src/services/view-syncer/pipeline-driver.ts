@@ -206,14 +206,24 @@ export interface PipelineDriverInterface {
   removeQuery(queryID: string): void;
   getRow(table: string, pk: RowKey): Row | undefined | Promise<Row | undefined>;
   advance(timer: Timer):
-    | {version: string; numChanges: number; changes: Iterable<RowChange | 'yield'>}
-    | Promise<{version: string; numChanges: number; changes: Iterable<RowChange | 'yield'>}>;
+    | {
+        version: string;
+        numChanges: number;
+        changes:
+          | Iterable<RowChange | 'yield'>
+          | AsyncIterable<RowChange | 'yield'>;
+      }
+    | Promise<{
+        version: string;
+        numChanges: number;
+        changes:
+          | Iterable<RowChange | 'yield'>
+          | AsyncIterable<RowChange | 'yield'>;
+      }>;
   advanceWithRecovery(
     clientSchema: ClientSchema,
     timer: Timer,
-  ):
-    | AdvanceWithRecoveryResult
-    | Promise<AdvanceWithRecoveryResult>;
+  ): AdvanceWithRecoveryResult | Promise<AdvanceWithRecoveryResult>;
   destroy(): void;
 }
 

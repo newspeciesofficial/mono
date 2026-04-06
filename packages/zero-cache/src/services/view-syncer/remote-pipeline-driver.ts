@@ -9,7 +9,7 @@ import type {LoadedPermissions} from '../../auth/load-permissions.ts';
 import type {RowKey} from '../../types/row-key.ts';
 import type {InitResult} from '../../workers/pool-protocol.ts';
 import type {
-  AdvanceResult,
+  AdvanceBeginResult,
   GetRowResult,
   HydrationResult,
   PoolWorkerMsg,
@@ -31,6 +31,12 @@ type PendingResponse = {
   requestId: string;
   resolve: (result: PoolWorkerResult) => void;
   reject: (error: Error) => void;
+};
+
+type StreamHandler = {
+  requestId: string;
+  onMessage: (msg: PoolWorkerResult) => void;
+  onError: (error: Error) => void;
 };
 
 /**
@@ -60,26 +66,34 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
   readonly #hydrationTimes = new Map<string, number>();
 
   readonly #pendingResponses = new Map<Worker, PendingResponse[]>();
+  readonly #streamHandlers = new Map<Worker, StreamHandler[]>();
 
   // Store handler references so we can remove them on destroy.
-  readonly #messageHandlers = new Map<Worker, (msg: PoolWorkerResult & {requestId?: string}) => void>();
+  readonly #messageHandlers = new Map<
+    Worker,
+    (msg: PoolWorkerResult & {requestId?: string}) => void
+  >();
   readonly #errorHandlers = new Map<Worker, (err: Error) => void>();
 
-  constructor(
-    lc: LogContext,
-    threads: Worker[],
-    clientGroupID: string,
-  ) {
+  constructor(lc: LogContext, threads: Worker[], clientGroupID: string) {
     this.#lc = lc.withContext('component', 'remote-pipeline-driver');
     this.#threads = threads.map(worker => ({worker, load: 0}));
     this.#clientGroupID = clientGroupID;
 
     for (const thread of this.#threads) {
       this.#pendingResponses.set(thread.worker, []);
+      this.#streamHandlers.set(thread.worker, []);
 
-      const messageHandler = (
-        msg: PoolWorkerResult & {requestId?: string},
-      ) => {
+      const messageHandler = (msg: PoolWorkerResult & {requestId?: string}) => {
+        // Check stream handlers first (advance streaming).
+        const streams = this.#streamHandlers.get(thread.worker)!;
+        const streamIdx = streams.findIndex(s => s.requestId === msg.requestId);
+        if (streamIdx >= 0) {
+          streams[streamIdx].onMessage(msg);
+          return;
+        }
+
+        // Fall back to one-shot pending responses.
         const queue = this.#pendingResponses.get(thread.worker)!;
         const idx = queue.findIndex(p => p.requestId === msg.requestId);
         if (idx >= 0) {
@@ -101,6 +115,11 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
           pending.reject(err);
         }
         queue.length = 0;
+        const streams = this.#streamHandlers.get(thread.worker)!;
+        for (const stream of streams) {
+          stream.onError(err);
+        }
+        streams.length = 0;
       };
 
       thread.worker.on('message', messageHandler);
@@ -123,7 +142,9 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
   ): Promise<PoolWorkerResult> {
     const requestId = String(RemotePipelineDriver.#nextRequestId++);
     const {promise, resolve, reject} = resolver<PoolWorkerResult>();
-    this.#pendingResponses.get(thread.worker)!.push({requestId, resolve, reject});
+    this.#pendingResponses
+      .get(thread.worker)!
+      .push({requestId, resolve, reject});
     thread.worker.postMessage({...msg, requestId});
     return promise;
   }
@@ -228,13 +249,13 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
         `clientGroup=${this.#clientGroupID}`,
     );
 
-    const result = (await this.#sendAndWait(thread, {
+    const result = await this.#sendAndWait(thread, {
       type: 'hydrate',
       clientGroupID: this.#clientGroupID,
       queryID,
       transformationHash,
       ast: query,
-    }));
+    });
 
     if (result.type !== 'hydrationResult') {
       this.#lc.error?.(
@@ -272,10 +293,7 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
     }
   }
 
-  async getRow(
-    table: string,
-    pk: RowKey,
-  ): Promise<Row | undefined> {
+  async getRow(table: string, pk: RowKey): Promise<Row | undefined> {
     if (!this.#assignedThread) {
       return undefined;
     }
@@ -288,38 +306,128 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
     return result.row;
   }
 
-  async advance(
-    _timer: Timer,
-  ): Promise<{
+  async advance(_timer: Timer): Promise<{
     version: string;
     numChanges: number;
-    changes: Iterable<RowChange | 'yield'>;
+    changes: AsyncIterable<RowChange | 'yield'>;
   }> {
     if (!this.#assignedThread || this.#queryInfos.size === 0) {
-      return {version: this.#lastVersion, numChanges: 0, changes: []};
+      return {
+        version: this.#lastVersion,
+        numChanges: 0,
+        changes: emptyAsyncIterable(),
+      };
     }
 
-    const start = performance.now();
+    const thread = this.#assignedThread;
+    const requestId = String(RemotePipelineDriver.#nextRequestId++);
 
-    const result = (await this.#sendAndWait(this.#assignedThread, {
+    // Push-pull queue: pool thread pushes messages, syncer pulls via async iterator.
+    const buffer: PoolWorkerResult[] = [];
+    let waiter: {resolve: (v: undefined) => void} | null = null;
+    let done = false;
+    let streamError: Error | null = null;
+
+    const push = (msg: PoolWorkerResult) => {
+      buffer.push(msg);
+      if (waiter) {
+        waiter.resolve(undefined);
+        waiter = null;
+      }
+    };
+
+    const pushError = (err: Error) => {
+      streamError = err;
+      if (waiter) {
+        waiter.resolve(undefined);
+        waiter = null;
+      }
+    };
+
+    const pull = async (): Promise<PoolWorkerResult | null> => {
+      while (buffer.length === 0 && !done && !streamError) {
+        const {promise, resolve} = resolver<undefined>();
+        waiter = {resolve};
+        await promise;
+      }
+      if (streamError) {
+        throw streamError;
+      }
+      if (buffer.length > 0) {
+        return buffer.shift()!;
+      }
+      return null;
+    };
+
+    // Register stream handler for this requestId.
+    const streams = this.#streamHandlers.get(thread.worker)!;
+    const handler: StreamHandler = {
+      requestId,
+      onMessage: push,
+      onError: pushError,
+    };
+    streams.push(handler);
+
+    const cleanup = () => {
+      const idx = streams.indexOf(handler);
+      if (idx >= 0) {
+        streams.splice(idx, 1);
+      }
+    };
+
+    // Send the advance message.
+    thread.worker.postMessage({
       type: 'advance',
       clientGroupID: this.#clientGroupID,
-    })) as AdvanceResult;
+      requestId,
+    });
 
-    this.#lastVersion = result.version;
-    this.#lastReplicaVersion = result.replicaVersion;
-    const elapsed = performance.now() - start;
-
-    this.#lc.info?.(
-      `RemotePipelineDriver advanced clientGroup=${this.#clientGroupID} ` +
-        `to=${result.version} changes=${result.numChanges} ` +
-        `rows=${result.changes.length} time=${elapsed.toFixed(1)}ms`,
+    // Wait for advanceBegin (first message).
+    const beginMsg = await pull();
+    assert(
+      beginMsg !== null && beginMsg.type === 'advanceBegin',
+      `Expected advanceBegin, got ${beginMsg?.type}`,
     );
+    const begin = beginMsg as AdvanceBeginResult;
+
+    this.#lastVersion = begin.version;
+    this.#lastReplicaVersion = begin.replicaVersion;
+
+    const lc = this.#lc;
+    const clientGroupID = this.#clientGroupID;
+
+    // Return an async iterable that yields changes as they stream in.
+    async function* streamChanges(): AsyncIterable<RowChange | 'yield'> {
+      try {
+        for (;;) {
+          const msg = await pull();
+          if (msg === null) {
+            break;
+          }
+          if (msg.type === 'advanceChangeBatch') {
+            yield* msg.changes;
+          } else if (msg.type === 'advanceComplete') {
+            lc.info?.(
+              `RemotePipelineDriver advanced clientGroup=${clientGroupID} ` +
+                `to=${begin.version} changes=${begin.numChanges} ` +
+                `didReset=${msg.didReset} ` +
+                `totalMs=${msg.metrics.totalMs.toFixed(1)}`,
+            );
+            done = true;
+            break;
+          } else if (msg.type === 'error') {
+            throw Object.assign(new Error(msg.message), {name: msg.name});
+          }
+        }
+      } finally {
+        cleanup();
+      }
+    }
 
     return {
-      version: result.version,
-      numChanges: result.numChanges,
-      changes: result.changes,
+      version: begin.version,
+      numChanges: begin.numChanges,
+      changes: streamChanges(),
     };
   }
 
@@ -327,32 +435,28 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
     _clientSchema: ClientSchema,
     _timer: Timer,
   ): Promise<AdvanceWithRecoveryResult> {
-    // Pool thread handles ResetPipelinesSignal internally via
-    // PipelineDriver.advanceWithRecovery(). Syncer never sees the error.
-    if (!this.#assignedThread || this.#queryInfos.size === 0) {
-      return {
-        version: this.#lastVersion,
-        numChanges: 0,
-        changes: [],
-        didReset: false,
-        metrics: {snapshotMs: 0, collectMs: 0, diffReadMs: 0, ivmPushMs: 0, totalMs: 0},
-      };
+    // Use streaming advance and collect changes.
+    // advanceWithRecovery is not in the hot path — only called when
+    // ViewSyncer needs the full result synchronously.
+    const {version, numChanges, changes} = await this.advance(_timer);
+    const collected: RowChange[] = [];
+    for await (const change of changes) {
+      if (change !== 'yield') {
+        collected.push(change);
+      }
     }
-
-    const result = (await this.#sendAndWait(this.#assignedThread, {
-      type: 'advance',
-      clientGroupID: this.#clientGroupID,
-    })) as AdvanceResult;
-
-    this.#lastVersion = result.version;
-    this.#lastReplicaVersion = result.replicaVersion;
-
     return {
-      version: result.version,
-      numChanges: result.numChanges,
-      changes: result.changes,
-      didReset: result.didReset,
-      metrics: result.metrics,
+      version,
+      numChanges,
+      changes: collected,
+      didReset: false,
+      metrics: {
+        snapshotMs: 0,
+        collectMs: 0,
+        diffReadMs: 0,
+        ivmPushMs: 0,
+        totalMs: 0,
+      },
     };
   }
 
@@ -383,10 +487,15 @@ export class RemotePipelineDriver implements PipelineDriverInterface {
     this.#messageHandlers.clear();
     this.#errorHandlers.clear();
     this.#pendingResponses.clear();
+    this.#streamHandlers.clear();
 
     this.#queryInfos.clear();
     this.#hydrationTimes.clear();
     this.#threadInitialized = false;
     this.#initialized = false;
   }
+}
+
+async function* emptyAsyncIterable(): AsyncIterable<RowChange | 'yield'> {
+  // yields nothing
 }
