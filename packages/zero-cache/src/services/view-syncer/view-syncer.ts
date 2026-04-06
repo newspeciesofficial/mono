@@ -1930,7 +1930,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
             patch = {type: 'row', op: 'del', id};
           } else {
             const row = must(
-              this.#pipelines.getRow(table, rowKey),
+              await this.#pipelines.getRow(table, rowKey),
               `Missing row ${table}:${stringify(rowKey)}`,
             );
             const {contents} = contentsAndVersion(row);
