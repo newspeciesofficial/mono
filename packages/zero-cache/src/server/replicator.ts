@@ -1,9 +1,7 @@
-import {existsSync} from 'node:fs';
 import {pid} from 'node:process';
 import {assert} from '../../../shared/src/asserts.ts';
 import {must} from '../../../shared/src/must.ts';
 import * as v from '../../../shared/src/valita.ts';
-import {Database} from '../../../zqlite/src/db.ts';
 import {getNormalizedZeroConfig} from '../config/zero-config.ts';
 import {initEventSink} from '../observability/events.ts';
 import {ChangeStreamerHttpClient} from '../services/change-streamer/change-streamer-http.ts';
@@ -48,29 +46,13 @@ export default async function runWorker(
   const lc = createLogContext(config, {worker: workerName});
   initEventSink(lc, config);
 
-  // Override the base replica file with shard suffix (NOT mode suffix).
-  // setupReplica handles mode-specific naming (e.g. serving-copy).
+  // Each shard gets its own replica file. Each shard replicator is fully
+  // independent — it does its own initial sync from the change-streamer,
+  // just like shard 0. No copying between shards.
   const baseFile =
     shardIndex !== undefined && shardIndex > 0
       ? `${config.replica.file}-shard-${shardIndex}`
       : config.replica.file;
-
-  // For shard replicas (index > 0), the shard file may not exist yet.
-  // Copy from the base replica (created by the change-streamer's initial sync)
-  // so that upgradeReplica has a valid starting point.
-  // We must checkpoint the source WAL first so that VACUUM INTO captures
-  // all committed data (including _zero.replicationState metadata).
-  if (shardIndex !== undefined && shardIndex > 0 && !existsSync(baseFile)) {
-    const sourceFile = config.replica.file;
-    lc.info?.(
-      `shard file ${baseFile} does not exist, copying from ${sourceFile}`,
-    );
-    const source = new Database(lc, sourceFile);
-    source.pragma('wal_checkpoint(TRUNCATE)');
-    source.prepare('VACUUM INTO ?').run(baseFile);
-    source.close();
-    lc.info?.(`created shard file ${baseFile}`);
-  }
 
   const replicaOptions = {...config.replica, file: baseFile};
   const replica = await setupReplica(lc, fileMode, replicaOptions);
