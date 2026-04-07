@@ -606,16 +606,19 @@ export class PipelineDriver {
   advance(timer: Timer): {
     version: string;
     numChanges: number;
+    snapshotMs: number;
     changes: Iterable<RowChange | 'yield'>;
   } {
     assert(
       this.initialized(),
       'Pipeline driver must be initialized before advancing',
     );
+    const tAdvanceStart = performance.now();
     const diff = this.#snapshotter.advance(
       this.#tableSpecs,
       this.#allTableNames,
     );
+    const snapshotMs = performance.now() - tAdvanceStart;
     const {prev, curr, changes} = diff;
     this.#lc.debug?.(
       `advance ${prev.version} => ${curr.version}: ${changes} changes`,
@@ -624,6 +627,7 @@ export class PipelineDriver {
     return {
       version: curr.version,
       numChanges: changes,
+      snapshotMs,
       changes: this.#advance(diff, timer, changes),
     };
   }

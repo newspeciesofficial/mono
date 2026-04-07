@@ -2064,7 +2064,8 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       const start = performance.now();
 
       const timer = new TimeSliceTimer(lc);
-      const {version, numChanges, changes} = this.#pipelines.advance(timer);
+      const {version, numChanges, snapshotMs, changes} =
+        this.#pipelines.advance(timer);
       lc = lc.withContext('newVersion', version);
 
       // Probably need a new updater type. CVRAdvancementUpdater?
@@ -2109,7 +2110,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       const wallTime = performance.now() - start;
       const totalProcessTime = timer.totalElapsed();
       lc.info?.(
-        `finished processing advancement of ${numChanges} changes ((process: ${totalProcessTime} ms, wall: ${wallTime} ms))`,
+        `finished processing advancement of ${numChanges} changes ((process: ${totalProcessTime} ms, wall: ${wallTime} ms, snapshotMs: ${snapshotMs.toFixed(2)}))`,
       );
       this.#transactionAdvanceTime.record(totalProcessTime / 1000);
       return 'success';
