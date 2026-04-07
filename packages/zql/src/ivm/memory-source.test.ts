@@ -1,7 +1,5 @@
 import {describe, expect, test} from 'vitest';
-import {testLogConfig} from '../../../otel/src/test-log-config.ts';
 import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
-import {emptyArray} from '../../../shared/src/sentinels.ts';
 import type {Ordering} from '../../../zero-protocol/src/ast.ts';
 import type {Row} from '../../../zero-protocol/src/data.ts';
 import {Catch} from './catch.ts';
@@ -14,9 +12,11 @@ import {
   overlaysForConstraintForTest,
   overlaysForStartAtForTest,
 } from './memory-source.ts';
-import {consume} from './stream.ts';
 import {compareRowsTest} from './test/compare-rows-test.ts';
 import {createSource} from './test/source-factory.ts';
+import {testLogConfig} from '../../../otel/src/test-log-config.ts';
+import {emptyArray} from '../../../shared/src/sentinels.ts';
+import {consume} from './stream.ts';
 
 const lc = createSilentLogContext();
 
@@ -427,7 +427,7 @@ describe('generateWithOverlayInner', () => {
     },
   ] as const)('$name', ({overlays, expected}) => {
     const actual = generateWithOverlayInner(rows, overlays, compare);
-    expect(Array.from(actual, ({row}) => row)).toEqual(expected);
+    expect([...actual].map(({row}) => row)).toEqual(expected);
   });
 });
 
@@ -583,10 +583,9 @@ describe('generateWithOverlayInnerUnordered', () => {
     },
   ] as const)('$name', c => {
     const input = 'rows' in c ? c.rows : rows;
-    const actual = Array.from(
-      generateWithOverlayInnerUnordered(input, c.overlays, pk),
-      ({row}) => row,
-    );
+    const actual = [
+      ...generateWithOverlayInnerUnordered(input, c.overlays, pk),
+    ].map(({row}) => row);
     expect(actual).toEqual(c.expected);
   });
 
@@ -597,14 +596,13 @@ describe('generateWithOverlayInnerUnordered', () => {
       {a: 2, b: 'x', v: 30},
     ];
     const compoundPK = ['a', 'b'] as const;
-    const actual = Array.from(
-      generateWithOverlayInnerUnordered(
+    const actual = [
+      ...generateWithOverlayInnerUnordered(
         compoundRows,
         {add: undefined, remove: {a: 1, b: 'y', v: 20}},
         compoundPK,
       ),
-      ({row}) => row,
-    );
+    ].map(({row}) => row);
     expect(actual).toEqual([compoundRows[0], compoundRows[2]]);
   });
 
@@ -615,14 +613,13 @@ describe('generateWithOverlayInnerUnordered', () => {
       {a: 2, b: 'x', v: 30},
     ];
     const compoundPK = ['a', 'b'] as const;
-    const actual = Array.from(
-      generateWithOverlayInnerUnordered(
+    const actual = [
+      ...generateWithOverlayInnerUnordered(
         compoundRows,
         {add: undefined, remove: {a: 1, b: 'z', v: 0}},
         compoundPK,
       ),
-      ({row}) => row,
-    );
+    ].map(({row}) => row);
     expect(actual).toEqual(compoundRows);
   });
 });
@@ -641,10 +638,9 @@ describe('generateWithOverlayUnordered', () => {
       epoch: 5,
       change: {type: 'add' as const, row: {id: 4, s: 'd', n: 44}},
     };
-    const actual = Array.from(
-      generateWithOverlayUnordered(rows, undefined, overlay, 4, pk),
-      ({row}) => row,
-    );
+    const actual = [
+      ...generateWithOverlayUnordered(rows, undefined, overlay, 4, pk),
+    ].map(({row}) => row);
     expect(actual).toEqual(rows);
   });
 
@@ -653,10 +649,9 @@ describe('generateWithOverlayUnordered', () => {
       epoch: 5,
       change: {type: 'add' as const, row: {id: 4, s: 'd', n: 44}},
     };
-    const actual = Array.from(
-      generateWithOverlayUnordered(rows, undefined, overlay, 5, pk),
-      ({row}) => row,
-    );
+    const actual = [
+      ...generateWithOverlayUnordered(rows, undefined, overlay, 5, pk),
+    ].map(({row}) => row);
     expect(actual).toEqual([{id: 4, s: 'd', n: 44}, ...rows]);
   });
 
@@ -665,10 +660,9 @@ describe('generateWithOverlayUnordered', () => {
       epoch: 1,
       change: {type: 'add' as const, row: {id: 4, s: 'd', n: 44}},
     };
-    const actual = Array.from(
-      generateWithOverlayUnordered(rows, {s: 'a'}, overlay, 1, pk),
-      ({row}) => row,
-    );
+    const actual = [
+      ...generateWithOverlayUnordered(rows, {s: 'a'}, overlay, 1, pk),
+    ].map(({row}) => row);
     expect(actual).toEqual(rows);
   });
 
@@ -677,8 +671,8 @@ describe('generateWithOverlayUnordered', () => {
       epoch: 1,
       change: {type: 'add' as const, row: {id: 4, s: 'd', n: 44}},
     };
-    const actual = Array.from(
-      generateWithOverlayUnordered(
+    const actual = [
+      ...generateWithOverlayUnordered(
         rows,
         undefined,
         overlay,
@@ -686,8 +680,7 @@ describe('generateWithOverlayUnordered', () => {
         pk,
         (row: Row) => (row.n as number) < 40,
       ),
-      ({row}) => row,
-    );
+    ].map(({row}) => row);
     expect(actual).toEqual(rows);
   });
 
@@ -696,10 +689,9 @@ describe('generateWithOverlayUnordered', () => {
       epoch: 1,
       change: {type: 'add' as const, row: {id: 4, s: 'd', n: 44}},
     };
-    const actual = Array.from(
-      generateWithOverlayUnordered(rows, undefined, overlay, 1, pk),
-      ({row}) => row,
-    );
+    const actual = [
+      ...generateWithOverlayUnordered(rows, undefined, overlay, 1, pk),
+    ].map(({row}) => row);
     expect(actual).toEqual([{id: 4, s: 'd', n: 44}, ...rows]);
   });
 
@@ -708,10 +700,9 @@ describe('generateWithOverlayUnordered', () => {
       epoch: 1,
       change: {type: 'remove' as const, row: {id: 2, s: 'b', n: 22}},
     };
-    const actual = Array.from(
-      generateWithOverlayUnordered(rows, undefined, overlay, 1, pk),
-      ({row}) => row,
-    );
+    const actual = [
+      ...generateWithOverlayUnordered(rows, undefined, overlay, 1, pk),
+    ].map(({row}) => row);
     expect(actual).toEqual([rows[0], rows[2]]);
   });
 
@@ -724,10 +715,9 @@ describe('generateWithOverlayUnordered', () => {
         oldRow: {id: 2, s: 'b', n: 22},
       },
     };
-    const actual = Array.from(
-      generateWithOverlayUnordered(rows, undefined, overlay, 1, pk),
-      ({row}) => row,
-    );
+    const actual = [
+      ...generateWithOverlayUnordered(rows, undefined, overlay, 1, pk),
+    ].map(({row}) => row);
     expect(actual).toEqual([{id: 2, s: 'b2', n: 225}, rows[0], rows[2]]);
   });
 });

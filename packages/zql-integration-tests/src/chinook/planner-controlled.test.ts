@@ -143,7 +143,7 @@ describe('two joins via or', () => {
         if (constraint !== undefined) {
           // fetching album by id
           assert(
-            Object.hasOwn(constraint, 'id'),
+            constraint.hasOwnProperty('id'),
             'Expected constraint to have id',
           );
           return {startupCost: 0, rows: 1, fanout: defaultFanout};
@@ -155,7 +155,7 @@ describe('two joins via or', () => {
         if (constraint !== undefined) {
           // fetching invoiceLines by trackId
           assert(
-            Object.hasOwn(constraint, 'trackId'),
+            constraint.hasOwnProperty('trackId'),
             'Expected constraint to have trackId',
           );
           // TODO: We cannot get this to flip one and not the other without incorporating
@@ -169,10 +169,10 @@ describe('two joins via or', () => {
 
       if (table === 'track') {
         if (constraint !== undefined) {
-          if (Object.hasOwn(constraint, 'id')) {
+          if (constraint.hasOwnProperty('id')) {
             return {startupCost: 0, rows: 1, fanout: defaultFanout};
           }
-          if (Object.hasOwn(constraint, 'albumId')) {
+          if (constraint.hasOwnProperty('albumId')) {
             return {startupCost: 0, rows: 10, fanout: defaultFanout};
           }
           throw new Error('Unexpected constraint on track');
@@ -323,11 +323,11 @@ describe('related calls get plans', () => {
       // Force `.related('tracks')` to be more expensive
       if (table === 'track') {
         assert(
-          constraint && Object.hasOwn(constraint, 'albumId'),
+          constraint?.hasOwnProperty('albumId'),
           'Expected constraint to have albumId',
         );
         // if we flip to do genre, we can reduce the cost.
-        if (Object.hasOwn(constraint, 'genreId')) {
+        if (constraint?.hasOwnProperty('genreId')) {
           return {
             rows: 1,
             startupCost: 0,

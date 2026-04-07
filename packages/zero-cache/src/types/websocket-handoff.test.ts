@@ -283,7 +283,7 @@ describe('types/websocket-handoff', () => {
         // Simulate the race condition: close the websocket before the callback runs
         ws.close();
         // Wait a tick for the close to take effect
-        setTimeout(callback, 10, ws, req);
+        setTimeout(() => callback(ws, req), 10);
       });
     };
 

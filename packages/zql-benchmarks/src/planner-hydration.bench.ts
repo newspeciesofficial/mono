@@ -53,7 +53,7 @@ const serverToClientMapper = serverToClient(schema.tables);
 function createQuery(tableName: string, queryAST: AST): AnyQuery {
   return newQueryImpl(
     schema,
-    tableName as keyof typeof schema.tables,
+    tableName as keyof typeof schema.tables & string,
     queryAST,
     defaultFormat,
     'test',

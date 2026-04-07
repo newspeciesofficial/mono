@@ -1,6 +1,4 @@
 import {expect, suite, test} from 'vitest';
-import {testLogConfig} from '../../../otel/src/test-log-config.ts';
-import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
 import type {
   Condition,
   SimpleOperator,
@@ -11,8 +9,10 @@ import {Catch, expandNode, type CaughtNode} from './catch.ts';
 import type {Constraint} from './constraint.ts';
 import type {FetchRequest, Input, Output, Start} from './operator.ts';
 import type {SourceChange} from './source.ts';
-import {consume} from './stream.ts';
 import {createSource} from './test/source-factory.ts';
+import {consume} from './stream.ts';
+import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
+import {testLogConfig} from '../../../otel/src/test-log-config.ts';
 
 const lc = createSilentLogContext();
 
@@ -45,7 +45,7 @@ class OverlaySpy implements Output {
   }
 
   fetch(req: FetchRequest) {
-    this.fetches.push(Array.from(this.#input.fetch(req), expandNode));
+    this.fetches.push([...this.#input.fetch(req)].map(expandNode));
   }
 
   push() {
@@ -3536,8 +3536,9 @@ suite('epoch-based overlay semantic equivalence', () => {
         // Fetch from each spy and then figure out what each spy saw
         spies[i].fetch({});
         observations[i].push(
-          // oxlint-disable-next-line typescript/no-non-null-assertion
-          spies[i].fetches.at(-1)!.map(n => (n !== 'yield' ? n.row : {})),
+          spies[i].fetches[spies[i].fetches.length - 1].map(n =>
+            n !== 'yield' ? n.row : {},
+          ),
         );
       }
     };
@@ -3589,8 +3590,9 @@ suite('epoch-based overlay semantic equivalence', () => {
       for (let i = 0; i < 3; i++) {
         spies[i].fetch({});
         observations[i].push(
-          // oxlint-disable-next-line typescript/no-non-null-assertion
-          spies[i].fetches.at(-1)!.map(n => (n !== 'yield' ? n.row : {})),
+          spies[i].fetches[spies[i].fetches.length - 1].map(n =>
+            n !== 'yield' ? n.row : {},
+          ),
         );
       }
     };

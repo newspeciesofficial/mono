@@ -25,7 +25,7 @@ window.onload = () => {
     input.name = 'group';
     input.value = group;
 
-    input.checked = selected.includes(group);
+    input.checked = selected.indexOf(group) > -1;
     input.onchange = () => {
       const url = new URL(location.href);
       if (input.checked) {

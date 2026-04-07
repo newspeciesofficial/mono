@@ -103,8 +103,10 @@ export async function runBenchmark(
       p75Ms: calcPercentile(75),
       p90Ms: calcPercentile(90),
       p95Ms: calcPercentile(95),
-      // oxlint-disable-next-line typescript/no-non-null-assertion
-      variance: Math.max(medianMs - times[0], times.at(-1)! - medianMs),
+      variance: Math.max(
+        medianMs - times[0],
+        times[times.length - 1] - medianMs,
+      ),
     },
   };
 }
