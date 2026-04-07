@@ -58,12 +58,15 @@ export default async function runWorker(
   // For shard replicas (index > 0), the shard file may not exist yet.
   // Copy from the base replica (created by the change-streamer's initial sync)
   // so that upgradeReplica has a valid starting point.
+  // We must checkpoint the source WAL first so that VACUUM INTO captures
+  // all committed data (including _zero.replicationState metadata).
   if (shardIndex !== undefined && shardIndex > 0 && !existsSync(baseFile)) {
     const sourceFile = config.replica.file;
     lc.info?.(
       `shard file ${baseFile} does not exist, copying from ${sourceFile}`,
     );
     const source = new Database(lc, sourceFile);
+    source.pragma('wal_checkpoint(TRUNCATE)');
     source.prepare('VACUUM INTO ?').run(baseFile);
     source.close();
     lc.info?.(`created shard file ${baseFile}`);
