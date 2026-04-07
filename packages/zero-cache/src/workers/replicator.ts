@@ -28,8 +28,18 @@ export const replicaFileModeSchema = v.literalUnion(
 
 export type ReplicaFileMode = v.Infer<typeof replicaFileModeSchema>;
 
-export function replicaFileName(replicaFile: string, mode: ReplicaFileMode) {
-  return mode === 'serving-copy' ? `${replicaFile}-serving-copy` : replicaFile;
+export function replicaFileName(
+  replicaFile: string,
+  mode: ReplicaFileMode,
+  shardIndex?: number | undefined,
+) {
+  // Shard suffix goes on the base file BEFORE the mode suffix,
+  // so that setupReplica's internal serving-copy logic works correctly.
+  const sharded =
+    shardIndex !== undefined && shardIndex > 0
+      ? `${replicaFile}-shard-${shardIndex}`
+      : replicaFile;
+  return mode === 'serving-copy' ? `${sharded}-serving-copy` : sharded;
 }
 
 const MILLIS_PER_HOUR = 1000 * 60 * 60;

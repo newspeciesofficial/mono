@@ -619,6 +619,18 @@ export const zeroOptions = {
     ],
   },
 
+  numReplicaShards: {
+    type: v.number().default(1),
+    desc: [
+      `The number of independent SQLite replica files to maintain.`,
+      `Each shard gets its own replicator process writing CDC data to a separate`,
+      `SQLite file. Sync workers are pinned to specific shards, reducing WAL`,
+      `read-mark contention. Only takes effect when numSyncWorkers > 0`,
+      `(zero-cache mode, not replication-manager mode).`,
+      `Default is 1 (single replica, same as current behavior).`,
+    ],
+  },
+
   autoReset: {
     type: v.boolean().default(true),
     desc: [

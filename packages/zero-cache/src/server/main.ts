@@ -164,23 +164,56 @@ export default async function runWorker(
   if (numSyncers) {
     const mode: ReplicaFileMode =
       runChangeStreamer && litestream.backupURL ? 'serving-copy' : 'serving';
-    const {promise: replicaReady, resolve} = resolver();
-    const replicator = loadWorker(
-      REPLICATOR_URL,
-      'supporting',
-      mode,
-      mode,
-    ).once('message', () => {
-      subscribeTo(lc, replicator);
-      resolve();
-    });
-    await replicaReady;
+    const numReplicaShards = Math.min(
+      config.numReplicaShards ?? 1,
+      numSyncers,
+    );
 
-    const notifier = createNotifierFrom(lc, replicator);
-    for (let i = 0; i < numSyncers; i++) {
-      syncers.push(loadWorker(SYNCER_URL, 'user-facing', i + 1, mode));
+    // Spawn one replicator per shard, each writing to its own SQLite file.
+    const notifiers: {notifier: ReturnType<typeof createNotifierFrom>; shardIndex: number}[] = [];
+    for (let s = 0; s < numReplicaShards; s++) {
+      const shardIndex = numReplicaShards === 1 ? undefined : s;
+      const shardArgs = shardIndex !== undefined
+        ? [mode, `--shard-index=${shardIndex}`]
+        : [mode];
+      const {promise: replicaReady, resolve} = resolver();
+      const replicator = loadWorker(
+        REPLICATOR_URL,
+        'supporting',
+        shardIndex !== undefined ? `${mode}-shard-${shardIndex}` : mode,
+        ...shardArgs,
+      ).once('message', () => {
+        subscribeTo(lc, replicator);
+        resolve();
+      });
+      await replicaReady;
+      notifiers.push({
+        notifier: createNotifierFrom(lc, replicator),
+        shardIndex: s,
+      });
     }
-    syncers.forEach(syncer => handleSubscriptionsFrom(lc, syncer, notifier));
+
+    lc.info?.(
+      `started ${numReplicaShards} replica shard(s) for ${numSyncers} sync workers`,
+    );
+
+    // Distribute sync workers across replica shards.
+    // Syncer i is pinned to shard (i % numReplicaShards).
+    for (let i = 0; i < numSyncers; i++) {
+      const shardIndex = numReplicaShards === 1 ? undefined : i % numReplicaShards;
+      const shardArgs = shardIndex !== undefined
+        ? [mode, `--shard-index=${shardIndex}`]
+        : [mode];
+      syncers.push(
+        loadWorker(SYNCER_URL, 'user-facing', i + 1, ...shardArgs),
+      );
+    }
+
+    // Subscribe each syncer to its shard's notifier.
+    syncers.forEach((syncer, i) => {
+      const shardIdx = i % numReplicaShards;
+      handleSubscriptionsFrom(lc, syncer, notifiers[shardIdx].notifier);
+    });
   }
   let mutator: Worker | undefined;
   if (clientConnectionBifurcated) {
@@ -209,6 +242,7 @@ export default async function runWorker(
         syncers,
         mutator,
         changeStreamer,
+        config.numReplicaShards ?? 1,
       ),
     );
   } catch (err) {

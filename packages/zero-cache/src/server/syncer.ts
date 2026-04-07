@@ -61,21 +61,31 @@ export default function runWorker(
   env: NodeJS.ProcessEnv,
   ...args: string[]
 ): Promise<void> {
-  const config = getNormalizedZeroConfig({env, argv: args.slice(1)});
-
-  startOtelAuto(createLogContext(config, {worker: 'syncer'}, false));
-  const lc = createLogContext(config, {worker: 'syncer'}, true);
-  initEventSink(lc, config);
-
   assert(args.length > 0, `replicator mode not specified`);
   const fileMode = v.parse(args[0], replicaFileModeSchema);
+  // Parse optional --shard-index=N arg
+  const shardIndex =
+    args.length > 1 && args[1].startsWith('--shard-index=')
+      ? Number(args[1].split('=')[1])
+      : undefined;
+  const remainingArgs =
+    shardIndex !== undefined ? args.slice(2) : args.slice(1);
+
+  const config = getNormalizedZeroConfig({env, argv: remainingArgs});
+
+  const shardSuffix = shardIndex !== undefined ? `-shard${shardIndex}` : '';
+  startOtelAuto(
+    createLogContext(config, {worker: `syncer${shardSuffix}`}, false),
+  );
+  const lc = createLogContext(config, {worker: `syncer${shardSuffix}`}, true);
+  initEventSink(lc, config);
 
   const {cvr, upstream} = config;
   assert(cvr.maxConnsPerWorker, 'cvr.maxConnsPerWorker must be set');
   assert(upstream.maxConnsPerWorker, 'upstream.maxConnsPerWorker must be set');
 
-  const replicaFile = replicaFileName(config.replica.file, fileMode);
-  lc.debug?.(`running view-syncer on ${replicaFile}`);
+  const replicaFile = replicaFileName(config.replica.file, fileMode, shardIndex);
+  lc.debug?.(`running view-syncer on ${replicaFile} (shardIndex=${shardIndex ?? 'none'})`);
 
   const cvrDB = pgClient(lc, cvr.db, {
     max: cvr.maxConnsPerWorker,

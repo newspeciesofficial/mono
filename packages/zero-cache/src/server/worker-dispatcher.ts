@@ -23,7 +23,10 @@ export class WorkerDispatcher implements Service {
     syncers: Worker[],
     mutator: Worker | undefined,
     changeStreamer: Worker | undefined,
+    numReplicaShards = 1,
   ) {
+    // Can't have more shards than syncers.
+    numReplicaShards = Math.min(numReplicaShards, syncers.length || 1);
     this.#lc = lc;
 
     function connectParams(req: IncomingMessageSubset) {
@@ -69,12 +72,31 @@ export class WorkerDispatcher implements Service {
       const {clientGroupID, protocolVersion} = params;
       maxProtocolVersion = Math.max(maxProtocolVersion, protocolVersion);
 
-      // Include the TaskID when hash-bucketting the client group to the sync
-      // worker. This diversifies the distribution of client groups (across
-      // workers) for different tasks, so that if one task sheds connections
-      // from its most heavily loaded sync worker(s), those client groups will
-      // be distributed uniformly across workers on the receiving task(s).
-      const syncer = h32(taskID + '/' + clientGroupID) % syncers.length;
+      let syncer: number;
+      if (numReplicaShards <= 1) {
+        // Original behavior: hash across all syncers.
+        syncer = h32(taskID + '/' + clientGroupID) % syncers.length;
+      } else {
+        // With multiple replica shards, first pick the shard, then pick
+        // a syncer within that shard's pool. Syncers are distributed
+        // round-robin: syncer i is pinned to shard (i % numReplicaShards).
+        const shard =
+          h32(taskID + '/' + clientGroupID) % numReplicaShards;
+        // Collect syncers belonging to this shard.
+        const shardSyncerIndices: number[] = [];
+        for (let i = 0; i < syncers.length; i++) {
+          if (i % numReplicaShards === shard) {
+            shardSyncerIndices.push(i);
+          }
+        }
+        // Pick within the shard's pool.
+        const idx =
+          h32(taskID + '/s/' + clientGroupID) % shardSyncerIndices.length;
+        syncer = shardSyncerIndices[idx];
+        lc.debug?.(
+          `routing ${clientGroupID} to shard ${shard} (${shardSyncerIndices.length} syncers, picked ${syncer})`,
+        );
+      }
 
       lc.debug?.(`connecting ${clientGroupID} to syncer ${syncer}`);
       return {payload: params, sender: syncers[syncer]};
