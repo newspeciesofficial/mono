@@ -381,12 +381,16 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
     };
   }
 
+  #lockWaitMs = 0;
+
   #runInLockWithCVR(
     fn: (lc: LogContext, cvr: CVRSnapshot) => Promise<void> | void,
   ): Promise<void> {
     const rid = randomID();
+    const tBeforeLock = performance.now();
     this.#lc.debug?.('about to acquire lock for cvr ', rid);
     return this.#lock.withLock(async () => {
+      this.#lockWaitMs = performance.now() - tBeforeLock;
       this.#lc.debug?.('acquired lock in #runInLockWithCVR ', rid);
       const lc = this.#lc.withContext('lock', rid);
       if (!this.#stateChanges.active) {
@@ -2061,12 +2065,14 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
         this.#pipelines.initialized(),
         'pipelines must be initialized (advancePipelines',
       );
-      const start = performance.now();
+      const tStart = performance.now();
 
       const timer = new TimeSliceTimer(lc);
       const {version, numChanges, snapshotMs, changes} =
         this.#pipelines.advance(timer);
       lc = lc.withContext('newVersion', version);
+
+      const tAfterSnapshot = performance.now();
 
       // Probably need a new updater type. CVRAdvancementUpdater?
       const updater = new CVRQueryDrivenUpdater(
@@ -2082,7 +2088,6 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
         this.#getClients(cvr.version),
         updater.updatedVersion(),
       );
-      lc.debug?.(`applying ${numChanges} to advance to ${version}`);
 
       try {
         await this.#processChanges(
@@ -2100,17 +2105,33 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
         throw e;
       }
 
+      const tAfterIVM = performance.now();
+
       // Commit the changes and update the CVR snapshot.
       this.#cvr = await this.#flushUpdater(lc, updater);
       const finalVersion = this.#cvr.version;
 
+      const tAfterCVR = performance.now();
+
       // Signal clients to commit.
       await pokers.end(finalVersion);
 
-      const wallTime = performance.now() - start;
+      const tEnd = performance.now();
+
       const totalProcessTime = timer.totalElapsed();
+      const ivmMs = tAfterIVM - tAfterSnapshot;
+      const cvrFlushMs = tAfterCVR - tAfterIVM;
+      const pokeMs = tEnd - tAfterCVR;
+      const wallTime = tEnd - tStart;
+
       lc.info?.(
-        `finished processing advancement of ${numChanges} changes ((process: ${totalProcessTime} ms, wall: ${wallTime} ms, snapshotMs: ${snapshotMs.toFixed(2)}))`,
+        `finished processing advancement of ${numChanges} changes ` +
+          `((process: ${totalProcessTime} ms, wall: ${wallTime.toFixed(1)} ms, ` +
+          `lockWaitMs: ${this.#lockWaitMs.toFixed(1)}, ` +
+          `snapshotMs: ${snapshotMs.toFixed(2)}, ` +
+          `ivmMs: ${ivmMs.toFixed(1)}, ` +
+          `cvrFlushMs: ${cvrFlushMs.toFixed(1)}, ` +
+          `pokeMs: ${pokeMs.toFixed(1)}))`,
       );
       this.#transactionAdvanceTime.record(totalProcessTime / 1000);
       return 'success';
