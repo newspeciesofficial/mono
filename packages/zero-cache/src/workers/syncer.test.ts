@@ -40,7 +40,7 @@ import {
   DatabaseStorage,
 } from '../../../zqlite/src/database-storage.ts';
 import {Database} from '../../../zqlite/src/db.ts';
-import {AuthSessionImpl, type ValidateLegacyJWT} from '../auth/auth.ts';
+import type {ValidateLegacyJWT} from '../auth/auth.ts';
 import * as jwt from '../auth/jwt.ts';
 import type {ZeroConfig} from '../config/zero-config.ts';
 import {
@@ -51,6 +51,8 @@ import {MutagenService} from '../services/mutagen/mutagen.ts';
 import {PusherService} from '../services/mutagen/pusher.ts';
 import {CREATE_TABLE_METADATA_TABLE} from '../services/replicator/schema/table-metadata.ts';
 import type {ActivityBasedService} from '../services/service.ts';
+import type {ConnectionContextManager} from '../services/view-syncer/connection-context-manager.ts';
+import {ConnectionContextManagerImpl} from '../services/view-syncer/connection-context-manager.ts';
 import type {ViewSyncer} from '../services/view-syncer/view-syncer.ts';
 import type {WebSocketReceiver} from '../types/websocket-handoff.ts';
 import {Syncer} from './syncer.ts';
@@ -81,6 +83,7 @@ function makeFactories(
   lc: LogContext,
   mutagensOut: MutagenService[],
   pushersOut: PusherService[],
+  contextManagersOut: Map<string, ConnectionContextManagerImpl>,
 ) {
   const storageDb = new Database(lc, ':memory:');
   storageDb.prepare(CREATE_STORAGE_TABLE).run();
@@ -92,21 +95,14 @@ function makeFactories(
       id: string,
       _sub: unknown,
       _drainCoordinator: unknown,
-      validateLegacyJWT: ValidateLegacyJWT | undefined,
     ) =>
       (() => {
         const stopped = resolver<void>();
-        const authSession = new AuthSessionImpl(lc, id, validateLegacyJWT);
+        const contextManager = new ConnectionContextManagerImpl(lc);
+        contextManagersOut.set(id, contextManager);
         return {
           id,
-          get auth() {
-            return authSession.auth;
-          },
-          clearAuth: vi.fn(() => authSession.clear()),
-          initAuthSession: vi.fn(
-            (userID: string, wireAuth: string | undefined) =>
-              authSession.update(userID, wireAuth),
-          ),
+          contextManager,
           initConnection: vi.fn(),
           changeDesiredQueries: vi.fn(),
           deleteClients: vi.fn(),
@@ -137,12 +133,15 @@ function makeFactories(
       mutagensOut.push(ret);
       return ret;
     },
-    pusherFactory: (id: string) => {
+    pusherFactory: (id: string, contextManager: ConnectionContextManager) => {
       const ret = new PusherService(
-        {} as ZeroConfig,
-        {url: ['http://example.com'], forwardCookies: false},
+        {
+          app: {id: 'test-app'},
+          shard: {num: 0},
+        } as ZeroConfig,
         lc,
         id,
+        contextManager,
       );
       pushersOut.push(ret);
       return ret;
@@ -153,11 +152,28 @@ function makeFactories(
 function setupSyncer(lc: LogContext, config: ZeroConfig) {
   const mutagens: MutagenService[] = [];
   const pushers: PusherService[] = [];
+  const contextManagers = new Map<string, ConnectionContextManagerImpl>();
   const {viewSyncerFactory, mutagenFactory, pusherFactory} = makeFactories(
     lc,
     mutagens,
     pushers,
+    contextManagers,
   );
+  const validateLegacyJWT: ValidateLegacyJWT | undefined =
+    jwt.tokenConfigOptions(config.auth ?? {}).length === 1
+      ? async (token, {userID}) => {
+          if (!userID) {
+            throw new Error('UserID is required for JWT validation.');
+          }
+          return {
+            type: 'jwt',
+            raw: token,
+            decoded: await jwt.verifyToken(config.auth, token, {
+              subject: userID,
+            }),
+          };
+        }
+      : undefined;
   const syncer = new Syncer(
     lc,
     config,
@@ -165,13 +181,13 @@ function setupSyncer(lc: LogContext, config: ZeroConfig) {
     mutagenFactory,
     pusherFactory,
     TEST_PARENT,
+    validateLegacyJWT,
   );
-  return {syncer, mutagens, pushers};
+  return {syncer, mutagens, pushers, contextManagers};
 }
 
 const baseParams = {
   clientGroupID: '1',
-  userID: 'anon',
   wsID: '1',
   protocolVersion: 30,
 };
@@ -355,7 +371,7 @@ describe('jwt auth validation', () => {
         {
           clientGroupID: '1',
           clientID: `1`,
-          userID: 'anon',
+          userID: 'user-1',
           wsID: '1',
           protocolVersion: 21,
           auth: 'dummy-token',
@@ -410,7 +426,7 @@ describe('jwt auth without options', () => {
       {
         clientGroupID: '1',
         clientID: '1',
-        userID: 'anon',
+        userID: 'user-1',
         wsID: '1',
         protocolVersion: 30,
         auth: 'dummy-token',
@@ -432,6 +448,38 @@ describe('jwt auth without options', () => {
     // Services should be instantiated for successful connection
     expect(mutagens.length).toBe(1);
     expect(pushers.length).toBe(1);
+  });
+
+  test('allows logged-out connections to omit userID', async () => {
+    const ws = await openConnection(1, {userID: undefined});
+
+    expect((ws as unknown as MockWebSocket).readyState).toBe(
+      MockWebSocket.OPEN,
+    );
+    expect(mutagens.length).toBe(1);
+    expect(pushers.length).toBe(1);
+  });
+
+  test('rejects authenticated connections that omit userID', async () => {
+    const ws = new MockWebSocket() as unknown as WebSocket;
+    await receiver(
+      ws,
+      {
+        clientGroupID: '1',
+        clientID: '1',
+        userID: undefined,
+        wsID: '1',
+        protocolVersion: 30,
+        auth: 'dummy-token',
+      },
+      {} as any,
+    );
+
+    expect((ws as unknown as MockWebSocket).readyState).toBe(
+      MockWebSocket.CLOSED,
+    );
+    expect(mutagens.length).toBe(0);
+    expect(pushers.length).toBe(0);
   });
 });
 
@@ -476,7 +524,7 @@ describe('jwt auth missing options and missing endpoints', () => {
         {
           clientGroupID: '1',
           clientID: `1`,
-          userID: 'anon',
+          userID: 'user-1',
           wsID: '1',
           auth: 'dummy-token',
         },
@@ -494,6 +542,7 @@ describe('jwt auth missing options and missing endpoints', () => {
 
 describe('connection hijacking prevention', () => {
   let syncer: Syncer;
+  let contextManagers: Map<string, ConnectionContextManagerImpl>;
   let verifySpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
@@ -506,6 +555,7 @@ describe('connection hijacking prevention', () => {
       },
     } as ZeroConfig);
     syncer = env.syncer;
+    contextManagers = env.contextManagers;
   });
 
   afterEach(async () => {
@@ -603,7 +653,49 @@ describe('connection hijacking prevention', () => {
     );
   });
 
-  test('rejects missing auth on reconnect for authenticated client group', async () => {
+  test('mismatched validated user does not replace existing connection', async () => {
+    const existingWs = new MockWebSocket() as unknown as WebSocket;
+    await receiver(
+      existingWs,
+      {
+        clientGroupID: '1',
+        clientID: 'target-client',
+        userID: 'user-1',
+        wsID: 'ws-1',
+        protocolVersion: 30,
+      },
+      {} as any,
+    );
+
+    const contextManager = contextManagers.get('1');
+    expect(contextManager).toBeDefined();
+    contextManager!.validateConnection(
+      {clientID: 'target-client', wsID: 'ws-1'},
+      0,
+    );
+
+    const attackerWs = new MockWebSocket() as unknown as WebSocket;
+    await receiver(
+      attackerWs,
+      {
+        clientGroupID: '1',
+        clientID: 'target-client',
+        userID: 'user-2',
+        wsID: 'ws-2',
+        protocolVersion: 30,
+      },
+      {} as any,
+    );
+
+    expect((existingWs as unknown as MockWebSocket).readyState).toBe(
+      MockWebSocket.OPEN,
+    );
+    expect((attackerWs as unknown as MockWebSocket).readyState).toBe(
+      MockWebSocket.CLOSED,
+    );
+  });
+
+  test('admits a second clientID without reusing another connection auth state', async () => {
     verifySpy.mockResolvedValueOnce({sub: 'user-1'});
     const firstWs = new MockWebSocket() as unknown as WebSocket;
     await receiver(
@@ -636,14 +728,14 @@ describe('connection hijacking prevention', () => {
     );
 
     expect((reconnectWs as unknown as MockWebSocket).readyState).toBe(
-      MockWebSocket.CLOSED,
+      MockWebSocket.OPEN,
     );
     expect((firstWs as unknown as MockWebSocket).readyState).toBe(
       MockWebSocket.OPEN,
     );
   });
 
-  test('retains user binding until view syncer expires', async () => {
+  test('admits a later connection after an earlier authenticated connection closes', async () => {
     verifySpy.mockResolvedValueOnce({sub: 'user-1'});
     const firstWs = new MockWebSocket() as unknown as WebSocket;
     await receiver(
@@ -674,7 +766,7 @@ describe('connection hijacking prevention', () => {
     );
 
     expect((reconnectWs as unknown as MockWebSocket).readyState).toBe(
-      MockWebSocket.CLOSED,
+      MockWebSocket.OPEN,
     );
   });
 });
