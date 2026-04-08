@@ -134,7 +134,7 @@ export class WorkerDispatcher implements Service {
 
       const syncer = assignSyncer(clientGroupID);
 
-      lc.debug?.(`connecting ${clientGroupID} to syncer ${syncer}`);
+      lc.info?.(`connecting ${clientGroupID} to syncer ${syncer}`);
       return {payload: params, sender: syncers[syncer]};
     };
 
