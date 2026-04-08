@@ -165,7 +165,7 @@ export default async function runWorker(
     const mode: ReplicaFileMode =
       runChangeStreamer && litestream.backupURL ? 'serving-copy' : 'serving';
     const numReplicaShards = Math.min(
-      config.numReplicaShards ?? 1,
+      Math.max(config.numReplicaShards ?? 1, 1),
       numSyncers,
     );
 

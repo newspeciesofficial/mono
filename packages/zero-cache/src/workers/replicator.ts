@@ -119,12 +119,40 @@ export function getPragmaConfig(mode: ReplicaFileMode): PragmaConfig {
   };
 }
 
+/**
+ * Creates a minimal empty replica database in the given WAL mode.
+ * Used for new shard files that will be populated by the IncrementalSyncer
+ * via the change-streamer's initial sync.
+ */
+function createEmptyReplica(
+  lc: LogContext,
+  file: string,
+  walMode: 'wal' | 'wal2',
+  mode: ReplicaFileMode,
+): Database {
+  lc.info?.(`creating empty replica at ${file}`);
+  const replica = new Database(lc, file);
+  replica.pragma(`journal_mode = ${walMode}`);
+  const pragmas = getPragmaConfig(mode);
+  applyPragmas(replica, pragmas);
+  return replica;
+}
+
 export async function setupReplica(
   lc: LogContext,
   mode: ReplicaFileMode,
   replicaOptions: ReplicaOptions,
+  isNewShard = false,
 ): Promise<Database> {
-  lc.info?.(`setting up ${mode} replica`);
+  lc.info?.(`setting up ${mode} replica (isNewShard=${isNewShard})`);
+
+  // New shard files are empty — they will be populated by the
+  // IncrementalSyncer via the change-streamer's initial sync.
+  // Skip the full connect() which assumes an existing synced replica.
+  if (isNewShard) {
+    const walMode = mode === 'backup' ? 'wal' : 'wal2';
+    return createEmptyReplica(lc, replicaOptions.file, walMode, mode);
+  }
 
   switch (mode) {
     case 'backup':

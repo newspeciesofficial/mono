@@ -55,7 +55,8 @@ export default async function runWorker(
       : config.replica.file;
 
   const replicaOptions = {...config.replica, file: baseFile};
-  const replica = await setupReplica(lc, fileMode, replicaOptions);
+  const isNewShard = shardIndex !== undefined && shardIndex > 0;
+  const replica = await setupReplica(lc, fileMode, replicaOptions, isNewShard);
 
   // Create the write worker for async SQLite writes.
   const dbPath = replica.name;
