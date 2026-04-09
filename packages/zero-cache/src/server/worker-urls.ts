@@ -15,6 +15,7 @@ function resolve(path: string): URL {
 export const CHANGE_STREAMER_URL = resolve('./change-streamer.ts');
 export const MAIN_URL = resolve('./main.ts');
 export const MUTATOR_URL = resolve('./mutator.ts');
+export const POOL_THREAD_URL = resolve('./pool-thread.ts');
 export const REAPER_URL = resolve('./reaper.ts');
 export const REPLICATOR_URL = resolve('./replicator.ts');
 export const SYNCER_URL = resolve('./syncer.ts');

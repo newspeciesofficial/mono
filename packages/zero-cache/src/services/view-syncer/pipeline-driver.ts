@@ -336,7 +336,11 @@ export class PipelineDriver {
   /** Returns per-query hydration times for diagnostics. */
   hydrationBudgetBreakdown(): {id: string; table: string; ms: number}[] {
     return [...this.#pipelines.entries()]
-      .map(([id, p]) => ({id, table: p.transformedAst.table, ms: p.hydrationTimeMs}))
+      .map(([id, p]) => ({
+        id,
+        table: p.transformedAst.table,
+        ms: p.hydrationTimeMs,
+      }))
       .sort((a, b) => b.ms - a.ms);
   }
 

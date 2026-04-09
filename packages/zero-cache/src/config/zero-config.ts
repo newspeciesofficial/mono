@@ -437,6 +437,22 @@ export const zeroOptions = {
     ],
   },
 
+  numPoolThreads: {
+    type: v.number().default(0),
+    desc: [
+      `The number of IVM pool worker threads per syncer process.`,
+      ``,
+      `When 0 (default), IVM runs on the syncer's main event loop — stock`,
+      `behavior, same as if this flag did not exist.`,
+      ``,
+      `When > 0, each syncer spawns this many worker_threads. Every client`,
+      `group is stickily assigned to one pool thread; all of that group's`,
+      `SQLite / IVM work (init, addQuery, advance, getRow) runs on the`,
+      `assigned pool thread, freeing the syncer event loop to handle`,
+      `WebSocket I/O, CVR writes, and poke delivery concurrently with IVM.`,
+    ],
+  },
+
   change: {
     db: {
       type: v.string().optional(),

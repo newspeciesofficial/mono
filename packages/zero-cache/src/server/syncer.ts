@@ -19,8 +19,15 @@ import {PusherService} from '../services/mutagen/pusher.ts';
 import type {ReplicaState} from '../services/replicator/replicator.ts';
 import type {DrainCoordinator} from '../services/view-syncer/drain-coordinator.ts';
 import {PipelineDriver} from '../services/view-syncer/pipeline-driver.ts';
+import {PoolThreadManager} from '../services/view-syncer/pool-thread-manager.ts';
+import {PoolThreadMapper} from '../services/view-syncer/pool-thread-mapper.ts';
+import {
+  RemotePipelineDriver,
+  type PoolThreadHandle,
+} from '../services/view-syncer/remote-pipeline-driver.ts';
 import {Snapshotter} from '../services/view-syncer/snapshotter.ts';
 import {ViewSyncerService} from '../services/view-syncer/view-syncer.ts';
+import {POOL_THREAD_URL} from './worker-urls.ts';
 import {pgClient} from '../types/pg.ts';
 import {
   parentWorker,
@@ -104,6 +111,29 @@ export default function runWorker(
 
   const shard = getShardID(config);
 
+  // Pool worker threads (optional, gated by ZERO_NUM_POOL_THREADS).
+  // When numPoolThreads > 0, IVM runs on worker threads; each client group
+  // is sticky-assigned to one pool thread via PoolThreadMapper. When 0, the
+  // stock in-process PipelineDriver is used and none of the pool-thread
+  // modules are touched.
+  const poolManager =
+    config.numPoolThreads > 0
+      ? new PoolThreadManager({
+          lc,
+          numPoolThreads: config.numPoolThreads,
+          workerURL: POOL_THREAD_URL,
+          replicaFile,
+          shardID: shard,
+          logConfig: config.log,
+          yieldThresholdMs: config.yieldThresholdMs,
+          enableQueryPlanner: config.enableQueryPlanner,
+        })
+      : undefined;
+  const poolMapper =
+    poolManager !== undefined
+      ? new PoolThreadMapper(poolManager.numPoolThreads)
+      : undefined;
+
   const viewSyncerFactory = (
     id: string,
     sub: Subscription<ReplicaState>,
@@ -138,6 +168,45 @@ export default function runWorker(
       validateLegacyJWT,
     );
 
+    const pipelineDriver =
+      poolManager !== undefined && poolMapper !== undefined
+        ? (() => {
+            const poolThreadIdx = poolMapper.assign(id);
+            const baseHandle = poolManager.getHandle(poolThreadIdx);
+            // Wrap the base handle so unregister also releases the
+            // mapper slot for this CG. ViewSyncerService calls
+            // pipelineDriver.destroy() which internally calls
+            // handle.unregister(id) — that is the single cleanup point.
+            const wrappedHandle: PoolThreadHandle = {
+              get poolThreadIdx() {
+                return baseHandle.poolThreadIdx;
+              },
+              postMessage: msg => baseHandle.postMessage(msg),
+              unregister: cgID => {
+                baseHandle.unregister(cgID);
+                poolMapper.release(cgID);
+              },
+            };
+            const remote = new RemotePipelineDriver(logger, wrappedHandle, id);
+            poolManager.registerDriver(poolThreadIdx, id, remote);
+            return remote;
+          })()
+        : new PipelineDriver(
+            logger,
+            config.log,
+            new Snapshotter(logger, replicaFile, shard),
+            shard,
+            operatorStorage.createClientGroupStorage(id),
+            id,
+            inspectorDelegate,
+            () =>
+              isPriorityOpRunning()
+                ? priorityOpRunningYieldThresholdMs
+                : normalYieldThresholdMs,
+            config.enableQueryPlanner,
+            config,
+          );
+
     return new ViewSyncerService(
       config,
       logger,
@@ -145,21 +214,7 @@ export default function runWorker(
       config.taskID,
       id,
       cvrDB,
-      new PipelineDriver(
-        logger,
-        config.log,
-        new Snapshotter(logger, replicaFile, shard),
-        shard,
-        operatorStorage.createClientGroupStorage(id),
-        id,
-        inspectorDelegate,
-        () =>
-          isPriorityOpRunning()
-            ? priorityOpRunningYieldThresholdMs
-            : normalYieldThresholdMs,
-        config.enableQueryPlanner,
-        config,
-      ),
+      pipelineDriver,
       sub,
       drainCoordinator,
       config.log.slowHydrateThreshold,
