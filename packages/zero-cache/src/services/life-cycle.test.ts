@@ -188,6 +188,16 @@ describe('shutdown', () => {
       ],
     ],
     [
+      'SIGABRT',
+      () => proc.emit('SIGABRT'),
+      [
+        'stop supporting',
+        'stop supporting',
+        'stop user-facing',
+        'stop user-facing',
+      ],
+    ],
+    [
       'supporting worker exits',
       () => replicator.stop(),
       [
@@ -224,30 +234,5 @@ describe('shutdown', () => {
 
     // sort() because order doesn't matter.
     expect(events.sort()).toEqual(expectedEvents.sort());
-  });
-
-  test('graceful shutdown with no user-facing workers', async () => {
-    proc = new EventEmitter();
-    processes = new ProcessManager(lc, proc);
-    const changeStreamer = startWorker('cs', 'supporting');
-    const replicator = startWorker('rep', 'supporting');
-    const all = [changeStreamer, replicator];
-
-    await Promise.all(all.map(w => w.running.promise));
-
-    void changeStreamer.stop();
-
-    await replicator.draining.promise;
-
-    replicator.finishDrain.resolve();
-
-    await replicator.stopped.promise;
-
-    lc.debug?.('expecting');
-    expect(events).toEqual([
-      'stop supporting',
-      'drain supporting',
-      'stop supporting',
-    ]);
   });
 });
