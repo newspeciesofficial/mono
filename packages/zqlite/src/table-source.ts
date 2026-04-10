@@ -80,8 +80,6 @@ export class TableSource implements Source {
   readonly #logConfig: LogConfig;
   readonly #lc: LogContext;
   readonly #shouldYield: () => boolean;
-  readonly #explainCache = new Map<string, boolean>();
-  #currentDB: Database;
   #stmts: Statements;
   #overlay?: Overlay | undefined;
   #pushEpoch = 0;
@@ -107,7 +105,6 @@ export class TableSource implements Source {
     this.#columns = columns;
     this.#uniqueIndexes = getUniqueIndexes(db, tableName);
     this.#primaryKey = primaryKey;
-    this.#currentDB = db;
     this.#stmts = this.#getStatementsFor(db);
     this.#shouldYield = shouldYield;
 
@@ -130,7 +127,6 @@ export class TableSource implements Source {
    * algorithm for concurrent traversal of historic timelines.
    */
   setDB(db: Database) {
-    this.#currentDB = db;
     this.#stmts = this.#getStatementsFor(db);
   }
 
@@ -279,37 +275,6 @@ export class TableSource implements Source {
 
     const query = this.#requestToSQL(req, connection.filters?.condition, sort);
     const sqlAndBindings = format(query);
-
-    // Log TEMP B-TREE usage for debugging query plan issues.
-    // Uses a cache to avoid running EXPLAIN on every fetch.
-    if (!this.#explainCache.has(sqlAndBindings.text)) {
-      this.#explainCache.set(sqlAndBindings.text, true);
-      try {
-        const explainSql = `EXPLAIN QUERY PLAN ${sqlAndBindings.text.replaceAll('?', "'__placeholder__'")}`;
-        const plan = this.#currentDB
-          .prepare(explainSql)
-          .all<{detail: string}>();
-        const planDetails = plan.map(r => r.detail);
-        const hasTempBTree = planDetails.some(p => p.includes('TEMP B-TREE'));
-        const hasFullScan = planDetails.some(
-          p => p.includes('SCAN') && !p.includes('USING INDEX'),
-        );
-        if (hasTempBTree || hasFullScan) {
-          this.#lc.warn?.(
-            `[QUERY_PLAN] ${this.#table}: ${hasTempBTree ? 'TEMP_B_TREE' : ''}${hasFullScan ? ' FULL_SCAN' : ''}`,
-            {
-              table: this.#table,
-              sql: sqlAndBindings.text,
-              plan: planDetails.join(' | '),
-              hasTempBTree,
-              hasFullScan,
-            },
-          );
-        }
-      } catch (e) {
-        this.#lc.warn?.(`[QUERY_PLAN] EXPLAIN failed for ${this.#table}`, e);
-      }
-    }
 
     const cachedStatement = this.#stmts.cache.get(sqlAndBindings.text);
     try {
