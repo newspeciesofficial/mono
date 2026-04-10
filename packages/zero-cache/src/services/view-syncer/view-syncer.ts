@@ -972,6 +972,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
           const pokers = startPoke(
             this.#getClients(cvr.version),
             newCVR.version,
+            'config',
           );
           for (const patch of patches) {
             await pokers.addPatch(patch);
@@ -1778,7 +1779,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
         removeQueries,
       );
       const clients = this.#getClients();
-      const pokers = startPoke(clients, newVersion);
+      const pokers = startPoke(clients, newVersion, 'hydration');
       for (const patch of queryPatches) {
         await pokers.addPatch(patch);
       }
@@ -1909,7 +1910,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
     return startAsyncSpan(tracer, 'vs.#catchupClients', async span => {
       current ??= cvr.version;
       const clients = this.#getClients();
-      const pokers = usePokers ?? startPoke(clients, cvr.version);
+      const pokers = usePokers ?? startPoke(clients, cvr.version, 'catchup');
       span.setAttribute('numClients', clients.length);
 
       const catchupFrom = clients
@@ -2243,8 +2244,12 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
   }
 }
 
-// Update CVR after every 10000 rows.
-const CURSOR_PAGE_SIZE = 10000;
+// Update CVR after every N rows. Lower values stream patches to clients
+// sooner (less buffering) at the cost of more frequent CVR updater calls.
+const CURSOR_PAGE_SIZE = parseInt(
+  process.env.ZERO_CURSOR_PAGE_SIZE ?? '10000',
+  10,
+);
 
 // A global Lock acts as a queue to run a single IVM time slice per iteration
 // of the node event loop, thus bounding I/O delay to the duration of a single

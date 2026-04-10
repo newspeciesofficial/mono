@@ -81,12 +81,15 @@ const NOOP: PokeHandler = {
   end: () => promiseVoid,
 };
 
+export type PokeType = 'hydration' | 'advance' | 'catchup' | 'config';
+
 /** Wraps PokeHandlers for multiple clients in a single PokeHandler. */
 export function startPoke(
   clients: ClientHandler[],
   tentativeVersion: CVRVersion,
+  pokeType: PokeType = 'advance',
 ): PokeHandler {
-  const pokers = clients.map(c => c.startPoke(tentativeVersion));
+  const pokers = clients.map(c => c.startPoke(tentativeVersion, pokeType));
 
   // Promise.allSettled() ensures that a failed (e.g. disconnected) client
   // does not prevent other clients from receiving the pokes. However, the
@@ -181,7 +184,10 @@ export class ClientHandler {
     this.#downstream.cancel();
   }
 
-  startPoke(tentativeVersion: CVRVersion): PokeHandler {
+  startPoke(
+    tentativeVersion: CVRVersion,
+    pokeType: PokeType = 'advance',
+  ): PokeHandler {
     const pokeID = versionToCookie(tentativeVersion);
     const lc = this.#lc.withContext('pokeID', pokeID);
 
@@ -327,8 +333,8 @@ export class ClientHandler {
         this.#baseVersion = finalVersion;
 
         const elapsed = performance.now() - start;
-        this.#pokeTransactions.add(1);
-        this.#pokeTime.record(elapsed / 1000);
+        this.#pokeTransactions.add(1, {pokeType});
+        this.#pokeTime.record(elapsed / 1000, {pokeType});
       },
     };
   }
