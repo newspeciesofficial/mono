@@ -295,14 +295,19 @@ export class TableSource implements Source {
           p => p.includes('SCAN') && !p.includes('USING INDEX'),
         );
         if (hasTempBTree || hasFullScan) {
-          // eslint-disable-next-line no-console
-          console.warn(
-            `[QUERY_PLAN] ${this.#table}: ${hasTempBTree ? 'TEMP_B_TREE' : ''}${hasFullScan ? ' FULL_SCAN' : ''} | sql=${sqlAndBindings.text} | plan=${planDetails.join(' | ')}`,
+          this.#lc.warn?.(
+            `[QUERY_PLAN] ${this.#table}: ${hasTempBTree ? 'TEMP_B_TREE' : ''}${hasFullScan ? ' FULL_SCAN' : ''}`,
+            {
+              table: this.#table,
+              sql: sqlAndBindings.text,
+              plan: planDetails.join(' | '),
+              hasTempBTree,
+              hasFullScan,
+            },
           );
         }
       } catch (e) {
-        // eslint-disable-next-line no-console
-        console.warn(`[QUERY_PLAN] EXPLAIN failed for ${this.#table}: ${e}`);
+        this.#lc.debug?.(`[QUERY_PLAN] EXPLAIN failed for ${this.#table}`, e);
       }
     }
 
