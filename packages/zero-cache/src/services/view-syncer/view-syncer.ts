@@ -1845,20 +1845,24 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       }
       // #processChanges does batched de-duping of rows. Wrap all pipelines in
       // a single generator in order to maximize de-duping.
-      await this.#processChanges(
+      const tBeforeProcessChanges = performance.now();
+      const pcStats = await this.#processChanges(
         lc,
         timer,
         generateRowChanges(this.#slowHydrateThreshold),
         updater,
         pokers,
       );
+      const tAfterProcessChanges = performance.now();
 
       for (const patch of await updater.deleteUnreferencedRows(lc)) {
         await pokers.addPatch(patch);
       }
+      const tAfterDeleteUnref = performance.now();
 
       // Commit the changes and update the CVR snapshot.
       this.#cvr = await this.#flushUpdater(lc, updater);
+      const tAfterCvrFlush = performance.now();
 
       const finalVersion = this.#cvr.version;
 
@@ -1870,13 +1874,32 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
         addQueries.map(q => q.id),
         pokers,
       );
+      const tAfterCatchup = performance.now();
 
       // Signal clients to commit.
       await pokers.end(finalVersion);
+      const tAfterPokeEnd = performance.now();
 
-      const wallTime = performance.now() - start;
+      const wallTime = tAfterPokeEnd - start;
+      const processChangesMs = tAfterProcessChanges - tBeforeProcessChanges;
+      const deleteUnrefMs = tAfterDeleteUnref - tAfterProcessChanges;
+      const cvrFlushMs = tAfterCvrFlush - tAfterDeleteUnref;
+      const catchupMs = tAfterCatchup - tAfterCvrFlush;
+      const pokeEndMs = tAfterPokeEnd - tAfterCatchup;
       lc.info?.(
-        `finished processing queries (process: ${totalProcessTime} ms, wall: ${wallTime} ms)`,
+        `finished processing queries (process: ${totalProcessTime} ms, wall: ${wallTime.toFixed(1)} ms, ` +
+          `processChangesMs: ${processChangesMs.toFixed(1)}, ` +
+          `deleteUnrefMs: ${deleteUnrefMs.toFixed(1)}, ` +
+          `cvrFlushMs: ${cvrFlushMs.toFixed(1)}, ` +
+          `catchupMs: ${catchupMs.toFixed(1)}, ` +
+          `pokeEndMs: ${pokeEndMs.toFixed(1)}, ` +
+          `queries: ${addQueries.length}, ` +
+          `removed: ${removeQueries.length}, ` +
+          `totalRows: ${pcStats.totalRows}, ` +
+          `batches: ${pcStats.batchCount}, ` +
+          `patchesSent: ${pcStats.patchesSent}, ` +
+          `receivedMs: ${pcStats.receivedMs.toFixed(1)}, ` +
+          `addPatchMs: ${pcStats.addPatchMs.toFixed(1)})`,
       );
     });
   }
@@ -1908,6 +1931,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
     usePokers?: PokeHandler,
   ) {
     return startAsyncSpan(tracer, 'vs.#catchupClients', async span => {
+      const tCatchupStart = performance.now();
       current ??= cvr.version;
       const clients = this.#getClients();
       const pokers = usePokers ?? startPoke(clients, cvr.version, 'catchup');
@@ -1965,18 +1989,32 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
           rowPatchCount++;
         }
       }
+      const tAfterRowPatches = performance.now();
       span.setAttribute('rowPatchCount', rowPatchCount);
-      if (rowPatchCount) {
-        lc.debug?.(`sent ${rowPatchCount} row patches`);
-      }
 
       // Then await the config patches which were fetched in parallel.
+      let configPatchCount = 0;
       for (const patch of await configPatches) {
         await pokers.addPatch(patch);
+        configPatchCount++;
       }
+      const tAfterConfigPatches = performance.now();
 
       if (!usePokers) {
         await pokers.end(cvr.version);
+      }
+      const tCatchupEnd = performance.now();
+      const catchupWall = tCatchupEnd - tCatchupStart;
+      if (rowPatchCount > 0 || configPatchCount > 0 || catchupWall > 50) {
+        lc.info?.(
+          `catchup completed (wall: ${catchupWall.toFixed(1)} ms, ` +
+            `rowPatches: ${rowPatchCount}, ` +
+            `configPatches: ${configPatchCount}, ` +
+            `rowPatchMs: ${(tAfterRowPatches - tCatchupStart).toFixed(1)}, ` +
+            `configPatchMs: ${(tAfterConfigPatches - tAfterRowPatches).toFixed(1)}, ` +
+            `pokeEndMs: ${(tCatchupEnd - tAfterConfigPatches).toFixed(1)}, ` +
+            `clients: ${clients.length})`,
+        );
       }
     });
   }
@@ -1987,12 +2025,22 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
     changes: Iterable<RowChange | 'yield'> | AsyncIterable<RowChange | 'yield'>,
     updater: CVRQueryDrivenUpdater,
     pokers: PokeHandler,
-  ) {
+  ): Promise<{
+    totalRows: number;
+    batchCount: number;
+    receivedMs: number;
+    addPatchMs: number;
+    patchesSent: number;
+  }> {
     return startAsyncSpan(tracer, 'vs.#processChanges', async () => {
       const start = performance.now();
 
       const rows = new CustomKeyMap<RowID, RowUpdate>(rowIDString);
       let total = 0;
+      let batchCount = 0;
+      let totalReceivedMs = 0;
+      let totalAddPatchMs = 0;
+      let totalPatchesSent = 0;
 
       const processBatch = () =>
         startAsyncSpan(tracer, 'processBatch', async () => {
@@ -2001,11 +2049,17 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
           lc.debug?.(
             `processing ${rows.size} (of ${total}) rows (${wallElapsed} ms)`,
           );
+          const tRecv = performance.now();
           const patches = await updater.received(lc, rows);
+          totalReceivedMs += performance.now() - tRecv;
 
+          const tPatch = performance.now();
           for (const patch of patches) {
             await pokers.addPatch(patch);
           }
+          totalAddPatchMs += performance.now() - tPatch;
+          totalPatchesSent += patches.length;
+          batchCount++;
           rows.clear();
         });
 
@@ -2058,6 +2112,13 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
         }
         span.setAttribute('totalRows', total);
       });
+      return {
+        totalRows: total,
+        batchCount,
+        receivedMs: totalReceivedMs,
+        addPatchMs: totalAddPatchMs,
+        patchesSent: totalPatchesSent,
+      };
     });
   }
 
