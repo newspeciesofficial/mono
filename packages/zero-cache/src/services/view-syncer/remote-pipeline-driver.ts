@@ -354,21 +354,28 @@ export class RemotePipelineDriver {
     queryID: string,
     query: AST,
     _timer: Timer,
-  ): Promise<Iterable<RowChange | 'yield'>> {
-    const result = await this.#sendAndWait({
+  ): Promise<AsyncIterable<RowChange | 'yield'>> {
+    assert(!this.#destroyed, 'addQuery: driver destroyed');
+    const requestId = this.#allocRequestId();
+    const stream = new AdvanceStream();
+    this.#streams.set(requestId, stream);
+    stream.postTime = performance.now();
+    this.#postMessage({
       type: 'addQuery',
-      requestId: 0,
+      requestId,
       clientGroupID: this.#clientGroupID,
       queryID,
       transformationHash,
       ast: query,
     });
-    assert(
-      result.type === 'addQueryResult',
-      `addQuery: expected addQueryResult, got ${result.type}`,
-    );
-    this.#state = result.state;
-    return result.changes;
+    // Wait for addQueryBegin — confirms pool thread received the request.
+    try {
+      await stream.awaitBegin();
+    } catch (e) {
+      this.#streams.delete(requestId);
+      throw e;
+    }
+    return this.#streamAdvanceChanges(requestId, stream);
   }
 
   removeQuery(queryID: string): void {
@@ -531,10 +538,12 @@ export class RemotePipelineDriver {
    * driver code.
    */
   handleMessage(msg: PoolWorkerResult): void {
-    // Streaming advance responses are routed to the stream buffer first.
+    // Streaming responses (advance + addQuery) are routed to the stream
+    // buffer first. Both use the same AdvanceStream push-pull pattern.
     const stream = this.#streams.get(msg.requestId);
     if (stream) {
       switch (msg.type) {
+        // --- advance streaming ---
         case 'advanceBegin':
           stream.beginTime = performance.now();
           stream.onBegin({
@@ -555,11 +564,6 @@ export class RemotePipelineDriver {
           this.#state = msg.state;
           stream.completeTime = performance.now();
           stream.onComplete(msg.poolToCompleteMs, msg.batchCount);
-          // Snapshot the per-advance timings from the stream. The diagnostic
-          // fields from advanceBegin are mirrored onto the stream by
-          // `onBegin`, and the advanceComplete fields arrive in `msg`.
-          // ViewSyncer reads this via `getLastAdvanceTimings()` after the
-          // for-await loop drains.
           this.#lastTimings = {
             postToBeginMs: stream.beginTime - stream.postTime,
             postToCompleteMs: stream.completeTime - stream.postTime,
@@ -572,12 +576,33 @@ export class RemotePipelineDriver {
             poolThreadIdx: stream.poolThreadIdx,
           };
           return;
+        // --- addQuery streaming (same pattern, simpler begin payload) ---
+        case 'addQueryBegin':
+          stream.beginTime = performance.now();
+          stream.onBegin({
+            version: '',
+            numChanges: 0,
+            snapshotMs: 0,
+            poolToBeginMs: 0,
+            gapSincePrevAdvanceMs: 0,
+            prevAdvanceCgID: undefined,
+            prevAdvanceDurationMs: undefined,
+            poolThreadIdx: this.#handle.poolThreadIdx,
+          });
+          return;
+        case 'addQueryBatch':
+          stream.onBatch(msg.changes);
+          return;
+        case 'addQueryComplete':
+          this.#state = msg.state;
+          stream.completeTime = performance.now();
+          stream.onComplete(0, msg.batchCount);
+          return;
+        // --- errors ---
         case 'error':
           stream.onError(this.#toError(msg));
           return;
         default:
-          // Fall through — not a stream message; treat as a one-shot response
-          // that happens to share the requestId (shouldn't happen in practice).
           break;
       }
     }

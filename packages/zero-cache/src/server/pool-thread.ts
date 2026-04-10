@@ -250,31 +250,66 @@ function handleAddQuery(
 ): void {
   const state = requireState(clientGroupID);
   const timer = createTimer();
-  const changes: RowChange[] = [];
+
+  send({
+    type: 'addQueryBegin',
+    requestId,
+    clientGroupID,
+    queryID,
+  });
+
+  let batch: RowChange[] = [];
+  let totalRows = 0;
+  let batchCount = 0;
   for (const change of state.driver.addQuery(
     transformationHash,
     queryID,
     ast,
     timer,
   )) {
-    if (change !== 'yield') {
-      changes.push(change);
+    if (change === 'yield') {
+      continue;
+    }
+    batch.push(change);
+    if (batch.length >= BATCH_SIZE) {
+      totalRows += batch.length;
+      batchCount++;
+      send({
+        type: 'addQueryBatch',
+        requestId,
+        clientGroupID,
+        changes: batch,
+      });
+      batch = [];
     }
   }
+  if (batch.length > 0) {
+    totalRows += batch.length;
+    batchCount++;
+    send({
+      type: 'addQueryBatch',
+      requestId,
+      clientGroupID,
+      changes: batch,
+    });
+  }
+
   state.queryCount++;
   const hydrationTimeMs = timer.totalElapsed();
   lc.info?.(
     `hydrated query=${queryID} clientGroup=${clientGroupID} ` +
-      `rows=${changes.length} hydrationMs=${hydrationTimeMs.toFixed(1)} ` +
+      `rows=${totalRows} batches=${batchCount} ` +
+      `hydrationMs=${hydrationTimeMs.toFixed(1)} ` +
       `queriesInGroup=${state.queryCount}`,
   );
   send({
-    type: 'addQueryResult',
+    type: 'addQueryComplete',
     requestId,
     clientGroupID,
     queryID,
-    changes,
     hydrationTimeMs,
+    totalRows,
+    batchCount,
     state: snapshotState(state),
   });
 }

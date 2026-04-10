@@ -124,19 +124,31 @@ export type InitResult = {
   generation: number;
 };
 
-export type AddQueryResult = {
-  type: 'addQueryResult';
+/** Start of a streaming addQuery response. */
+export type AddQueryBeginResult = {
+  type: 'addQueryBegin';
   requestId: number;
   clientGroupID: string;
   queryID: string;
-  /**
-   * The full hydration changes, collected on the pool thread before the
-   * response is posted. Hydrations are short enough that streaming is not
-   * required; collecting them into one message simplifies the proxy.
-   * `'yield'` markers are NOT included — the pool thread drops them.
-   */
+};
+
+/** A batch of hydration row changes. */
+export type AddQueryBatchResult = {
+  type: 'addQueryBatch';
+  requestId: number;
+  clientGroupID: string;
   changes: RowChange[];
+};
+
+/** End of a streaming addQuery response. */
+export type AddQueryCompleteResult = {
+  type: 'addQueryComplete';
+  requestId: number;
+  clientGroupID: string;
+  queryID: string;
   hydrationTimeMs: number;
+  totalRows: number;
+  batchCount: number;
   state: DriverState;
 };
 
@@ -248,7 +260,9 @@ export type ErrorResult = {
 
 export type PoolWorkerResult =
   | InitResult
-  | AddQueryResult
+  | AddQueryBeginResult
+  | AddQueryBatchResult
+  | AddQueryCompleteResult
   | RemoveQueryResult
   | AdvanceBeginResult
   | AdvanceChangeBatchResult
