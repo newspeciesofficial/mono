@@ -307,7 +307,7 @@ export class TableSource implements Source {
           );
         }
       } catch (e) {
-        this.#lc.debug?.(`[QUERY_PLAN] EXPLAIN failed for ${this.#table}`, e);
+        this.#lc.warn?.(`[QUERY_PLAN] EXPLAIN failed for ${this.#table}`, e);
       }
     }
 
