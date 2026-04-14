@@ -64,6 +64,7 @@ clap = { version = "4", features = ["derive", "env"] }
 crossbeam = "0.8"
 crossbeam-channel = "0.5"
 dashmap = "6"
+rayon = "1"
 
 # Data structures
 smallvec = { version = "1", features = ["serde"] }

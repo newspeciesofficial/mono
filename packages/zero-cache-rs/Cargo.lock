@@ -1390,6 +1390,7 @@ version = "0.30.1"
 dependencies = [
  "bindgen",
  "cc",
+ "rayon",
  "rusqlite",
  "tempfile",
 ]
@@ -3606,6 +3607,7 @@ version = "0.0.0"
 dependencies = [
  "indexmap 2.14.0",
  "pretty_assertions",
+ "rayon",
  "rusqlite",
  "serde",
  "serde_json",

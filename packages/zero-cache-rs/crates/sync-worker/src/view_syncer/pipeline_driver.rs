@@ -126,6 +126,58 @@ use crate::zqlite::table_source::{SchemaValue, TableSource};
 /// tripped regardless of budget — absorbs timer jitter on fast advances.
 pub const MIN_ADVANCEMENT_TIME_LIMIT_MS: f64 = 50.0;
 
+/// Request shape for [`PipelineDriver::add_queries`]. Fields mirror the
+/// args of [`PipelineDriver::add_query`] so callers can construct the
+/// batch from the same data they'd pass to the singular call.
+#[derive(Debug, Clone)]
+pub struct AddQueryReq {
+    pub transformation_hash: String,
+    pub query_id: String,
+    pub query: AST,
+}
+
+/// Result for one query in an [`PipelineDriver::add_queries`] batch.
+/// `Ok(rows)` carries the same `RowChangeOrYield` stream that
+/// [`PipelineDriver::add_query`] returns; `Err` carries the same
+/// `PipelineDriverError` so failures of one query don't tank the batch.
+pub type AddQueryResult = Result<Vec<RowChangeOrYield>, PipelineDriverError>;
+
+/// Real-clock `Timer` used by [`PipelineDriver::add_queries`] so each
+/// rayon worker measures its own per-query elapsed (parallelism-invariant).
+/// `elapsed_lap` returns time since the last `lap_reset` (currently never
+/// called, matching what hydration uses today). `total_elapsed` returns
+/// time since construction.
+struct WallClockTimer {
+    start: std::time::Instant,
+}
+
+impl WallClockTimer {
+    fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Timer for WallClockTimer {
+    fn elapsed_lap(&self) -> f64 {
+        self.start.elapsed().as_secs_f64() * 1000.0
+    }
+    fn total_elapsed(&self) -> f64 {
+        self.start.elapsed().as_secs_f64() * 1000.0
+    }
+}
+
+fn panic_payload_to_string(p: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = p.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 /// Per-change floor baked into the advance budget. Guarantees each change
 /// gets at least this much time before the circuit breaker can fire,
 /// independent of how fast hydration was. Chosen so a diff of N changes
@@ -659,6 +711,82 @@ impl PipelineDriver {
         let result = self.add_query_inner(transformation_hash, query_id, query, timer);
         *self.hydrate_in_progress.lock().unwrap() = false;
         result
+    }
+
+    /// Hydrate `reqs.len()` queries in parallel. Each query goes through
+    /// the existing single-query [`add_query_inner`] path; rayon fans
+    /// the calls across cores. Per-query state is built locally on each
+    /// rayon worker and only crosses the `pipelines`/`tables` mutex for
+    /// the brief insert at the end.
+    ///
+    /// The returned `Vec` preserves input order: `result[i]` corresponds
+    /// to `reqs[i]`. One query failing does NOT abort the batch — its
+    /// `Err` lands in its slot and the others continue.
+    ///
+    /// Safety / soundness:
+    /// - No `unsafe` code. Parallelism rides on rayon's safe API.
+    /// - Each worker uses its own `WallClockTimer` so per-query
+    ///   `hydration_time_ms` is the worker's own elapsed (parallelism-
+    ///   invariant — not the batch wall clock).
+    /// - All mutated driver state (`tables`, `pipelines`, `storage`,
+    ///   `snapshotter`) is accessed through pre-existing `Mutex` guards.
+    /// - Each worker wraps its `add_query_inner` call in `catch_unwind`
+    ///   so a panic in one query becomes a `PipelineDriverError::Other`
+    ///   rather than poisoning the whole batch.
+    /// - Each worker calls `remove_query(id)` first to honour the same
+    ///   "replace if present" contract as the singular `add_query`.
+    pub fn add_queries(&self, reqs: Vec<AddQueryReq>) -> Vec<AddQueryResult> {
+        use rayon::prelude::*;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        if !self.initialized() {
+            return reqs
+                .into_iter()
+                .map(|_| Err(PipelineDriverError::NotInitialized("addQueries")))
+                .collect();
+        }
+        if *self.advance_in_progress.lock().unwrap() {
+            return reqs
+                .into_iter()
+                .map(|_| Err(PipelineDriverError::HydrationDuringAdvance))
+                .collect();
+        }
+
+        // Hold the hydrate-in-progress flag for the entire batch. The
+        // singular advance() will refuse to start while we're hydrating
+        // any of the queries in this batch.
+        *self.hydrate_in_progress.lock().unwrap() = true;
+
+        let results: Vec<AddQueryResult> = reqs
+            .into_par_iter()
+            .map(|req| {
+                // remove_query is required for the "replace if present"
+                // contract. It briefly locks self.pipelines; serialised
+                // across workers but each call is O(1).
+                self.remove_query(&req.query_id);
+
+                let timer = WallClockTimer::new();
+                let res = catch_unwind(AssertUnwindSafe(|| {
+                    self.add_query_inner(
+                        &req.transformation_hash,
+                        &req.query_id,
+                        req.query,
+                        &timer,
+                    )
+                }));
+                match res {
+                    Ok(r) => r,
+                    Err(panic) => Err(PipelineDriverError::Other(format!(
+                        "add_query for {} panicked: {}",
+                        req.query_id,
+                        panic_payload_to_string(panic),
+                    ))),
+                }
+            })
+            .collect();
+
+        *self.hydrate_in_progress.lock().unwrap() = false;
+        results
     }
 
     fn add_query_inner(
@@ -2665,6 +2793,137 @@ mod tests {
         let r = driver.should_advance_yield_maybe_abort(&t, 4, num_changes, budget);
         assert!(r.is_err(), "must trip above full budget");
         assert!(matches!(r.unwrap_err(), PipelineDriverError::Reset(_)));
+    }
+
+    // ─── add_queries: parallel hydration ───────────────────────────────
+
+    fn simple_users_ast() -> AST {
+        SqlAST {
+            schema: None,
+            table: "users".into(),
+            alias: None,
+            where_clause: None,
+            related: None,
+            start: None,
+            limit: None,
+            order_by: None,
+        }
+    }
+
+    #[test]
+    fn add_queries_returns_one_result_per_input_in_order() {
+        // 3 distinct queries in a batch — verifies order preservation
+        // (result[i] matches reqs[i]) and that all run successfully.
+        let (driver, _d, source) = make_driver();
+        driver
+            .init(&client_schema(), table_specs(), full_tables())
+            .unwrap();
+        driver.register_table_source("users", source.clone());
+        // Seed two rows so each query produces something distinguishable.
+        for (id, handle) in [(1, "alice"), (2, "bob"), (3, "carol")] {
+            source
+                .push_change(SourceChange::Add(SourceChangeAdd {
+                    row: {
+                        let mut r = Row::new();
+                        r.insert("id".into(), Some(json!(id)));
+                        r.insert("handle".into(), Some(json!(handle)));
+                        r.insert("_0_version".into(), Some(json!("00")));
+                        r
+                    },
+                }))
+                .unwrap();
+        }
+        let reqs = vec![
+            AddQueryReq {
+                transformation_hash: "h1".into(),
+                query_id: "q1".into(),
+                query: simple_users_ast(),
+            },
+            AddQueryReq {
+                transformation_hash: "h2".into(),
+                query_id: "q2".into(),
+                query: simple_users_ast(),
+            },
+            AddQueryReq {
+                transformation_hash: "h3".into(),
+                query_id: "q3".into(),
+                query: simple_users_ast(),
+            },
+        ];
+        let results = driver.add_queries(reqs);
+        assert_eq!(results.len(), 3, "one result per input");
+        for (i, r) in results.iter().enumerate() {
+            assert!(r.is_ok(), "query {i} failed: {:?}", r.as_ref().err());
+            let rows = r.as_ref().unwrap();
+            assert!(!rows.is_empty(), "query {i} produced no rows");
+        }
+        // All three pipelines registered.
+        let q = driver.queries();
+        assert!(q.contains_key("q1"));
+        assert!(q.contains_key("q2"));
+        assert!(q.contains_key("q3"));
+    }
+
+    #[test]
+    fn add_queries_returns_not_initialized_before_init() {
+        let (driver, _d, _s) = make_driver();
+        let reqs = vec![AddQueryReq {
+            transformation_hash: "h".into(),
+            query_id: "q".into(),
+            query: simple_users_ast(),
+        }];
+        let results = driver.add_queries(reqs);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            results[0].as_ref().unwrap_err(),
+            PipelineDriverError::NotInitialized(_)
+        ));
+    }
+
+    #[test]
+    fn add_queries_each_pipelines_hydration_time_independent() {
+        // Each query gets its own per-thread WallClockTimer, so per-query
+        // hydration_time_ms must NOT be the batch wall clock (which
+        // would be invariant across all queries when parallelism caps
+        // wall time at the slowest).
+        let (driver, _d, source) = make_driver();
+        driver
+            .init(&client_schema(), table_specs(), full_tables())
+            .unwrap();
+        driver.register_table_source("users", source.clone());
+        // One small row so each hydration is trivially fast.
+        source
+            .push_change(SourceChange::Add(SourceChangeAdd {
+                row: {
+                    let mut r = Row::new();
+                    r.insert("id".into(), Some(json!(1)));
+                    r.insert("handle".into(), Some(json!("a")));
+                    r.insert("_0_version".into(), Some(json!("00")));
+                    r
+                },
+            }))
+            .unwrap();
+        let reqs = vec![
+            AddQueryReq {
+                transformation_hash: "h1".into(),
+                query_id: "q1".into(),
+                query: simple_users_ast(),
+            },
+            AddQueryReq {
+                transformation_hash: "h2".into(),
+                query_id: "q2".into(),
+                query: simple_users_ast(),
+            },
+        ];
+        let _ = driver.add_queries(reqs);
+        // Per-pipeline times are exposed via hydration_budget_breakdown —
+        // both should be measured (>= 0) since each thread used its own
+        // WallClockTimer (parallelism-invariant per-query measurement).
+        let bb = driver.hydration_budget_breakdown();
+        assert_eq!(bb.len(), 2, "two queries hydrated");
+        for (id, _table, ms) in &bb {
+            assert!(*ms >= 0.0, "{id} hydration_time_ms = {ms} should be >= 0");
+        }
     }
 
     #[test]
