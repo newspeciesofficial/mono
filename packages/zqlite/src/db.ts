@@ -10,6 +10,15 @@ import {version} from '../../otel/src/version.ts';
 
 const tracer = trace.getTracer('view-syncer', version);
 
+// Process-wide accumulator of time spent inside SQLite read/iterate calls.
+// Sampled by callers (e.g. PipelineDriver) to attribute IVM time between
+// SQLite work and operator/JS compute. Not thread-safe across worker threads,
+// but each worker has its own module scope so this is per-thread state.
+let sqliteReadMs = 0;
+export function getSqliteReadMs(): number {
+  return sqliteReadMs;
+}
+
 // https://www.sqlite.org/pragma.html#pragma_auto_vacuum
 const AUTO_VACUUM_INCREMENTAL = 2;
 
@@ -196,9 +205,11 @@ export class Statement {
   run(...params: unknown[]): RunResult {
     const start = performance.now();
     const ret = this.#stmt.run(...params);
+    const elapsed = performance.now() - start;
+    sqliteReadMs += elapsed;
     logIfSlow(
       this.#lc.withContext('method', 'run'),
-      performance.now() - start,
+      elapsed,
       {...this.#attrs, method: 'run'},
       this.#threshold,
     );
@@ -208,9 +219,11 @@ export class Statement {
   get<T>(...params: unknown[]): T {
     const start = performance.now();
     const ret = this.#stmt.get(...params);
+    const elapsed = performance.now() - start;
+    sqliteReadMs += elapsed;
     logIfSlow(
       this.#lc.withContext('method', 'get'),
-      performance.now() - start,
+      elapsed,
       {...this.#attrs, method: 'get'},
       this.#threshold,
     );
@@ -220,9 +233,11 @@ export class Statement {
   all<T>(...params: unknown[]): T[] {
     const start = performance.now();
     const ret = this.#stmt.all(...params);
+    const elapsed = performance.now() - start;
+    sqliteReadMs += elapsed;
     logIfSlow(
       this.#lc.withContext('method', 'all'),
-      performance.now() - start,
+      elapsed,
       {...this.#attrs, method: 'all'},
       this.#threshold,
     );
@@ -266,6 +281,7 @@ class LoggingIterableIterator<T> implements IterableIterator<T> {
     const ret = this.#it.next();
     const elapsed = performance.now() - start;
     this.#sqliteRowTimeSum += elapsed;
+    sqliteReadMs += elapsed;
     if (ret.done) {
       this.#log();
     }

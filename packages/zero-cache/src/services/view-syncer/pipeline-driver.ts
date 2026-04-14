@@ -27,7 +27,7 @@ import type {
 import type {ConnectionCostModel} from '../../../../zql/src/planner/planner-connection.ts';
 import {MeasurePushOperator} from '../../../../zql/src/query/measure-push-operator.ts';
 import type {ClientGroupStorage} from '../../../../zqlite/src/database-storage.ts';
-import type {Database} from '../../../../zqlite/src/db.ts';
+import {getSqliteReadMs, type Database} from '../../../../zqlite/src/db.ts';
 import {
   resolveSimpleScalarSubqueries,
   type CompanionSubquery,
@@ -144,6 +144,12 @@ export class PipelineDriver {
   #streamer: Streamer | null = null;
   #hydrateContext: HydrateContext | null = null;
   #advanceContext: AdvanceContext | null = null;
+  // Per-advance accumulators sampled by the consumer (view-syncer) after
+  // the advance generator drains. Reset at the start of each #advance.
+  #lastAdvanceTimings: {
+    tableMs: Record<string, {ms: number; count: number}>;
+    sqliteReadMs: number;
+  } | null = null;
   #replicaVersion: string | null = null;
   #primaryKeys: Map<string, PrimaryKey> | null = null;
   #permissions: LoadedPermissions | null = null;
@@ -652,6 +658,9 @@ export class PipelineDriver {
       numChanges,
       pos: 0,
     };
+    const tableMs: Record<string, {ms: number; count: number}> = {};
+    const sqliteAtStart = getSqliteReadMs();
+    this.#lastAdvanceTimings = null;
     this.#lc.info?.(
       `starting pipeline advancement of ${numChanges} changes with an ` +
         `advancement time limited based on total hydration time of ` +
@@ -715,6 +724,10 @@ export class PipelineDriver {
         }
 
         const elapsed = timer.totalElapsed() - start;
+        const acc = tableMs[table] ?? {ms: 0, count: 0};
+        acc.ms += elapsed;
+        acc.count += 1;
+        tableMs[table] = acc;
         if (elapsed > 50) {
           this.#lc.info?.(
             `slow advance change: table=${table} pos=${this.#advanceContext.pos}/${numChanges} ` +
@@ -736,8 +749,29 @@ export class PipelineDriver {
       this.#ensureCostModelExistsIfEnabled(curr.db.db);
       this.#lc.debug?.(`Advanced to ${curr.version}`);
     } finally {
+      const tableMsRounded: Record<string, {ms: number; count: number}> = {};
+      for (const [t, v] of Object.entries(tableMs)) {
+        tableMsRounded[t] = {ms: +v.ms.toFixed(1), count: v.count};
+      }
+      this.#lastAdvanceTimings = {
+        tableMs: tableMsRounded,
+        sqliteReadMs: +(getSqliteReadMs() - sqliteAtStart).toFixed(1),
+      };
       this.#advanceContext = null;
     }
+  }
+
+  /**
+   * IVM diagnostics for the most recent #advance call: per-table push time +
+   * total time spent inside SQLite read/iterate calls. View-syncer reads this
+   * after the advance generator drains and appends to the existing
+   * "finished processing advancement" log line. Null if never advanced.
+   */
+  getLastAdvanceIvmTimings(): {
+    tableMs: Record<string, {ms: number; count: number}>;
+    sqliteReadMs: number;
+  } | null {
+    return this.#lastAdvanceTimings;
   }
 
   /** Implements `BuilderDelegate.getSource()` */

@@ -19,7 +19,7 @@ import {ErrorOrigin} from '../../../../zero-protocol/src/error-origin.ts';
 import type {InspectQueryRow} from '../../../../zero-protocol/src/inspect-down.ts';
 import {clampTTL, DEFAULT_TTL_MS} from '../../../../zql/src/query/ttl.ts';
 import * as Mode from '../../db/mode-enum.ts';
-import {runTx} from '../../db/run-transaction.ts';
+import {runTx, type TransactionOptions} from '../../db/run-transaction.ts';
 import {TransactionPool} from '../../db/transaction-pool.ts';
 import {recordRowsSynced} from '../../server/anonymous-otel-start.ts';
 import {ProtocolErrorWithLevel} from '../../types/error-with-level.ts';
@@ -106,6 +106,25 @@ const tracer = trace.getTracer('cvr-store', version);
 type StringifiedQueriesRow = Omit<QueriesRow, 'queryArgs'> & {
   queryArgs: string | null;
 };
+
+// Module-level gauge of how many CVR transactions are currently open
+// against the CVR PG pool from this process. Sampled at the start of each
+// flush so that high txBeginMs can be correlated with pool saturation
+// (vs. pure PG round-trip latency).
+let cvrActiveTxs = 0;
+
+function runCvrTx<T>(
+  db: PostgresDB,
+  fn: (tx: PostgresTransaction) => T | Promise<T>,
+  opts?: TransactionOptions,
+) {
+  cvrActiveTxs++;
+  // Decrement on settle without changing the return type — runTx uses
+  // postgres.js's begin() which returns Promise<UnwrapPromiseArray<T>>.
+  return runTx(db, fn, opts).finally(() => {
+    cvrActiveTxs--;
+  });
+}
 
 function asQuery(row: QueriesRow): QueryRecord {
   const maybeVersion = (s: string | null) =>
@@ -273,7 +292,7 @@ export class CVRStore {
       profileID: null,
     };
 
-    const [instance, clientsRows, queryRows, desiresRows] = await runTx(
+    const [instance, clientsRows, queryRows, desiresRows] = await runCvrTx(
       this.#db,
       tx => {
         lc.debug?.(`CVR tx started after ${Date.now() - start} ms`);
@@ -962,6 +981,7 @@ export class CVRStore {
     lockCheckMs: 0,
     pipelineMs: 0,
     postTxMs: 0,
+    activeTxsAtStart: 0,
   };
 
   async #flush(
@@ -980,6 +1000,7 @@ export class CVRStore {
       statements: 0,
     };
     const tFlushStart = performance.now();
+    const activeTxsAtStart = cvrActiveTxs;
     if (this.#pendingRowRecordUpdates.size) {
       const existingRowRecords = await this.getRowRecords();
       this.#rowCount = existingRowRecords.size;
@@ -1023,7 +1044,7 @@ export class CVRStore {
     // Use an async callback so we can await the version/ownership check and
     // validate it INSIDE the transaction. If validation fails, the exception
     // causes postgres.js to ROLLBACK, ensuring no writes are committed on error.
-    const results = await runTx(
+    const results = await runCvrTx(
       this.#db,
       async tx => {
         tTxBegun = performance.now();
@@ -1147,6 +1168,7 @@ export class CVRStore {
       lockCheckMs: +(tAfterLockCheck - tTxBegun).toFixed(1),
       pipelineMs: +(tAfterPipeline - tAfterLockCheck).toFixed(1),
       postTxMs: +(performance.now() - tAfterPipeline).toFixed(1),
+      activeTxsAtStart,
     };
 
     return stats;

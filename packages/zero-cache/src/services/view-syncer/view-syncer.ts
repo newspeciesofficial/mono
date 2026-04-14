@@ -80,8 +80,7 @@ import {
 } from './cvr.ts';
 import type {DrainCoordinator} from './drain-coordinator.ts';
 import {handleInspect} from './inspect-handler.ts';
-import type {PipelineDriver} from './pipeline-driver.ts';
-import {type RowChange} from './pipeline-driver.ts';
+import {PipelineDriver, type RowChange} from './pipeline-driver.ts';
 import {RemotePipelineDriver} from './remote-pipeline-driver.ts';
 
 /**
@@ -1799,6 +1798,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       const pipelines = this.#pipelines;
       const hydrations = this.#hydrations;
       const hydrationTime = this.#hydrationTime;
+      const perQueryStats: {id: string; name: string; ms: number}[] = [];
       // oxlint-disable-next-line @typescript-eslint/no-this-alias
       const self = this;
 
@@ -1828,11 +1828,10 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
             lc.warn?.('Slow query materialization', elapsed, q.ast);
           }
 
-          // Log query name and latency for observability
-          lc.info?.('Query hydration completed', {
-            queryID: q.id,
-            queryName: q.name ?? 'unnamed',
-            hydrationTimeMs: elapsed,
+          perQueryStats.push({
+            id: q.id,
+            name: q.name ?? 'unnamed',
+            ms: +elapsed.toFixed(1),
           });
 
           manualSpan(tracer, 'vs.addAndConsumeQuery', elapsed, {
@@ -1899,7 +1898,8 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
           `batches: ${pcStats.batchCount}, ` +
           `patchesSent: ${pcStats.patchesSent}, ` +
           `receivedMs: ${pcStats.receivedMs.toFixed(1)}, ` +
-          `addPatchMs: ${pcStats.addPatchMs.toFixed(1)})`,
+          `addPatchMs: ${pcStats.addPatchMs.toFixed(1)}, ` +
+          `perQuery: ${JSON.stringify(perQueryStats)})`,
       );
     });
   }
@@ -2198,6 +2198,19 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       const pokeMs = tEnd - tAfterCVR;
       const wallTime = tEnd - tStart;
 
+      // IVM diagnostics from the in-process PipelineDriver: per-table push
+      // time + total SQLite read time. Pool path runs IVM in a worker so
+      // these are only available on the stock driver.
+      let ivmDiag = '';
+      if (this.#pipelines instanceof PipelineDriver) {
+        const t = this.#pipelines.getLastAdvanceIvmTimings();
+        if (t !== null) {
+          ivmDiag =
+            `, sqliteReadMs: ${t.sqliteReadMs.toFixed(1)}` +
+            `, tableMs: ${JSON.stringify(t.tableMs)}`;
+        }
+      }
+
       // Pool-thread IPC diagnostics, only when running on RemotePipelineDriver.
       // Zero new log lines — the fields are appended to the existing
       // "finished processing advancement" entry. Null on stock driver.
@@ -2234,7 +2247,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
           `snapshotMs: ${snapshotMs.toFixed(2)}, ` +
           `ivmMs: ${ivmMs.toFixed(1)}, ` +
           `cvrFlushMs: ${cvrFlushMs.toFixed(1)}, ` +
-          `pokeMs: ${pokeMs.toFixed(1)}${poolDiag}))`,
+          `pokeMs: ${pokeMs.toFixed(1)}${ivmDiag}${poolDiag}))`,
       );
       this.#transactionAdvanceTime.record(totalProcessTime / 1000);
       return 'success';
