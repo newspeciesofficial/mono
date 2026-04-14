@@ -244,7 +244,7 @@ export class RustPipelineDriver {
     }>,
     onChunk: (chunk: {
       queryID: string;
-      rows: Iterable<RowChange | 'yield'>;
+      rows: ReadonlyArray<RowChange>;
     }) => void,
   ): Array<
     | {queryID: string; ok: true; hydrationTimeMs: number}
