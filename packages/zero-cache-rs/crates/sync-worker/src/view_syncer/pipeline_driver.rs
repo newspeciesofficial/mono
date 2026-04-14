@@ -142,6 +142,24 @@ pub struct AddQueryReq {
 /// `PipelineDriverError` so failures of one query don't tank the batch.
 pub type AddQueryResult = Result<Vec<RowChangeOrYield>, PipelineDriverError>;
 
+/// One chunk of rows from a single query, emitted to the callback
+/// passed into [`PipelineDriver::add_queries_streaming`]. Multiple
+/// chunks may be emitted per query; the last one carries `is_final = true`.
+pub struct QueryChunk {
+    pub query_id: String,
+    pub rows: Vec<RowChangeOrYield>,
+    pub is_final: bool,
+}
+
+/// Status for one query in a [`PipelineDriver::add_queries_streaming`]
+/// batch. Rows are NOT carried here — they were streamed via the
+/// callback. This carries only success/failure + the per-query
+/// hydration time so callers can observe budget metrics.
+pub struct AddQueryStreamStatus {
+    pub query_id: String,
+    pub result: Result<f64, PipelineDriverError>,
+}
+
 /// Real-clock `Timer` used by [`PipelineDriver::add_queries`] so each
 /// rayon worker measures its own per-query elapsed (parallelism-invariant).
 /// `elapsed_lap` returns time since the last `lap_reset` (currently never
@@ -787,6 +805,107 @@ impl PipelineDriver {
 
         *self.hydrate_in_progress.lock().unwrap() = false;
         results
+    }
+
+    /// Streaming variant of [`add_queries`]. Same parallelism and safety
+    /// invariants, but rows are emitted via `on_chunk` callback instead
+    /// of buffered into a return vec. The callback is called from the
+    /// rayon worker thread that produced the chunk — caller's callback
+    /// MUST be `Send + Sync` and itself thread-safe (the napi
+    /// `ThreadsafeFunction` wrapper handles this for the FFI path).
+    ///
+    /// Per-query rows are emitted in one final chunk (`is_final = true`)
+    /// after `add_query_inner` returns. Within-query streaming chunks
+    /// (e.g. flushing every 20 rows mid-hydrate) is intentionally
+    /// deferred — the across-query parallelism wins are realised
+    /// by emitting per-query chunks immediately as each worker finishes,
+    /// without waiting for the slowest worker.
+    ///
+    /// Returns one [`AddQueryStreamStatus`] per input request, in input
+    /// order. Failed queries do NOT trigger a chunk callback for that
+    /// query — the caller observes the failure via the status's
+    /// `Err(PipelineDriverError)`.
+    pub fn add_queries_streaming<F>(
+        &self,
+        reqs: Vec<AddQueryReq>,
+        on_chunk: F,
+    ) -> Vec<AddQueryStreamStatus>
+    where
+        F: Fn(QueryChunk) + Send + Sync,
+    {
+        use rayon::prelude::*;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        if !self.initialized() {
+            return reqs
+                .into_iter()
+                .map(|r| AddQueryStreamStatus {
+                    query_id: r.query_id,
+                    result: Err(PipelineDriverError::NotInitialized("addQueriesStreaming")),
+                })
+                .collect();
+        }
+        if *self.advance_in_progress.lock().unwrap() {
+            return reqs
+                .into_iter()
+                .map(|r| AddQueryStreamStatus {
+                    query_id: r.query_id,
+                    result: Err(PipelineDriverError::HydrationDuringAdvance),
+                })
+                .collect();
+        }
+
+        *self.hydrate_in_progress.lock().unwrap() = true;
+        let on_chunk = &on_chunk;
+
+        let statuses: Vec<AddQueryStreamStatus> = reqs
+            .into_par_iter()
+            .map(|req| {
+                self.remove_query(&req.query_id);
+
+                let timer = WallClockTimer::new();
+                let qid = req.query_id.clone();
+                let res = catch_unwind(AssertUnwindSafe(|| {
+                    self.add_query_inner(
+                        &req.transformation_hash,
+                        &req.query_id,
+                        req.query,
+                        &timer,
+                    )
+                }));
+
+                match res {
+                    Ok(Ok(rows)) => {
+                        // One terminal chunk per query — within-query
+                        // chunking is a follow-up. Calling on_chunk from
+                        // the worker thread is safe because F: Sync.
+                        on_chunk(QueryChunk {
+                            query_id: qid.clone(),
+                            rows,
+                            is_final: true,
+                        });
+                        AddQueryStreamStatus {
+                            query_id: qid,
+                            result: Ok(timer.total_elapsed()),
+                        }
+                    }
+                    Ok(Err(e)) => AddQueryStreamStatus {
+                        query_id: qid,
+                        result: Err(e),
+                    },
+                    Err(panic) => AddQueryStreamStatus {
+                        query_id: qid.clone(),
+                        result: Err(PipelineDriverError::Other(format!(
+                            "add_query for {qid} panicked: {}",
+                            panic_payload_to_string(panic),
+                        ))),
+                    },
+                }
+            })
+            .collect();
+
+        *self.hydrate_in_progress.lock().unwrap() = false;
+        statuses
     }
 
     fn add_query_inner(
@@ -2878,6 +2997,95 @@ mod tests {
             results[0].as_ref().unwrap_err(),
             PipelineDriverError::NotInitialized(_)
         ));
+    }
+
+    #[test]
+    fn add_queries_streaming_emits_one_terminal_chunk_per_query() {
+        use std::sync::Mutex;
+        let (driver, _d, source) = make_driver();
+        driver
+            .init(&client_schema(), table_specs(), full_tables())
+            .unwrap();
+        driver.register_table_source("users", source.clone());
+        for (id, h) in [(1, "a"), (2, "b")] {
+            source
+                .push_change(SourceChange::Add(SourceChangeAdd {
+                    row: {
+                        let mut r = Row::new();
+                        r.insert("id".into(), Some(json!(id)));
+                        r.insert("handle".into(), Some(json!(h)));
+                        r.insert("_0_version".into(), Some(json!("00")));
+                        r
+                    },
+                }))
+                .unwrap();
+        }
+        let collected: Mutex<Vec<(String, usize, bool)>> = Mutex::new(Vec::new());
+        let reqs = vec![
+            AddQueryReq {
+                transformation_hash: "h1".into(),
+                query_id: "q1".into(),
+                query: simple_users_ast(),
+            },
+            AddQueryReq {
+                transformation_hash: "h2".into(),
+                query_id: "q2".into(),
+                query: simple_users_ast(),
+            },
+        ];
+        let statuses = driver.add_queries_streaming(reqs, |chunk| {
+            collected
+                .lock()
+                .unwrap()
+                .push((chunk.query_id, chunk.rows.len(), chunk.is_final));
+        });
+        // Both succeed.
+        assert_eq!(statuses.len(), 2);
+        for s in &statuses {
+            assert!(s.result.is_ok(), "{} failed: {:?}", s.query_id, s.result);
+        }
+        // One chunk per query, marked final, with at least one row.
+        let chunks = collected.lock().unwrap();
+        assert_eq!(chunks.len(), 2, "exactly one chunk per query");
+        for (_qid, n_rows, is_final) in chunks.iter() {
+            assert!(*is_final, "every chunk should be marked final");
+            assert!(*n_rows > 0, "chunk should have rows");
+        }
+        // Queries actually registered.
+        let q = driver.queries();
+        assert!(q.contains_key("q1"));
+        assert!(q.contains_key("q2"));
+    }
+
+    #[test]
+    fn add_queries_streaming_returns_status_with_per_query_hydration_time() {
+        let (driver, _d, source) = make_driver();
+        driver
+            .init(&client_schema(), table_specs(), full_tables())
+            .unwrap();
+        driver.register_table_source("users", source.clone());
+        source
+            .push_change(SourceChange::Add(SourceChangeAdd {
+                row: {
+                    let mut r = Row::new();
+                    r.insert("id".into(), Some(json!(1)));
+                    r.insert("handle".into(), Some(json!("a")));
+                    r.insert("_0_version".into(), Some(json!("00")));
+                    r
+                },
+            }))
+            .unwrap();
+        let reqs = vec![AddQueryReq {
+            transformation_hash: "h".into(),
+            query_id: "q".into(),
+            query: simple_users_ast(),
+        }];
+        let statuses = driver.add_queries_streaming(reqs, |_| {});
+        assert_eq!(statuses.len(), 1);
+        let s = &statuses[0];
+        assert_eq!(s.query_id, "q");
+        let elapsed = s.result.as_ref().expect("ok");
+        assert!(*elapsed >= 0.0, "elapsed should be measured");
     }
 
     #[test]

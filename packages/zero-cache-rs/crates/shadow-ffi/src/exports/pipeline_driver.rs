@@ -45,8 +45,10 @@ use zero_cache_sync_worker::view_syncer::client_schema::{
     ClientColumnSchema, ClientSchema, ClientTableSchema, LiteAndZqlSpec, LiteColumnSpec,
     LiteTableSpec, LiteTableSpecWithKeys, ShardId, ZqlSchemaValue,
 };
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use zero_cache_sync_worker::view_syncer::pipeline_driver::{
-    NoopInspectorDelegate, PipelineDriver, RowChange, RowChangeOrYield, Timer,
+    AddQueryReq, NoopInspectorDelegate, PipelineDriver, QueryChunk, RowChange, RowChangeOrYield,
+    Timer,
 };
 use zero_cache_sync_worker::view_syncer::snapshotter::Snapshotter;
 use zero_cache_sync_worker::zqlite::database_storage::{DatabaseStorage, DatabaseStorageOptions};
@@ -387,6 +389,114 @@ pub fn pipeline_driver_add_query(
             let json: Vec<JsonValue> = changes.iter().map(row_change_to_json).collect();
             Ok::<JsonValue, String>(JsonValue::Array(json))
         })
+    })
+}
+
+/// Parallel batched hydration with chunk-streaming.
+///
+/// The TS caller hands in:
+/// - `queries`: array of `{transformationHash, queryID, ast}` JSON
+///   objects (one per query in the batch);
+/// - `on_chunk`: a `ThreadsafeFunction` that receives one
+///   `{queryID, rows, isFinal}` payload per query as soon as that
+///   query's hydration completes on its rayon worker.
+///
+/// The call returns once every worker has finished, with one
+/// `{queryID, ok, hydrationTimeMs?, error?}` status per input query (in
+/// input order). Per-query rows are NOT carried in the return — they
+/// were already pushed via `on_chunk` so the TS Streamer can flush them
+/// to the client incrementally as workers finish.
+///
+/// ## Safety / soundness
+///
+/// - All FFI types deserialise via serde — no unsafe casts.
+/// - `ThreadsafeFunction` calls `on_chunk` from rayon worker threads;
+///   napi-rs handles the cross-thread dispatch onto the JS event loop.
+///   Multiple workers may call it concurrently; napi-rs serialises
+///   delivery into JS.
+/// - Panics inside any worker are caught by `add_queries_streaming`'s
+///   inner `catch_unwind` and surfaced as `Err` in that query's status.
+///   No panic crosses the FFI boundary.
+#[napi(js_name = "pipeline_driver_add_queries_parallel")]
+pub fn pipeline_driver_add_queries_parallel(
+    driver: &PipelineDriverHandle,
+    queries: Vec<JsonValue>,
+    on_chunk: ThreadsafeFunction<JsonValue, ()>,
+) -> napi::Result<JsonValue> {
+    run("pipeline_driver_add_queries_parallel", || {
+        // Parse each request once so a malformed AST surfaces as a
+        // batch-level error rather than a per-query failure.
+        let mut reqs: Vec<AddQueryReq> = Vec::with_capacity(queries.len());
+        for (i, q) in queries.into_iter().enumerate() {
+            let req = parse_add_query_req(q)
+                .map_err(|e| format!("queries[{i}]: {e}"))?;
+            reqs.push(req);
+        }
+
+        // Wrap the ThreadsafeFunction so it can be called from rayon
+        // workers. Cloning it just bumps an Arc — it's a cheap handle.
+        // Using NonBlocking call mode so workers don't stall waiting
+        // for napi to deliver.
+        let on_chunk = Arc::new(on_chunk);
+
+        with_handle(driver, |d| {
+            let on_chunk = Arc::clone(&on_chunk);
+            let statuses = d.add_queries_streaming(reqs, move |chunk: QueryChunk| {
+                let payload = chunk_to_json(chunk);
+                on_chunk.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking);
+            });
+            let result: Vec<JsonValue> = statuses
+                .into_iter()
+                .map(|s| match s.result {
+                    Ok(hydration_ms) => json!({
+                        "queryID": s.query_id,
+                        "ok": true,
+                        "hydrationTimeMs": hydration_ms,
+                    }),
+                    Err(e) => json!({
+                        "queryID": s.query_id,
+                        "ok": false,
+                        "error": e.to_string(),
+                    }),
+                })
+                .collect();
+            Ok::<JsonValue, String>(JsonValue::Array(result))
+        })
+    })
+}
+
+fn parse_add_query_req(v: JsonValue) -> Result<AddQueryReq, String> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| "expected an object".to_string())?;
+    let transformation_hash = obj
+        .get("transformationHash")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "missing transformationHash".to_string())?
+        .to_string();
+    let query_id = obj
+        .get("queryID")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "missing queryID".to_string())?
+        .to_string();
+    let ast_v = obj
+        .get("ast")
+        .ok_or_else(|| "missing ast".to_string())?
+        .clone();
+    let query: AST = serde_json::from_value(ast_v).map_err(|e| format!("bad ast: {e}"))?;
+    Ok(AddQueryReq {
+        transformation_hash,
+        query_id,
+        query,
+    })
+}
+
+fn chunk_to_json(chunk: QueryChunk) -> JsonValue {
+    let rows: Vec<JsonValue> = chunk.rows.iter().map(row_change_to_json).collect();
+    json!({
+        "queryID": chunk.query_id,
+        "rows": rows,
+        "isFinal": chunk.is_final,
     })
 }
 

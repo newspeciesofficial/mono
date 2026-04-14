@@ -226,6 +226,65 @@ export class RustPipelineDriver {
     }
   }
 
+  /**
+   * Batched parallel hydration. Each query is hydrated on its own rayon
+   * worker in Rust; chunks stream back via `onChunk` as soon as each
+   * worker finishes. The returned promise resolves once every worker
+   * is done with one status per query (input order preserved).
+   *
+   * Use this in place of looping `addQuery()` per query when caller
+   * has multiple queries to hydrate at once (e.g. ViewSyncer's
+   * `#hydrateUnchangedQueries` batch).
+   */
+  addQueries(
+    batch: ReadonlyArray<{
+      transformationHash: string;
+      queryID: string;
+      ast: AST;
+    }>,
+    onChunk: (chunk: {
+      queryID: string;
+      rows: Iterable<RowChange | 'yield'>;
+    }) => void,
+  ): Array<
+    | {queryID: string; ok: true; hydrationTimeMs: number}
+    | {queryID: string; ok: false; error: string}
+  > {
+    assert(this.initialized(), 'Not yet initialized');
+    const reqs = batch.map(b => ({
+      transformationHash: b.transformationHash,
+      queryID: b.queryID,
+      ast: b.ast,
+    }));
+    const results = this.#native.pipeline_driver_add_queries_parallel(
+      this.#handle,
+      reqs,
+      (err, chunk) => {
+        if (err) {
+          this.#lc.error?.('add_queries_parallel chunk callback error', err);
+          return;
+        }
+        // Strip yield markers — the Rust path runs synchronously per
+        // worker so cooperative-scheduling yields aren't meaningful here.
+        const rows = chunk.rows.filter(r => r.type !== 'yield') as RowChange[];
+        onChunk({queryID: chunk.queryID, rows});
+      },
+    );
+    // Update local pipeline metadata for any successful queries so
+    // queries() / totalHydrationTimeMs() reflect the new batch.
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r.ok) {
+        this.#pipelines.set(r.queryID, {
+          transformedAst: batch[i].ast,
+          transformationHash: batch[i].transformationHash,
+          hydrationTimeMs: r.hydrationTimeMs,
+        });
+      }
+    }
+    return results;
+  }
+
   removeQuery(queryID: string): void {
     if (!this.#pipelines.has(queryID)) return;
     this.#native.pipeline_driver_remove_query(this.#handle, queryID);

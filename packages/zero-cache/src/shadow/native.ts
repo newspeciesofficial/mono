@@ -137,6 +137,39 @@ export type ShadowNative = {
   }>;
   /** Shadow of `PipelineDriver.totalHydrationTimeMs()`. */
   pipeline_driver_total_hydration_time_ms(driver: PipelineDriverHandle): number;
+  /**
+   * Parallel batched hydration with chunk-streaming. Each query in the
+   * batch is hydrated on its own rayon worker thread; rows are pushed
+   * to TS via `onChunk` as soon as each worker finishes (one terminal
+   * chunk per query for now — sub-query chunking is a future change).
+   *
+   * The promise resolves once every worker is done. The resolved
+   * value is a per-query status array (input order):
+   *   `{queryID, ok: true,  hydrationTimeMs: number}` on success
+   *   `{queryID, ok: false, error: string}` on failure
+   *
+   * Per-query rows are NOT in the return — they were already streamed
+   * via `onChunk` so the TS Streamer can flush incrementally.
+   */
+  pipeline_driver_add_queries_parallel(
+    driver: PipelineDriverHandle,
+    queries: Array<{
+      transformationHash: string;
+      queryID: string;
+      ast: unknown;
+    }>,
+    onChunk: (
+      err: Error | null,
+      chunk: {
+        queryID: string;
+        rows: ShadowRowChange[];
+        isFinal: boolean;
+      },
+    ) => void,
+  ): Array<
+    | {queryID: string; ok: true; hydrationTimeMs: number}
+    | {queryID: string; ok: false; error: string}
+  >;
   /** Shadow of `PipelineDriver.hydrationBudgetBreakdown()`. */
   pipeline_driver_hydration_budget_breakdown(
     driver: PipelineDriverHandle,
