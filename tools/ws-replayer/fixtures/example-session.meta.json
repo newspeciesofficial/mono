@@ -1,0 +1,5 @@
+{
+  "url": "ws://localhost:4848/zero/sync/v49/connect?clientID=c-example&clientGroupID=g-example&wsid=w-example&userID=u-example&baseCookie=&schemaVersion=1",
+  "cookies": [{"name": "jwt", "value": "<redacted>"}],
+  "recorded_at": "2026-01-01T00:00:00Z"
+}

@@ -33,10 +33,11 @@ import type {ClientSchema} from '../../../../zero-protocol/src/client-schema.ts'
 import type {Row} from '../../../../zero-protocol/src/data.ts';
 import type {LoadedPermissions} from '../../auth/load-permissions.ts';
 import type {RowKey} from '../../types/row-key.ts';
-import type {
-  DriverState,
-  PoolWorkerMsg,
-  PoolWorkerResult,
+import {
+  decodeBatch,
+  type DriverState,
+  type PoolWorkerMsg,
+  type PoolWorkerResult,
 } from '../../workers/pool-protocol.ts';
 import type {RowChange, Timer} from './pipeline-driver.ts';
 
@@ -558,7 +559,7 @@ export class RemotePipelineDriver {
           });
           return;
         case 'advanceChangeBatch':
-          stream.onBatch(msg.changes);
+          stream.onBatch(decodeBatch(msg.changesBuf, msg.changesLen));
           return;
         case 'advanceComplete':
           this.#state = msg.state;
@@ -576,6 +577,47 @@ export class RemotePipelineDriver {
             poolThreadIdx: stream.poolThreadIdx,
           };
           return;
+        // --- single-message advance (< BATCH_SIZE rows) ---
+        case 'advanceSingle': {
+          const now = performance.now();
+          stream.beginTime = now;
+          stream.completeTime = now;
+          stream.poolToBeginMs = msg.poolToBeginMs;
+          stream.gapSincePrevAdvanceMs = msg.gapSincePrevAdvanceMs;
+          stream.prevAdvanceCgID = msg.prevAdvanceCgID;
+          stream.prevAdvanceDurationMs = msg.prevAdvanceDurationMs;
+          stream.poolThreadIdx = msg.poolThreadIdx;
+          // Deliver begin
+          stream.onBegin({
+            version: msg.version,
+            numChanges: msg.numChanges,
+            snapshotMs: msg.snapshotMs,
+            poolToBeginMs: msg.poolToBeginMs,
+            gapSincePrevAdvanceMs: msg.gapSincePrevAdvanceMs,
+            prevAdvanceCgID: msg.prevAdvanceCgID,
+            prevAdvanceDurationMs: msg.prevAdvanceDurationMs,
+            poolThreadIdx: msg.poolThreadIdx,
+          });
+          // Deliver batch if any
+          if (msg.changesBuf) {
+            stream.onBatch(decodeBatch(msg.changesBuf, msg.changesLen));
+          }
+          // Complete
+          this.#state = msg.state;
+          stream.onComplete(msg.poolToCompleteMs, msg.batchCount);
+          this.#lastTimings = {
+            postToBeginMs: now - stream.postTime,
+            postToCompleteMs: now - stream.postTime,
+            poolToBeginMs: msg.poolToBeginMs,
+            poolToCompleteMs: msg.poolToCompleteMs,
+            gapSincePrevAdvanceMs: msg.gapSincePrevAdvanceMs,
+            prevAdvanceCgID: msg.prevAdvanceCgID,
+            prevAdvanceDurationMs: msg.prevAdvanceDurationMs,
+            batchCount: msg.batchCount,
+            poolThreadIdx: msg.poolThreadIdx,
+          };
+          return;
+        }
         // --- addQuery streaming (same pattern, simpler begin payload) ---
         case 'addQueryBegin':
           stream.beginTime = performance.now();
@@ -591,7 +633,7 @@ export class RemotePipelineDriver {
           });
           return;
         case 'addQueryBatch':
-          stream.onBatch(msg.changes);
+          stream.onBatch(decodeBatch(msg.changesBuf, msg.changesLen));
           return;
         case 'addQueryComplete':
           this.#state = msg.state;

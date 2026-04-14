@@ -1,0 +1,63 @@
+# Side-by-side testing: TS zero-cache vs Rust zero-cache-rs
+#
+# Both connect to the same PostgreSQL and use separate SQLite replicas.
+# TS server on :4848, Rust server on :5858.
+#
+# Usage:
+#   # Start PostgreSQL first (from apps/zbugs)
+#   cd apps/zbugs && npm run db-up && npm run db-migrate && npm run db-seed
+#
+#   # Then run both servers
+#   docker compose -f packages/zero-cache-rs/docker-compose.test.yml up
+#
+#   # Health check both
+#   curl http://localhost:4848/      # TS
+#   curl http://localhost:5858/      # Rust
+
+services:
+  zero-cache-ts:
+    image: zero-cache-pool:local
+    ports:
+      - "4848:4848"
+      - "4849:4849"
+    environment:
+      ZERO_UPSTREAM_DB: "postgres://host.docker.internal:5432/zbugs"
+      ZERO_CVR_DB: "postgres://host.docker.internal:5432/zbugs"
+      ZERO_REPLICA_FILE: "/var/zero/zero-ts.db"
+      ZERO_PORT: "4848"
+      ZERO_NUM_SYNC_WORKERS: "4"
+      ZERO_NUM_POOL_THREADS: "4"
+      ZERO_LOG_LEVEL: "info"
+      ZERO_LOG_FORMAT: "json"
+    volumes:
+      - zero-data-ts:/var/zero
+    command: ["npx zero-cache"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4848/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  zero-cache-rs:
+    image: zero-cache-rs:local
+    ports:
+      - "5858:4848"
+      - "5859:4849"
+    environment:
+      ZERO_UPSTREAM_DB: "postgres://host.docker.internal:5432/zbugs"
+      ZERO_CVR_DB: "postgres://host.docker.internal:5432/zbugs"
+      ZERO_REPLICA_FILE: "/var/zero/zero-rs.db"
+      ZERO_PORT: "4848"
+      ZERO_NUM_SYNC_WORKERS: "4"
+      ZERO_LOG_LEVEL: "info"
+    volumes:
+      - zero-data-rs:/var/zero
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4848/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  zero-data-ts:
+  zero-data-rs:

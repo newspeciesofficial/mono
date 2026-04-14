@@ -1,0 +1,28 @@
+[package]
+name = "zero-cache-test-support"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# NOTE: This crate is dev-only. It is included in the workspace so that
+# integration tests can pull it in via `[dev-dependencies]`. It should never
+# appear in the runtime dependency graph of any production crate.
+[dependencies]
+anyhow.workspace = true
+tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros"] }
+tokio-postgres.workspace = true
+deadpool-postgres.workspace = true
+tracing.workspace = true
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
+zero-cache-db.workspace = true
+zero-cache-types.workspace = true
+url.workspace = true
+
+[features]
+default = []
+# When enabled, PG-integration tests run (via `cargo test --features pg-tests`).
+pg-tests = []

@@ -1,7 +1,7 @@
 // Build script for @rocicorp/zero package
 import {spawn} from 'node:child_process';
-import {existsSync} from 'node:fs';
-import {chmod, copyFile, mkdir, readFile, rm} from 'node:fs/promises';
+import {existsSync, readdirSync} from 'node:fs';
+import {chmod, copyFile, mkdir, readFile, rm, writeFile} from 'node:fs/promises';
 import {builtinModules} from 'node:module';
 import {basename, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -190,6 +190,58 @@ async function copyStaticFiles() {
   const destDir = resolve('out', relPath);
   await mkdir(destDir, {recursive: true});
   await copyFile(resolve(srcDir, fileName), resolve(destDir, fileName));
+
+  // Copy shadow-ffi native module artifacts (index.js loader + .d.ts + all
+  // prebuilt .node binaries for the platforms we ship). These are built
+  // out-of-band by `napi build` in packages/zero-cache-rs/crates/shadow-ffi
+  // and committed/produced before `npm run build`.
+  const ffiSrcDir = resolve(
+    '..',
+    'zero-cache-rs/crates/shadow-ffi',
+  );
+  const ffiDestDir = resolve('out', 'zero-cache-shadow-ffi');
+  const ffiIndexJs = resolve(ffiSrcDir, 'index.js');
+  if (existsSync(ffiIndexJs)) {
+    await mkdir(ffiDestDir, {recursive: true});
+    // Required loader + types
+    await copyFile(ffiIndexJs, resolve(ffiDestDir, 'index.js'));
+    const ffiDts = resolve(ffiSrcDir, 'index.d.ts');
+    if (existsSync(ffiDts)) {
+      await copyFile(ffiDts, resolve(ffiDestDir, 'index.d.ts'));
+    }
+    // Copy every prebuilt .node (darwin-*, linux-*-gnu, linux-*-musl, …)
+    for (const entry of readdirSync(ffiSrcDir)) {
+      if (entry.endsWith('.node')) {
+        await copyFile(
+          resolve(ffiSrcDir, entry),
+          resolve(ffiDestDir, entry),
+        );
+      }
+    }
+    // napi's generated index.js uses CommonJS (`require`, `module.exports`).
+    // Because @rocicorp/zero/package.json declares `"type": "module"`, the
+    // default inheritance would make Node treat this file as ESM. Add a
+    // nested package.json that overrides the module type for this directory.
+    await writeFile(
+      resolve(ffiDestDir, 'package.json'),
+      JSON.stringify(
+        {
+          name: '@rocicorp/zero-cache-shadow-ffi',
+          private: true,
+          main: 'index.js',
+          types: 'index.d.ts',
+          type: 'commonjs',
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+  } else {
+    console.warn(
+      `[build] shadow-ffi loader not found at ${ffiIndexJs}; skipping ` +
+        `bundle of native shadow module.`,
+    );
+  }
 }
 
 async function runPromise(p: Promise<unknown>, label: string) {

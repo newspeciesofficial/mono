@@ -27,7 +27,15 @@ import {
 } from '../services/view-syncer/remote-pipeline-driver.ts';
 import {Snapshotter} from '../services/view-syncer/snapshotter.ts';
 import {ViewSyncerService} from '../services/view-syncer/view-syncer.ts';
+import {RustPipelineDriver} from '../services/view-syncer/rust-pipeline-driver.ts';
 import {POOL_THREAD_URL} from './worker-urls.ts';
+
+/**
+ * When set, the in-process IVM path uses the Rust port via shadow-ffi
+ * instead of the TS PipelineDriver. Pool-thread mode is unaffected
+ * (ZERO_NUM_POOL_THREADS=0 is required to exercise this).
+ */
+const USE_RUST_IVM = process.env['ZERO_USE_RUST_IVM'] === '1';
 import {pgClient} from '../types/pg.ts';
 import {
   parentWorker,
@@ -191,21 +199,37 @@ export default function runWorker(
             poolManager.registerDriver(poolThreadIdx, id, remote);
             return remote;
           })()
-        : new PipelineDriver(
-            logger,
-            config.log,
-            new Snapshotter(logger, replicaFile, shard),
-            shard,
-            operatorStorage.createClientGroupStorage(id),
-            id,
-            inspectorDelegate,
-            () =>
-              isPriorityOpRunning()
-                ? priorityOpRunningYieldThresholdMs
-                : normalYieldThresholdMs,
-            config.enableQueryPlanner,
-            config,
-          );
+        : USE_RUST_IVM
+          ? new RustPipelineDriver(
+              logger,
+              config.log,
+              new Snapshotter(logger, replicaFile, shard),
+              shard,
+              operatorStorage.createClientGroupStorage(id),
+              id,
+              inspectorDelegate,
+              () =>
+                isPriorityOpRunning()
+                  ? priorityOpRunningYieldThresholdMs
+                  : normalYieldThresholdMs,
+              config.enableQueryPlanner,
+              config,
+            )
+          : new PipelineDriver(
+              logger,
+              config.log,
+              new Snapshotter(logger, replicaFile, shard),
+              shard,
+              operatorStorage.createClientGroupStorage(id),
+              id,
+              inspectorDelegate,
+              () =>
+                isPriorityOpRunning()
+                  ? priorityOpRunningYieldThresholdMs
+                  : normalYieldThresholdMs,
+              config.enableQueryPlanner,
+              config,
+            );
 
     return new ViewSyncerService(
       config,

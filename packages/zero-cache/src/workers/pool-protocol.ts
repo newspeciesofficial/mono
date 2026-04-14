@@ -132,12 +132,15 @@ export type AddQueryBeginResult = {
   queryID: string;
 };
 
-/** A batch of hydration row changes. */
+/** A batch of hydration row changes (shared memory). */
 export type AddQueryBatchResult = {
   type: 'addQueryBatch';
   requestId: number;
   clientGroupID: string;
-  changes: RowChange[];
+  /** SharedArrayBuffer containing JSON-encoded RowChange[]. */
+  changesBuf: SharedArrayBuffer;
+  /** Byte length of the encoded data within the buffer. */
+  changesLen: number;
 };
 
 /** End of a streaming addQuery response. */
@@ -192,12 +195,44 @@ export type AdvanceBeginResult = {
   poolThreadIdx: number;
 };
 
-/** A batch of row changes from an in-progress advance stream. */
+/** A batch of row changes from an in-progress advance stream (shared memory). */
 export type AdvanceChangeBatchResult = {
   type: 'advanceChangeBatch';
   requestId: number;
   clientGroupID: string;
-  changes: RowChange[];
+  /** SharedArrayBuffer containing JSON-encoded RowChange[]. */
+  changesBuf: SharedArrayBuffer;
+  /** Byte length of the encoded data within the buffer. */
+  changesLen: number;
+};
+
+/**
+ * Single-message advance for small advances (< BATCH_SIZE rows).
+ * Combines begin + batch + complete into one postMessage call.
+ */
+export type AdvanceSingleResult = {
+  type: 'advanceSingle';
+  requestId: number;
+  clientGroupID: string;
+  // begin fields
+  version: string;
+  numChanges: number;
+  snapshotMs: number;
+  poolToBeginMs: number;
+  gapSincePrevAdvanceMs: number;
+  prevAdvanceCgID: string | undefined;
+  prevAdvanceDurationMs: number | undefined;
+  poolThreadIdx: number;
+  // batch (shared memory, may be empty)
+  changesBuf: SharedArrayBuffer | undefined;
+  changesLen: number;
+  // complete fields
+  didReset: boolean;
+  iterateMs: number;
+  totalRows: number;
+  state: DriverState;
+  poolToCompleteMs: number;
+  batchCount: number;
 };
 
 /** End of a streaming advance response. Carries updated driver state. */
@@ -267,8 +302,32 @@ export type PoolWorkerResult =
   | AdvanceBeginResult
   | AdvanceChangeBatchResult
   | AdvanceCompleteResult
+  | AdvanceSingleResult
   | GetRowResult
   | ResetResult
   | AdvanceWithoutDiffResult
   | DestroyClientGroupResult
   | ErrorResult;
+
+// ---------------------------------------------------------------------------
+// Zero-copy batch helpers
+// ---------------------------------------------------------------------------
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+/** Encode RowChange[] into a SharedArrayBuffer. Returns {buf, len}. */
+export function encodeBatch(changes: RowChange[]): {
+  buf: SharedArrayBuffer;
+  len: number;
+} {
+  const encoded = encoder.encode(JSON.stringify(changes));
+  const buf = new SharedArrayBuffer(encoded.byteLength);
+  new Uint8Array(buf).set(encoded);
+  return {buf, len: encoded.byteLength};
+}
+
+/** Decode a SharedArrayBuffer back to RowChange[]. */
+export function decodeBatch(buf: SharedArrayBuffer, len: number): RowChange[] {
+  return JSON.parse(decoder.decode(new Uint8Array(buf, 0, len))) as RowChange[];
+}

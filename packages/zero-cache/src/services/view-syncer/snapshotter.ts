@@ -108,6 +108,11 @@ export class Snapshotter {
     this.#pageCacheSizeKib = pageCacheSizeKib;
   }
 
+  /** Path of the SQLite replica file this Snapshotter reads from. */
+  get dbFile(): string {
+    return this.#dbFile;
+  }
+
   /**
    * Initializes the snapshot to the current head of the database. This must be
    * only be called once. The state of whether a Snapshotter has been initialized

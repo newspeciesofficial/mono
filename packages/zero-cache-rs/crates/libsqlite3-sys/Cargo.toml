@@ -1,0 +1,48 @@
+[package]
+name = "libsqlite3-sys"
+version = "0.30.1"
+authors = ["The rusqlite developers", "Rocicorp"]
+edition = "2021"
+description = "libsqlite3-sys fork pinned to the @rocicorp/zero-sqlite3 amalgamation (begin-concurrent-wal2)."
+license = "MIT"
+links = "sqlite3"
+build = "build.rs"
+keywords = ["sqlite", "ffi"]
+categories = ["external-ffi-bindings"]
+
+[features]
+# This fork is bundle-only: it always compiles the vendored amalgamation.
+# The empty `bundled` feature exists so rusqlite's `features = ["bundled"]`
+# request resolves — the actual build decision is unconditional in build.rs.
+default = []
+bundled = []
+bundled-windows = []
+loadable_extension = []
+# Features kept as empty no-ops so other crates that pass them through don't break.
+sqlcipher = []
+bundled-sqlcipher = []
+bundled-sqlcipher-vendored-openssl = []
+buildtime_bindgen = []
+min_sqlite_version_3_14_0 = []
+bundled_bindings = []
+unlock_notify = []
+preupdate_hook = []
+session = []
+in_gecko = []
+with-asan = []
+wasm32-wasi-vfs = []
+vcpkg = []
+
+[dependencies]
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
+
+[build-dependencies]
+cc = "1.1"
+bindgen = { version = "0.69", default-features = false, features = ["runtime"] }
+
+[lib]
+name = "libsqlite3_sys"
+path = "src/lib.rs"

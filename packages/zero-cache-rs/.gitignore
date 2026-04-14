@@ -1,0 +1,13 @@
+# Rust build artifacts
+target/
+Cargo.lock.bak
+
+# napi-rs build outputs (rebuild per platform in CI)
+crates/*/node_modules/
+crates/*/*.node
+crates/*/index.js
+crates/*/index.d.ts
+
+# Test coverage + temp files
+**/*.profraw
+*.log

@@ -1,0 +1,32 @@
+[package]
+name = "zero-cache-types"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+smallvec.workspace = true
+indexmap.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+criterion.workspace = true
+rusqlite.workspace = true
+indexmap.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "serialization"
+harness = false
+path = "../../benches/serialization.rs"
+
+[[bench]]
+name = "sqlite_perf"
+harness = false
+path = "../../benches/comparison/sqlite_perf.rs"

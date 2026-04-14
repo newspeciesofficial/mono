@@ -1,0 +1,28 @@
+[package]
+name = "zero-cache-sync-worker"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Port of packages/zero-cache/src/services/view-syncer + packages/zql/src/ivm — the per-ClientGroup sync machine and the IVM operator graph it drives."
+
+[lib]
+
+[dependencies]
+zero-cache-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+indexmap = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Layer 8 (zqlite port) onwards touches SQLite. Bundled build keeps the
+# crate self-contained for CI / Docker; column_decltype is required to
+# read the schema metadata the builder / cost model consume.
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -81,6 +81,7 @@ import {
 import type {DrainCoordinator} from './drain-coordinator.ts';
 import {handleInspect} from './inspect-handler.ts';
 import type {PipelineDriver} from './pipeline-driver.ts';
+import type {RustPipelineDriver} from './rust-pipeline-driver.ts';
 import {type RowChange} from './pipeline-driver.ts';
 import {RemotePipelineDriver} from './remote-pipeline-driver.ts';
 
@@ -90,7 +91,10 @@ import {RemotePipelineDriver} from './remote-pipeline-driver.ts';
  * call so that both variants work uniformly: `await` on `void` is a no-op,
  * and `for await` iterates sync iterables as well as async ones.
  */
-type AnyPipelineDriver = PipelineDriver | RemotePipelineDriver;
+type AnyPipelineDriver =
+  | PipelineDriver
+  | RemotePipelineDriver
+  | RustPipelineDriver;
 import {
   cmpVersions,
   EMPTY_CVR_VERSION,

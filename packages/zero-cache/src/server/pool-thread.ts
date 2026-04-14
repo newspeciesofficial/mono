@@ -49,10 +49,11 @@ import {createLogContext} from './logging.ts';
 import {InspectorDelegate} from './inspector-delegate.ts';
 import type {RowKey} from '../types/row-key.ts';
 import type {ShardID} from '../types/shards.ts';
-import type {
-  DriverState,
-  PoolWorkerMsg,
-  PoolWorkerResult,
+import {
+  encodeBatch,
+  type DriverState,
+  type PoolWorkerMsg,
+  type PoolWorkerResult,
 } from '../workers/pool-protocol.ts';
 
 export type PoolThreadWorkerData = {
@@ -67,7 +68,7 @@ export type PoolThreadWorkerData = {
   enableQueryPlanner: boolean | undefined;
 };
 
-const BATCH_SIZE = 20;
+const BATCH_SIZE = parseInt(process.env.ZERO_POOL_BATCH_SIZE ?? '100', 10);
 
 const {
   port,
@@ -120,6 +121,23 @@ let prevAdvanceEndTime = 0; // performance.now() when the previous advance finis
 
 function send(msg: PoolWorkerResult): void {
   port.postMessage(msg);
+}
+
+/** Send a batch message via SharedArrayBuffer (no clone, no transfer). */
+function sendBatch(
+  type: 'advanceChangeBatch' | 'addQueryBatch',
+  requestId: number,
+  clientGroupID: string,
+  changes: RowChange[],
+): void {
+  const {buf, len} = encodeBatch(changes);
+  send({
+    type,
+    requestId,
+    clientGroupID,
+    changesBuf: buf,
+    changesLen: len,
+  } as PoolWorkerResult);
 }
 
 function createTimer(): Timer {
@@ -274,24 +292,14 @@ function handleAddQuery(
     if (batch.length >= BATCH_SIZE) {
       totalRows += batch.length;
       batchCount++;
-      send({
-        type: 'addQueryBatch',
-        requestId,
-        clientGroupID,
-        changes: batch,
-      });
+      sendBatch('addQueryBatch', requestId, clientGroupID, batch);
       batch = [];
     }
   }
   if (batch.length > 0) {
     totalRows += batch.length;
     batchCount++;
-    send({
-      type: 'addQueryBatch',
-      requestId,
-      clientGroupID,
-      changes: batch,
-    });
+    sendBatch('addQueryBatch', requestId, clientGroupID, batch);
   }
 
   state.queryCount++;
@@ -370,35 +378,39 @@ function handleAdvance(requestId: number, clientGroupID: string): void {
   const tBeforeBegin = performance.now();
   const poolToBeginMs = tBeforeBegin - tEntry;
 
-  send({
-    type: 'advanceBegin',
-    requestId,
-    clientGroupID,
-    version,
-    numChanges,
-    snapshotMs,
-    poolToBeginMs,
-    gapSincePrevAdvanceMs,
-    prevAdvanceCgID: capturedPrevCg,
-    prevAdvanceDurationMs: capturedPrevDur,
-    poolThreadIdx,
-  });
-
   let batch: RowChange[] = [];
   let totalRows = 0;
   let batchCount = 0;
   let didReset = false;
+  // Track whether we've started streaming (sent advanceBegin).
+  let streaming = false;
+
+  const startStreaming = () => {
+    if (streaming) return;
+    streaming = true;
+    send({
+      type: 'advanceBegin',
+      requestId,
+      clientGroupID,
+      version,
+      numChanges,
+      snapshotMs,
+      poolToBeginMs,
+      gapSincePrevAdvanceMs,
+      prevAdvanceCgID: capturedPrevCg,
+      prevAdvanceDurationMs: capturedPrevDur,
+      poolThreadIdx,
+    });
+  };
 
   const flush = () => {
     if (batch.length > 0) {
       totalRows += batch.length;
       batchCount++;
-      send({
-        type: 'advanceChangeBatch',
-        requestId,
-        clientGroupID,
-        changes: batch,
-      });
+      if (streaming) {
+        sendBatch('advanceChangeBatch', requestId, clientGroupID, batch);
+      }
+      // If not streaming yet, rows stay in `batch` for the single message.
       batch = [];
     }
   };
@@ -410,14 +422,11 @@ function handleAdvance(requestId: number, clientGroupID: string): void {
       }
       batch.push(change);
       if (batch.length >= BATCH_SIZE) {
+        // Too many rows for a single message — switch to streaming.
+        startStreaming();
         totalRows += batch.length;
         batchCount++;
-        send({
-          type: 'advanceChangeBatch',
-          requestId,
-          clientGroupID,
-          changes: batch,
-        });
+        sendBatch('advanceChangeBatch', requestId, clientGroupID, batch);
         batch = [];
       }
     }
@@ -428,6 +437,8 @@ function handleAdvance(requestId: number, clientGroupID: string): void {
     }
     didReset = true;
     lc.info?.(`advance reset for clientGroup=${clientGroupID}: ${e.message}`);
+    // Reset always streams — too much data to predict.
+    startStreaming();
     // Snapshot the live query set before reset — `reset()` clears the map.
     const queryInfos: {
       queryID: string;
@@ -460,12 +471,7 @@ function handleAdvance(requestId: number, clientGroupID: string): void {
         if (batch.length >= BATCH_SIZE) {
           totalRows += batch.length;
           batchCount++;
-          send({
-            type: 'advanceChangeBatch',
-            requestId,
-            clientGroupID,
-            changes: batch,
-          });
+          sendBatch('advanceChangeBatch', requestId, clientGroupID, batch);
           batch = [];
         }
       }
@@ -476,36 +482,279 @@ function handleAdvance(requestId: number, clientGroupID: string): void {
   const tEnd = performance.now();
   const iterateMs = tEnd - tEntry - snapshotMs;
   const poolToCompleteMs = tEnd - tEntry;
-  // The pool-thread log line already fires once per advance — we just add
-  // the new fields to it so there are no extra log calls in the hot path.
   lc.info?.(
     `advanced clientGroup=${clientGroupID} to=${version} ` +
       `changes=${numChanges} rows=${totalRows} didReset=${didReset} ` +
       `snapshotMs=${snapshotMs.toFixed(2)} iterateMs=${iterateMs.toFixed(1)} ` +
       `poolToBeginMs=${poolToBeginMs.toFixed(2)} ` +
       `poolToCompleteMs=${poolToCompleteMs.toFixed(1)} ` +
-      `batchCount=${batchCount} ` +
+      `batchCount=${batchCount} streaming=${streaming} ` +
       `gapSincePrevAdvanceMs=${gapSincePrevAdvanceMs.toFixed(1)} ` +
       `prevCg=${capturedPrevCg ?? '-'} ` +
       `prevDurMs=${capturedPrevDur !== undefined ? capturedPrevDur.toFixed(1) : '-'}`,
   );
-  send({
-    type: 'advanceComplete',
-    requestId,
-    clientGroupID,
-    didReset,
-    iterateMs,
-    totalRows,
-    state: snapshotState(state),
-    poolToCompleteMs,
-    batchCount,
-  });
+
+  if (streaming) {
+    // Multi-message path: already sent advanceBegin + batches.
+    send({
+      type: 'advanceComplete',
+      requestId,
+      clientGroupID,
+      didReset,
+      iterateMs,
+      totalRows,
+      state: snapshotState(state),
+      poolToCompleteMs,
+      batchCount,
+    });
+  } else {
+    // Single-message path: everything in one postMessage.
+    const encoded =
+      totalRows > 0 ? encodeBatch(batch) : {buf: undefined, len: 0};
+    send({
+      type: 'advanceSingle',
+      requestId,
+      clientGroupID,
+      // begin fields
+      version,
+      numChanges,
+      snapshotMs,
+      poolToBeginMs,
+      gapSincePrevAdvanceMs,
+      prevAdvanceCgID: capturedPrevCg,
+      prevAdvanceDurationMs: capturedPrevDur,
+      poolThreadIdx,
+      // batch
+      changesBuf: encoded.buf,
+      changesLen: encoded.len,
+      // complete fields
+      didReset,
+      iterateMs,
+      totalRows,
+      state: snapshotState(state),
+      poolToCompleteMs,
+      batchCount,
+    });
+  }
 
   // Update the rolling "prev advance" state for the next handleAdvance
   // invocation on this pool thread.
   prevAdvanceCgID = clientGroupID;
   prevAdvanceDurationMs = poolToCompleteMs;
   prevAdvanceEndTime = tEnd;
+}
+
+// ---------------------------------------------------------------------------
+// Round-robin advance scheduler
+// ---------------------------------------------------------------------------
+
+type PendingAdvance = {
+  requestId: number;
+  clientGroupID: string;
+  tEntry: number;
+  gapSincePrevAdvanceMs: number;
+  capturedPrevCg: string | undefined;
+  capturedPrevDur: number | undefined;
+};
+
+const advanceQueue: PendingAdvance[] = [];
+let advanceScheduled = false;
+
+function enqueueAdvance(requestId: number, clientGroupID: string): void {
+  const tEntry = performance.now();
+  const gapSincePrevAdvanceMs =
+    prevAdvanceEndTime > 0 ? tEntry - prevAdvanceEndTime : 0;
+  advanceQueue.push({
+    requestId,
+    clientGroupID,
+    tEntry,
+    gapSincePrevAdvanceMs,
+    capturedPrevCg: prevAdvanceCgID,
+    capturedPrevDur: prevAdvanceDurationMs,
+  });
+  if (!advanceScheduled) {
+    advanceScheduled = true;
+    // Use setImmediate to allow more advance messages to queue up
+    // before we start processing. This maximizes the round-robin batch.
+    setImmediate(drainAdvanceQueue);
+  }
+}
+
+function drainAdvanceQueue(): void {
+  advanceScheduled = false;
+  if (advanceQueue.length === 0) return;
+
+  // Take all queued advances.
+  const batch = advanceQueue.splice(0);
+
+  if (batch.length === 1) {
+    // Single advance — use the existing fast path (no round-robin overhead).
+    const a = batch[0];
+    prevAdvanceCgID = a.capturedPrevCg;
+    prevAdvanceDurationMs = a.capturedPrevDur;
+    prevAdvanceEndTime = a.tEntry; // approximate
+    handleAdvance(a.requestId, a.clientGroupID);
+    return;
+  }
+
+  // Multiple advances — round-robin across all CGs.
+  type ActiveAdvance = PendingAdvance & {
+    state: ClientGroupState;
+    timer: Timer;
+    version: string;
+    numChanges: number;
+    snapshotMs: number;
+    iterator: Iterator<RowChange | 'yield'>;
+    totalRows: number;
+    batchCount: number;
+    didReset: boolean;
+    rows: RowChange[];
+    done: boolean;
+  };
+
+  const active: ActiveAdvance[] = [];
+  for (const a of batch) {
+    try {
+      const state = requireState(a.clientGroupID);
+      const timer = createTimer();
+      const {version, numChanges, snapshotMs, changes} =
+        state.driver.advance(timer);
+      const iterator = changes[Symbol.iterator]();
+      active.push({
+        ...a,
+        state,
+        timer,
+        version,
+        numChanges,
+        snapshotMs,
+        iterator,
+        totalRows: 0,
+        batchCount: 0,
+        didReset: false,
+        rows: [],
+        done: false,
+      });
+    } catch (e) {
+      sendError(a.requestId, a.clientGroupID, e);
+    }
+  }
+
+  // Round-robin: read BATCH_SIZE changes from each CG, then repeat.
+  let anyActive = true;
+  while (anyActive) {
+    anyActive = false;
+    for (const a of active) {
+      if (a.done) continue;
+
+      // Read up to BATCH_SIZE changes from this CG's iterator.
+      let count = 0;
+      while (count < BATCH_SIZE) {
+        const next = a.iterator.next();
+        if (next.done) {
+          a.done = true;
+          break;
+        }
+        if (next.value !== 'yield') {
+          a.rows.push(next.value);
+          count++;
+        }
+      }
+
+      // If we filled a batch and there's more, send the batch now (streaming).
+      if (!a.done && a.rows.length >= BATCH_SIZE) {
+        // Start streaming if not already
+        if (a.batchCount === 0) {
+          const poolToBeginMs = performance.now() - a.tEntry;
+          send({
+            type: 'advanceBegin',
+            requestId: a.requestId,
+            clientGroupID: a.clientGroupID,
+            version: a.version,
+            numChanges: a.numChanges,
+            snapshotMs: a.snapshotMs,
+            poolToBeginMs,
+            gapSincePrevAdvanceMs: a.gapSincePrevAdvanceMs,
+            prevAdvanceCgID: a.capturedPrevCg,
+            prevAdvanceDurationMs: a.capturedPrevDur,
+            poolThreadIdx,
+          });
+        }
+        a.totalRows += a.rows.length;
+        a.batchCount++;
+        sendBatch('advanceChangeBatch', a.requestId, a.clientGroupID, a.rows);
+        a.rows = [];
+        anyActive = true;
+      } else if (a.done) {
+        // This CG is done — nothing more to do this round.
+      } else {
+        anyActive = true;
+      }
+    }
+  }
+
+  // Finalize all CGs — send remaining rows + complete.
+  for (const a of active) {
+    const tEnd = performance.now();
+    a.totalRows += a.rows.length;
+    if (a.rows.length > 0) a.batchCount++;
+    const iterateMs = tEnd - a.tEntry - a.snapshotMs;
+    const poolToCompleteMs = tEnd - a.tEntry;
+
+    if (a.batchCount > 1) {
+      // Was streaming — send remaining batch + complete.
+      if (a.rows.length > 0) {
+        sendBatch('advanceChangeBatch', a.requestId, a.clientGroupID, a.rows);
+      }
+      send({
+        type: 'advanceComplete',
+        requestId: a.requestId,
+        clientGroupID: a.clientGroupID,
+        didReset: a.didReset,
+        iterateMs,
+        totalRows: a.totalRows,
+        state: snapshotState(a.state),
+        poolToCompleteMs,
+        batchCount: a.batchCount,
+      });
+    } else {
+      // Small advance — single message.
+      const encoded =
+        a.rows.length > 0 ? encodeBatch(a.rows) : {buf: undefined, len: 0};
+      send({
+        type: 'advanceSingle',
+        requestId: a.requestId,
+        clientGroupID: a.clientGroupID,
+        version: a.version,
+        numChanges: a.numChanges,
+        snapshotMs: a.snapshotMs,
+        poolToBeginMs: performance.now() - a.tEntry,
+        gapSincePrevAdvanceMs: a.gapSincePrevAdvanceMs,
+        prevAdvanceCgID: a.capturedPrevCg,
+        prevAdvanceDurationMs: a.capturedPrevDur,
+        poolThreadIdx,
+        changesBuf: encoded.buf,
+        changesLen: encoded.len,
+        didReset: a.didReset,
+        iterateMs,
+        totalRows: a.totalRows,
+        state: snapshotState(a.state),
+        poolToCompleteMs,
+        batchCount: a.batchCount,
+      });
+    }
+
+    lc.info?.(
+      `advanced clientGroup=${a.clientGroupID} to=${a.version} ` +
+        `changes=${a.numChanges} rows=${a.totalRows} didReset=${a.didReset} ` +
+        `snapshotMs=${a.snapshotMs.toFixed(2)} iterateMs=${iterateMs.toFixed(1)} ` +
+        `poolToCompleteMs=${poolToCompleteMs.toFixed(1)} ` +
+        `batchCount=${a.batchCount} roundRobin=${batch.length}`,
+    );
+
+    prevAdvanceCgID = a.clientGroupID;
+    prevAdvanceDurationMs = poolToCompleteMs;
+    prevAdvanceEndTime = tEnd;
+  }
 }
 
 function handleGetRow(
@@ -625,7 +874,7 @@ port.on('message', (msg: PoolWorkerMsg) => {
         handleRemoveQuery(requestId, msg.clientGroupID, msg.queryID);
         return;
       case 'advance':
-        handleAdvance(requestId, msg.clientGroupID);
+        enqueueAdvance(requestId, msg.clientGroupID);
         return;
       case 'getRow':
         handleGetRow(requestId, msg.clientGroupID, msg.table, msg.rowKey);

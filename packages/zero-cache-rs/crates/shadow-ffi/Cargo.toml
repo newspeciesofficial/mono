@@ -1,0 +1,36 @@
+[package]
+name = "zero-cache-shadow-ffi"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "napi-rs bindings exposing Rust shadow implementations of TS zero-cache functions for differential testing"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3", default-features = false, features = ["napi8", "serde-json"] }
+napi-derive = "3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+indexmap = { workspace = true }
+thiserror = { workspace = true }
+
+# Shadow exports reach into crates that own the ported code. Keep this
+# list narrow — each added dependency is a new surface the shadow harness
+# exposes to TS.
+zero-cache-sync-worker = { workspace = true }
+zero-cache-types = { workspace = true }
+
+# For `table_source_create`: we open a fresh `rusqlite::Connection` on the
+# replica file path handed in by TS. `better-sqlite3` on the TS side keeps
+# its own connection on the same file; WAL handles concurrency.
+rusqlite = { workspace = true }
+
+[build-dependencies]
+napi-build = "2"
+
+# napi-rs uses internal `unsafe` for FFI; allow scoped to this crate only.
+[lints.rust]
+unsafe_code = "allow"

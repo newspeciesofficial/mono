@@ -1,0 +1,10 @@
+SQLITE_VERSION    = 3.50.0
+SQLITE_CHECKIN    = 54b8888080d99a8735ce11bb994e253a6406e42d4e34a7a4e5af566cf6841c8b
+BRANCH            = begin-concurrent-wal2
+SOURCE            = https://www.sqlite.org/src/zip/54b88880/SQLite-54b88880.zip
+COPIED_FROM       = node_modules/@rocicorp/zero-sqlite3/deps/sqlite3/
+COPIED_AT         = 2026-04-14
+PATCHES_APPLIED   = 1208.patch  (month/year duration constant, pre-computed)
+
+This amalgamation matches @rocicorp/zero-sqlite3 v1.0.15 byte-for-byte.
+Regenerate via: node_modules/@rocicorp/zero-sqlite3/deps/download.sh

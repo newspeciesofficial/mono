@@ -1,0 +1,13 @@
+[package]
+name = "zero-cache-config"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zero-cache-types.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
