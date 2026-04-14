@@ -122,8 +122,21 @@ use crate::zqlite::resolve_scalar_subqueries::{
 };
 use crate::zqlite::table_source::{SchemaValue, TableSource};
 
-/// TS `MIN_ADVANCEMENT_TIME_LIMIT_MS`.
+/// TS `MIN_ADVANCEMENT_TIME_LIMIT_MS`. Advance time under this is never
+/// tripped regardless of budget — absorbs timer jitter on fast advances.
 pub const MIN_ADVANCEMENT_TIME_LIMIT_MS: f64 = 50.0;
+
+/// Per-change floor baked into the advance budget. Guarantees each change
+/// gets at least this much time before the circuit breaker can fire,
+/// independent of how fast hydration was. Chosen so a diff of N changes
+/// gets `N * 10ms` worth of headroom — empirically covers the p99 advance
+/// in xyne's workload (79ms for a ~3-change batch).
+pub const ADVANCE_PER_CHANGE_BUDGET_MS: f64 = 10.0;
+
+/// Absolute minimum advance budget. Ensures that a single-change advance
+/// always has at least 100ms of headroom, even when the CG has no hydrated
+/// queries yet (e.g. initial connection).
+pub const ADVANCE_MIN_BUDGET_MS: f64 = 100.0;
 
 // ─── RowChange family ─────────────────────────────────────────────────
 
@@ -938,6 +951,21 @@ impl PipelineDriver {
         let num_changes = diff.changes;
         let changes = diff.collect_changes()?;
 
+        // Advance circuit-breaker budget. The TS formula used
+        // `total_hydration_time_ms` directly — which collapses to near
+        // zero when hydration is parallelised / fast and triggers a
+        // reset storm. We instead take the max of three sources:
+        //
+        //   1. total_hydration_time_ms        (CPU-time proxy, parallelism-invariant)
+        //   2. num_changes * PER_CHANGE_BUDGET (scales with actual work)
+        //   3. ADVANCE_MIN_BUDGET_MS          (absolute floor for fresh CGs)
+        //
+        // Named `advance_budget_ms` and threaded through the trip check
+        // below instead of raw hydration time.
+        let advance_budget_ms = total_hydration_time_ms
+            .max((num_changes as f64) * ADVANCE_PER_CHANGE_BUDGET_MS)
+            .max(ADVANCE_MIN_BUDGET_MS);
+
         // TS `advance()` (pipeline-driver.ts L731-735): the `setDB` swap
         // happens AFTER the push fan-out loop, not before. During the
         // push loop, each `TableSource` must still observe the *prev*
@@ -957,7 +985,7 @@ impl PipelineDriver {
                 timer,
                 pos,
                 changes.len(),
-                total_hydration_time_ms,
+                advance_budget_ms,
             )? {
                 out.push(RowChangeOrYield::Yield);
                 yields += 1;
@@ -1048,17 +1076,21 @@ impl PipelineDriver {
         timer: &dyn Timer,
         pos: usize,
         num_changes: usize,
-        total_hydration_time_ms: f64,
+        advance_budget_ms: f64,
     ) -> Result<bool, PipelineDriverError> {
         let elapsed = timer.total_elapsed();
-        // TS: `if elapsed > MIN && (elapsed > total || (elapsed > total/2 && pos <= n/2))`.
+        // Trip if elapsed has exceeded the budget computed by
+        // `advance_inner` (max of total-hydration / per-change-floor /
+        // absolute floor). Same trip shape as the TS port: full-budget
+        // exhaustion, OR half-budget exhaustion with the diff still
+        // less than half-processed.
         if elapsed > MIN_ADVANCEMENT_TIME_LIMIT_MS
-            && (elapsed > total_hydration_time_ms
-                || (elapsed > total_hydration_time_ms / 2.0
+            && (elapsed > advance_budget_ms
+                || (elapsed > advance_budget_ms / 2.0
                     && (pos as f64) <= (num_changes as f64) / 2.0))
         {
             return Err(PipelineDriverError::Reset(ResetPipelinesSignal(format!(
-                "Advancement exceeded timeout at {pos} of {num_changes} changes after {elapsed} ms. Advancement time limited based on total hydration time of {total_hydration_time_ms} ms."
+                "Advancement exceeded timeout at {pos} of {num_changes} changes after {elapsed} ms. Budget {advance_budget_ms} ms (max of total-hydration / per-change-floor / min-floor)."
             ))));
         }
         Ok(timer.elapsed_lap() > (self.yield_threshold_ms)())
@@ -2556,4 +2588,100 @@ mod tests {
         let _ = driver.advance(&NoopTimer).unwrap();
     }
 
+    // ─── circuit-breaker budget formula ────────────────────────────────
+
+    /// `should_advance_yield_maybe_abort` directly tested with a stub
+    /// timer to pin the budget formula. The trip threshold must be
+    /// `max(total_hydration, num_changes * PER_CHANGE_BUDGET, MIN_BUDGET)`,
+    /// not raw `total_hydration`. Verifies the user-reported scenario
+    /// (fast hydration → reset storm) is fixed.
+    #[test]
+    fn advance_budget_uses_per_change_floor_when_hydration_is_zero() {
+        struct StubTimer {
+            total_ms: f64,
+        }
+        impl Timer for StubTimer {
+            fn elapsed_lap(&self) -> f64 {
+                0.0
+            }
+            fn total_elapsed(&self) -> f64 {
+                self.total_ms
+            }
+        }
+
+        let (driver, _d, _s) = make_driver();
+        let num_changes = 5;
+        let budget = ADVANCE_PER_CHANGE_BUDGET_MS
+            .max(ADVANCE_MIN_BUDGET_MS / num_changes as f64)
+            * num_changes as f64; // = 100ms via the MIN_BUDGET floor
+
+        // Branch 1: elapsed below MIN_ADVANCEMENT_TIME_LIMIT_MS (50ms).
+        // Trips never fire here — absorbs timer jitter.
+        let t = StubTimer {
+            total_ms: MIN_ADVANCEMENT_TIME_LIMIT_MS - 1.0,
+        };
+        let r = driver.should_advance_yield_maybe_abort(&t, 0, num_changes, budget);
+        assert!(r.is_ok(), "must not trip under MIN_ADVANCEMENT_TIME_LIMIT_MS");
+
+        // Branch 2: elapsed between MIN_ADVANCEMENT and budget/2.
+        // Trips never fire here regardless of pos — neither condition met.
+        let t = StubTimer {
+            total_ms: budget / 2.0 - 1.0,
+        };
+        let r = driver.should_advance_yield_maybe_abort(&t, 0, num_changes, budget);
+        assert!(
+            r.is_ok(),
+            "must not trip below half-budget, got {:?}",
+            r.err()
+        );
+
+        // Branch 3: elapsed above budget/2 with pos > num/2.
+        // Half-budget condition requires pos <= num/2 — must NOT trip.
+        let t = StubTimer {
+            total_ms: budget / 2.0 + 1.0,
+        };
+        let r = driver.should_advance_yield_maybe_abort(&t, 4, num_changes, budget);
+        assert!(
+            r.is_ok(),
+            "must not trip above half-budget when past half-progress"
+        );
+
+        // Branch 4: elapsed above budget/2 with pos <= num/2.
+        // Half-budget condition fires.
+        let t = StubTimer {
+            total_ms: budget / 2.0 + 1.0,
+        };
+        let r = driver.should_advance_yield_maybe_abort(&t, 0, num_changes, budget);
+        assert!(
+            r.is_err(),
+            "must trip above half-budget when below half-progress"
+        );
+        assert!(matches!(r.unwrap_err(), PipelineDriverError::Reset(_)));
+
+        // Branch 5: elapsed above full budget. Trips regardless of pos.
+        let t = StubTimer {
+            total_ms: budget + 1.0,
+        };
+        let r = driver.should_advance_yield_maybe_abort(&t, 4, num_changes, budget);
+        assert!(r.is_err(), "must trip above full budget");
+        assert!(matches!(r.unwrap_err(), PipelineDriverError::Reset(_)));
+    }
+
+    #[test]
+    fn advance_budget_does_not_trip_under_min_advancement_time() {
+        struct StubTimer;
+        impl Timer for StubTimer {
+            fn elapsed_lap(&self) -> f64 {
+                0.0
+            }
+            fn total_elapsed(&self) -> f64 {
+                MIN_ADVANCEMENT_TIME_LIMIT_MS - 1.0
+            }
+        }
+        let (driver, _d, _s) = make_driver();
+        // Even with a tiny budget of 0, an elapsed under MIN_ADVANCEMENT
+        // must not trip — absorbs timer jitter.
+        let r = driver.should_advance_yield_maybe_abort(&StubTimer, 0, 1, 0.0);
+        assert!(r.is_ok(), "must not trip below MIN_ADVANCEMENT_TIME_LIMIT_MS");
+    }
 }

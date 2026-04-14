@@ -124,6 +124,23 @@ export type Timer = {
 const MIN_ADVANCEMENT_TIME_LIMIT_MS = 50;
 
 /**
+ * Per-change floor baked into the advance budget. When hydration is fast
+ * (e.g. parallelised in Rust IVM, or just a CG with cheap queries), the
+ * raw `totalHydrationTimeMs` collapses and the circuit breaker trips on
+ * advances that would have completed fine. Each change gets at least
+ * this many ms of headroom, scaling the budget with the actual diff
+ * size.
+ */
+const ADVANCE_PER_CHANGE_BUDGET_MS = 10;
+
+/**
+ * Absolute minimum advance budget. Ensures a single-change advance has
+ * at least this much headroom even when the CG has zero hydrated
+ * queries (initial-connection path, fresh CG).
+ */
+const ADVANCE_MIN_BUDGET_MS = 100;
+
+/**
  * Manages the state of IVM pipelines for a given ViewSyncer (i.e. client group).
  */
 export class PipelineDriver {
@@ -646,16 +663,30 @@ export class PipelineDriver {
       'Cannot advance while hydration is in progress',
     );
     const totalHydrationTimeMs = this.totalHydrationTimeMs();
+    // Advance circuit-breaker budget. Replaces the raw
+    // `totalHydrationTimeMs` budget that collapses when hydration is
+    // fast (parallel-Rust hydration, or a CG with cheap queries).
+    // Budget = max of three sources:
+    //   1. totalHydrationTimeMs       (scales with the CG's CPU work)
+    //   2. numChanges * PER_CHANGE     (scales with diff size)
+    //   3. ADVANCE_MIN_BUDGET_MS       (absolute floor)
+    const advanceBudgetMs = Math.max(
+      totalHydrationTimeMs,
+      numChanges * ADVANCE_PER_CHANGE_BUDGET_MS,
+      ADVANCE_MIN_BUDGET_MS,
+    );
     this.#advanceContext = {
       timer,
-      totalHydrationTimeMs,
+      totalHydrationTimeMs: advanceBudgetMs,
       numChanges,
       pos: 0,
     };
     this.#lc.info?.(
       `starting pipeline advancement of ${numChanges} changes with an ` +
-        `advancement time limited based on total hydration time of ` +
-        `${totalHydrationTimeMs} ms.`,
+        `advancement budget of ${advanceBudgetMs} ms ` +
+        `(hydration=${totalHydrationTimeMs}ms, ` +
+        `per-change-floor=${numChanges * ADVANCE_PER_CHANGE_BUDGET_MS}ms, ` +
+        `min-floor=${ADVANCE_MIN_BUDGET_MS}ms).`,
     );
     try {
       for (const {table, prevValues, nextValue} of diff) {
@@ -719,7 +750,7 @@ export class PipelineDriver {
           this.#lc.info?.(
             `slow advance change: table=${table} pos=${this.#advanceContext.pos}/${numChanges} ` +
               `changeTime=${elapsed.toFixed(0)}ms totalElapsed=${timer.totalElapsed().toFixed(0)}ms ` +
-              `budget=${totalHydrationTimeMs.toFixed(0)}ms`,
+              `budget=${advanceBudgetMs.toFixed(0)}ms`,
           );
         }
         this.#advanceTime.record(elapsed / 1000, {
