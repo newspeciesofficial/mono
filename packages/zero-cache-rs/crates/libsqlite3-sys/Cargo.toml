@@ -38,6 +38,7 @@ vcpkg = []
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
+rayon = "1"
 
 [build-dependencies]
 cc = "1.1"

@@ -132,6 +132,11 @@ fn main() {
         "SQLITE_OMIT_LOAD_EXTENSION",
         // rusqlite expects SQLITE_CORE. Also pulls in sqlite3_auto_extension.
         "SQLITE_CORE",
+        // Required for sqlite3_snapshot_get/open/free/cmp/recover — used by
+        // intra-CG parallel hydration to pin N worker Connections to the
+        // exact LSN captured by a leader Connection. Not set by upstream
+        // zero-sqlite3 default; we add it here because parallel IVM needs it.
+        "SQLITE_ENABLE_SNAPSHOT",
     ] {
         cfg.flag(&format!("-D{flag}"));
     }
