@@ -1434,10 +1434,14 @@ impl PipelineDriver {
                 continue;
             }
             let conn = crate::view_syncer::snapshotter::open_table_source_connection(&db_file)
-                .map_err(|e| PipelineDriverError::Other(format!(
-                    "auto_register_table_sources: open replica connection for table {name}: {e}",
-                )))?;
-            let source = TableSource::new(conn, name.clone(), columns, pk)?;
+                .map_err(|e| {
+                    PipelineDriverError::Other(format!(
+                        "auto_register_table_sources: open replica connection for table {name}: {e}",
+                    ))
+                })?;
+            let source = TableSource::new(conn, name.clone(), columns, pk).map_err(|e| {
+                PipelineDriverError::Other(format!("TableSource::new for {name}: {e}"))
+            })?;
             tables.insert(name, Arc::new(source));
         }
         Ok(())

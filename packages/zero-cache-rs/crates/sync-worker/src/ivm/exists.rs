@@ -179,6 +179,25 @@ impl Exists {
         }
     }
 
+    /// Wired variant: matches TS `new Exists(...)` followed by
+    /// `input.setFilterOutput(this)`. Returns `Arc<Mutex<Self>>`.
+    pub fn new_wired(
+        input: Box<dyn FilterInput>,
+        relationship_name: String,
+        parent_join_key: CompoundKey,
+        exists_type: ExistsType,
+    ) -> Arc<Mutex<Self>> {
+        let arc = Arc::new(Mutex::new(Self::new(
+            input,
+            relationship_name,
+            parent_join_key,
+            exists_type,
+        )));
+        let back: Box<dyn FilterOutput> = Box::new(ExistsPushBackEdge(Arc::clone(&arc)));
+        arc.lock().unwrap().input.set_filter_output(back);
+        arc
+    }
+
     /// Compute the cache key from the parent row's join-key columns.
     ///
     /// TS `#getCacheKey`: `JSON.stringify(values)` over
@@ -361,6 +380,87 @@ impl Output for Exists {
 }
 
 impl FilterOperator for Exists {}
+
+/// Back-edge installed on [`Exists::input`]. Created by
+/// [`Exists::new_wired`].
+pub struct ExistsPushBackEdge(pub Arc<Mutex<Exists>>);
+
+impl Output for ExistsPushBackEdge {
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let mut guard = self.0.lock().expect("exists back-edge mutex poisoned");
+        let items: Vec<Yield> = guard.push(change, pusher).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+impl FilterOutput for ExistsPushBackEdge {
+    fn begin_filter(&mut self) {
+        self.0.lock().expect("exists back-edge mutex poisoned").begin_filter();
+    }
+    fn end_filter(&mut self) {
+        self.0.lock().expect("exists back-edge mutex poisoned").end_filter();
+    }
+    fn filter(&mut self, node: &Node) -> (Stream<'_, Yield>, bool) {
+        let mut guard = self.0.lock().expect("exists back-edge mutex poisoned");
+        let (stream, keep) = guard.filter(node);
+        let collected: Vec<Yield> = stream.collect();
+        drop(guard);
+        (Box::new(collected.into_iter()), keep)
+    }
+}
+
+/// Adapter to plug a wired [`Arc<Mutex<Exists>>`] back into the chain
+/// as `Box<dyn FilterInput>`. Schema cached at construction.
+pub struct ArcExistsAsInput {
+    inner: Arc<Mutex<Exists>>,
+    schema: SourceSchema,
+}
+
+impl ArcExistsAsInput {
+    pub fn new(inner: Arc<Mutex<Exists>>) -> Self {
+        let schema = inner.lock().unwrap().get_schema().clone();
+        Self { inner, schema }
+    }
+}
+
+impl InputBase for ArcExistsAsInput {
+    fn get_schema(&self) -> &SourceSchema { &self.schema }
+    fn destroy(&mut self) { self.inner.lock().unwrap().destroy(); }
+}
+
+impl FilterInput for ArcExistsAsInput {
+    fn set_filter_output(&mut self, output: Box<dyn FilterOutput>) {
+        self.inner.lock().unwrap().set_filter_output(output);
+    }
+}
+
+impl Output for ArcExistsAsInput {
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let mut guard = self.inner.lock().unwrap();
+        let items: Vec<Yield> = guard.push(change, pusher).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+impl FilterOutput for ArcExistsAsInput {
+    fn begin_filter(&mut self) {
+        self.inner.lock().unwrap().begin_filter();
+    }
+    fn end_filter(&mut self) {
+        self.inner.lock().unwrap().end_filter();
+    }
+    fn filter(&mut self, node: &Node) -> (Stream<'_, Yield>, bool) {
+        let mut guard = self.inner.lock().unwrap();
+        let (stream, keep) = guard.filter(node);
+        let collected: Vec<Yield> = stream.collect();
+        drop(guard);
+        (Box::new(collected.into_iter()), keep)
+    }
+}
+
+impl FilterOperator for ArcExistsAsInput {}
 
 impl Exists {
     /// Core of `push` — separated so the outer can manage `#inPush`.

@@ -30,7 +30,7 @@ use crate::ivm::push_accumulated::push_accumulated_changes;
 use crate::ivm::schema::SourceSchema;
 use crate::ivm::source::Yield;
 use crate::ivm::stream::Stream;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// TS `FanIn` — merges N upstream filter streams into one.
 pub struct FanIn {
@@ -80,6 +80,23 @@ impl FanIn {
             output: Mutex::new(Box::new(ThrowFilterOutput)),
             accumulated_pushes: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Wired variant: matches TS `new FanIn(...)` followed by
+    /// `input.setFilterOutput(this)` for every upstream branch.
+    /// Returns `Arc<Mutex<Self>>`.
+    pub fn new_wired(
+        schema: SourceSchema,
+        inputs: Vec<Box<dyn FilterInput>>,
+    ) -> Arc<Mutex<Self>> {
+        let arc = Arc::new(Mutex::new(Self::new(schema, inputs)));
+        // Wire each branch's filter-output to this FanIn.
+        let n_inputs = arc.lock().unwrap().inputs.len();
+        for i in 0..n_inputs {
+            let back: Box<dyn FilterOutput> = Box::new(FanInPushBackEdge(Arc::clone(&arc)));
+            arc.lock().unwrap().inputs[i].set_filter_output(back);
+        }
+        arc
     }
 
     /// TS `*fanOutDonePushingToAllBranches(fanOutChangeType)`.
@@ -201,6 +218,87 @@ impl Output for FanIn {
 }
 
 impl FilterOperator for FanIn {}
+
+/// Back-edge adapter installed on every [`FanIn::inputs`] entry.
+/// Created by [`FanIn::new_wired`].
+pub struct FanInPushBackEdge(pub Arc<Mutex<FanIn>>);
+
+impl Output for FanInPushBackEdge {
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let mut guard = self.0.lock().expect("fan_in back-edge mutex poisoned");
+        let items: Vec<Yield> = guard.push(change, pusher).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+impl FilterOutput for FanInPushBackEdge {
+    fn begin_filter(&mut self) {
+        self.0.lock().expect("fan_in back-edge mutex poisoned").begin_filter();
+    }
+    fn end_filter(&mut self) {
+        self.0.lock().expect("fan_in back-edge mutex poisoned").end_filter();
+    }
+    fn filter(&mut self, node: &Node) -> (Stream<'_, Yield>, bool) {
+        let mut guard = self.0.lock().expect("fan_in back-edge mutex poisoned");
+        let (stream, keep) = guard.filter(node);
+        let collected: Vec<Yield> = stream.collect();
+        drop(guard);
+        (Box::new(collected.into_iter()), keep)
+    }
+}
+
+/// Adapter to plug a wired [`Arc<Mutex<FanIn>>`] back into the chain
+/// as `Box<dyn FilterInput>`. Schema cached at construction.
+pub struct ArcFanInAsInput {
+    inner: Arc<Mutex<FanIn>>,
+    schema: SourceSchema,
+}
+
+impl ArcFanInAsInput {
+    pub fn new(inner: Arc<Mutex<FanIn>>) -> Self {
+        let schema = inner.lock().unwrap().get_schema().clone();
+        Self { inner, schema }
+    }
+}
+
+impl InputBase for ArcFanInAsInput {
+    fn get_schema(&self) -> &SourceSchema { &self.schema }
+    fn destroy(&mut self) { self.inner.lock().unwrap().destroy(); }
+}
+
+impl FilterInput for ArcFanInAsInput {
+    fn set_filter_output(&mut self, output: Box<dyn FilterOutput>) {
+        self.inner.lock().unwrap().set_filter_output(output);
+    }
+}
+
+impl Output for ArcFanInAsInput {
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let mut guard = self.inner.lock().unwrap();
+        let items: Vec<Yield> = guard.push(change, pusher).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+impl FilterOutput for ArcFanInAsInput {
+    fn begin_filter(&mut self) {
+        self.inner.lock().unwrap().begin_filter();
+    }
+    fn end_filter(&mut self) {
+        self.inner.lock().unwrap().end_filter();
+    }
+    fn filter(&mut self, node: &Node) -> (Stream<'_, Yield>, bool) {
+        let mut guard = self.inner.lock().unwrap();
+        let (stream, keep) = guard.filter(node);
+        let collected: Vec<Yield> = stream.collect();
+        drop(guard);
+        (Box::new(collected.into_iter()), keep)
+    }
+}
+
+impl FilterOperator for ArcFanInAsInput {}
 
 // ─── Tests ────────────────────────────────────────────────────────────
 

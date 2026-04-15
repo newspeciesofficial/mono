@@ -81,7 +81,7 @@ import {
 import type {DrainCoordinator} from './drain-coordinator.ts';
 import {handleInspect} from './inspect-handler.ts';
 import type {PipelineDriver} from './pipeline-driver.ts';
-import {RustPipelineDriver} from './rust-pipeline-driver.ts';
+import type {RustPipelineDriver} from './rust-pipeline-driver.ts';
 import {type RowChange} from './pipeline-driver.ts';
 import {RemotePipelineDriver} from './remote-pipeline-driver.ts';
 
@@ -1366,51 +1366,6 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
           name: undefined,
         });
       }
-    }
-
-    // Fast path: when the underlying driver is RustPipelineDriver, hand
-    // the whole batch to its parallel hydration FFI. Each query runs on
-    // its own rayon worker; rows stream back via the chunk callback;
-    // per-query hydration time comes back in the status array. Wall
-    // time of the batch ≈ slowest single query (vs. sum-of-all on the
-    // serial path). Falls back to the per-query loop below for the TS
-    // and remote drivers.
-    if (
-      this.#pipelines instanceof RustPipelineDriver &&
-      transformedQueries.length > 0
-    ) {
-      const batchStart = Date.now();
-      const batch = transformedQueries.map(t => ({
-        transformationHash: t.transformed.transformationHash,
-        queryID: t.id,
-        ast: t.transformed.transformedAst,
-      }));
-      // Per-query row counters live here so we can log identically to
-      // the serial path. The chunk callback is invoked from rayon
-      // worker threads via napi's ThreadsafeFunction — napi-rs
-      // serialises delivery onto the JS event loop, so this counter
-      // map is touched single-threaded from JS's perspective.
-      const counts = new Map<string, number>();
-      const statuses = this.#pipelines.addQueries(batch, ({queryID, rows}) => {
-        counts.set(queryID, (counts.get(queryID) ?? 0) + rows.length);
-      });
-      for (const s of statuses) {
-        if (s.ok) {
-          const elapsed = s.hydrationTimeMs;
-          this.#hydrations.add(1);
-          this.#hydrationTime.record(elapsed / 1000);
-          this.#addQueryMaterializationServerMetric(s.queryID, elapsed);
-          lc.debug?.(
-            `hydrated ${counts.get(s.queryID) ?? 0} rows for ${s.queryID} ` +
-              `(${elapsed.toFixed(1)} ms, batch wall ${Date.now() - batchStart} ms)`,
-          );
-        } else {
-          lc.error?.(
-            `parallel hydration failed for ${s.queryID}: ${s.error}`,
-          );
-        }
-      }
-      return;
     }
 
     for (const {

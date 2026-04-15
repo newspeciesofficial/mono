@@ -82,6 +82,17 @@ impl Skip {
         }
     }
 
+    /// Wired variant: matches TS `new Skip(...)` followed by
+    /// `input.setOutput(this)`. Returns `Arc<Mutex<Self>>` so the
+    /// back-edge adapter ([`SkipPushBackEdge`]) can retain a strong
+    /// reference. Use [`ArcSkipAsInput`] to plug back into the chain.
+    pub fn new_wired(input: Box<dyn Input>, bound: Bound) -> Arc<Mutex<Self>> {
+        let arc = Arc::new(Mutex::new(Self::new(input, bound)));
+        let back: Box<dyn Output> = Box::new(SkipPushBackEdge(Arc::clone(&arc)));
+        arc.lock().unwrap().input.set_output(back);
+        arc
+    }
+
     /// TS private method `#shouldBePresent(row)`.
     ///
     /// `cmp(bound, row) < 0`  → bound precedes row, keep.
@@ -288,6 +299,61 @@ impl Output for Skip {
 }
 
 impl Operator for Skip {}
+
+/// Back-edge adapter installed on [`Skip::input`]. Created by
+/// [`Skip::new_wired`].
+pub struct SkipPushBackEdge(pub Arc<Mutex<Skip>>);
+
+impl Output for SkipPushBackEdge {
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let mut guard = self.0.lock().expect("skip back-edge mutex poisoned");
+        let items: Vec<Yield> = guard.push(change, pusher).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+/// Adapter to plug a wired [`Arc<Mutex<Skip>>`] back into the chain
+/// as `Box<dyn Input>`. Schema cached at construction.
+pub struct ArcSkipAsInput {
+    inner: Arc<Mutex<Skip>>,
+    schema: SourceSchema,
+}
+
+impl ArcSkipAsInput {
+    pub fn new(inner: Arc<Mutex<Skip>>) -> Self {
+        let schema = inner.lock().unwrap().get_schema().clone();
+        Self { inner, schema }
+    }
+}
+
+impl InputBase for ArcSkipAsInput {
+    fn get_schema(&self) -> &SourceSchema { &self.schema }
+    fn destroy(&mut self) { self.inner.lock().unwrap().destroy(); }
+}
+
+impl Input for ArcSkipAsInput {
+    fn set_output(&mut self, output: Box<dyn Output>) {
+        self.inner.lock().unwrap().set_output(output);
+    }
+    fn fetch<'a>(&'a self, req: FetchRequest) -> Stream<'a, NodeOrYield> {
+        let guard = self.inner.lock().unwrap();
+        let items: Vec<NodeOrYield> = guard.fetch(req).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+impl Output for ArcSkipAsInput {
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let mut guard = self.inner.lock().unwrap();
+        let items: Vec<Yield> = guard.push(change, pusher).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+impl Operator for ArcSkipAsInput {}
 
 // ─── Tests ────────────────────────────────────────────────────────────
 

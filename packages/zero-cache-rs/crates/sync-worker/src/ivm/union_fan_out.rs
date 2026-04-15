@@ -47,6 +47,15 @@ impl UnionFanOut {
         }
     }
 
+    /// Wired variant: matches TS `new UnionFanOut(...)` followed by
+    /// `input.setOutput(this)`. Returns `Arc<Mutex<Self>>`.
+    pub fn new_wired(input: Box<dyn Input>) -> Arc<Mutex<Self>> {
+        let arc = Arc::new(Mutex::new(Self::new(input)));
+        let back: Box<dyn Output> = Box::new(UnionFanOutPushBackEdge(Arc::clone(&arc)));
+        arc.lock().unwrap().input.set_output(back);
+        arc
+    }
+
     /// TS `setFanIn(fanIn)`.
     ///
     /// TS asserts that `#unionFanIn` is unset before setting. We enforce
@@ -167,6 +176,61 @@ impl Output for UnionFanOut {
 }
 
 impl Operator for UnionFanOut {}
+
+/// Back-edge installed on [`UnionFanOut::input`]. Created by
+/// [`UnionFanOut::new_wired`].
+pub struct UnionFanOutPushBackEdge(pub Arc<Mutex<UnionFanOut>>);
+
+impl Output for UnionFanOutPushBackEdge {
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let mut guard = self.0.lock().expect("union_fan_out back-edge mutex poisoned");
+        let items: Vec<Yield> = guard.push(change, pusher).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+/// Adapter to plug a wired [`Arc<Mutex<UnionFanOut>>`] back into the
+/// chain as `Box<dyn Input>`. Schema cached at construction.
+pub struct ArcUnionFanOutAsInput {
+    inner: Arc<Mutex<UnionFanOut>>,
+    schema: SourceSchema,
+}
+
+impl ArcUnionFanOutAsInput {
+    pub fn new(inner: Arc<Mutex<UnionFanOut>>) -> Self {
+        let schema = inner.lock().unwrap().get_schema().clone();
+        Self { inner, schema }
+    }
+}
+
+impl InputBase for ArcUnionFanOutAsInput {
+    fn get_schema(&self) -> &SourceSchema { &self.schema }
+    fn destroy(&mut self) { self.inner.lock().unwrap().destroy(); }
+}
+
+impl Input for ArcUnionFanOutAsInput {
+    fn set_output(&mut self, output: Box<dyn Output>) {
+        self.inner.lock().unwrap().set_output(output);
+    }
+    fn fetch<'a>(&'a self, req: FetchRequest) -> Stream<'a, NodeOrYield> {
+        let guard = self.inner.lock().unwrap();
+        let items: Vec<NodeOrYield> = guard.fetch(req).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+impl Output for ArcUnionFanOutAsInput {
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let mut guard = self.inner.lock().unwrap();
+        let items: Vec<Yield> = guard.push(change, pusher).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+impl Operator for ArcUnionFanOutAsInput {}
 
 // ─── Tests ────────────────────────────────────────────────────────────
 

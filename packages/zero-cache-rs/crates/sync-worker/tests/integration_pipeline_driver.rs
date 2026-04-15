@@ -877,3 +877,344 @@ fn _surface_check() {
     // We don't actually call this — existence at compile time is enough.
     let _ = json!(null);
 }
+
+// ─── JOIN subquery push propagation ───────────────────────────────────
+//
+// Models the xyne-observed flicker: messages table push fails to
+// propagate through a `channelConversationsPaginatedV3`-shaped query
+// because the join subquery's child input (TableSourceInput on
+// `messages`) never has its output slot wired. Driven in isolation —
+// no Docker, no napi — so iteration is cheap.
+//
+// Scenario: one query that selects channels and includes a related
+// subquery over messages joined by channelId. Insert a message for
+// an existing channel, advance, assert the query emits a RowAdd
+// carrying the new message in its channel parent's relationship.
+
+use zero_cache_sync_worker::view_syncer::client_schema::{
+    ClientColumnSchema as ClientColumnSchemaJ, ClientTableSchema as ClientTableSchemaJ,
+};
+use zero_cache_types::ast::{CompoundKey, Correlation, CorrelatedSubquery};
+
+fn make_replica_join(dir: &TempDir) -> String {
+    let path = dir.path().join("replica.db");
+    let p = path.to_string_lossy().into_owned();
+    let conn = Connection::open(&p).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE "_zero.replicationState" (
+            stateVersion TEXT NOT NULL,
+            lock INTEGER PRIMARY KEY DEFAULT 1 CHECK (lock=1)
+        );
+        INSERT INTO "_zero.replicationState" (stateVersion, lock) VALUES ('01', 1);
+
+        CREATE TABLE "_zero.changeLog2" (
+            "stateVersion" TEXT NOT NULL,
+            "pos" INT NOT NULL,
+            "table" TEXT NOT NULL,
+            "rowKey" TEXT NOT NULL,
+            "op" TEXT NOT NULL,
+            PRIMARY KEY("stateVersion", "pos")
+        );
+
+        CREATE TABLE channels(
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            _0_version TEXT NOT NULL
+        );
+        CREATE TABLE messages(
+            id INTEGER PRIMARY KEY,
+            channelId INTEGER NOT NULL,
+            content TEXT,
+            _0_version TEXT NOT NULL
+        );
+        "#,
+    )
+    .unwrap();
+    p
+}
+
+fn seed_channel(path: &str, id: i64, name: &str, v: &str) {
+    let c = Connection::open(path).unwrap();
+    c.execute(
+        "INSERT INTO channels(id, name, _0_version) VALUES(?, ?, ?)",
+        params![id, name, v],
+    )
+    .unwrap();
+}
+
+fn apply_insert_message(path: &str, id: i64, channel_id: i64, content: &str, v: &str) {
+    let c = Connection::open(path).unwrap();
+    c.execute(
+        "INSERT INTO messages(id, channelId, content, _0_version) VALUES(?, ?, ?, ?)",
+        params![id, channel_id, content, v],
+    )
+    .unwrap();
+}
+
+fn make_channels_source(replica_path: &str) -> Arc<TableSource> {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        r#"CREATE TABLE channels(
+             id INTEGER PRIMARY KEY,
+             name TEXT,
+             _0_version TEXT NOT NULL
+           );"#,
+    )
+    .unwrap();
+    let rc = Connection::open(replica_path).unwrap();
+    let mut stmt = rc
+        .prepare("SELECT id, name, _0_version FROM channels")
+        .unwrap();
+    let rows: Vec<(i64, Option<String>, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for (id, name, v) in rows {
+        conn.execute(
+            "INSERT INTO channels(id, name, _0_version) VALUES(?, ?, ?)",
+            params![id, name, v],
+        )
+        .unwrap();
+    }
+    let mut cols = IndexMap::new();
+    cols.insert("id".into(), SchemaValue::new(ValueType::Number));
+    cols.insert("name".into(), SchemaValue::new(ValueType::String));
+    cols.insert("_0_version".into(), SchemaValue::new(ValueType::String));
+    let ts = TableSource::new(conn, "channels", cols, PrimaryKey::new(vec!["id".into()]))
+        .expect("TableSource::new channels");
+    Arc::new(ts)
+}
+
+fn make_messages_source(replica_path: &str) -> Arc<TableSource> {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        r#"CREATE TABLE messages(
+             id INTEGER PRIMARY KEY,
+             channelId INTEGER NOT NULL,
+             content TEXT,
+             _0_version TEXT NOT NULL
+           );"#,
+    )
+    .unwrap();
+    let rc = Connection::open(replica_path).unwrap();
+    let mut stmt = rc
+        .prepare("SELECT id, channelId, content, _0_version FROM messages")
+        .unwrap();
+    let rows: Vec<(i64, i64, Option<String>, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for (id, cid, content, v) in rows {
+        conn.execute(
+            "INSERT INTO messages(id, channelId, content, _0_version) VALUES(?, ?, ?, ?)",
+            params![id, cid, content, v],
+        )
+        .unwrap();
+    }
+    let mut cols = IndexMap::new();
+    cols.insert("id".into(), SchemaValue::new(ValueType::Number));
+    cols.insert("channelId".into(), SchemaValue::new(ValueType::Number));
+    cols.insert("content".into(), SchemaValue::new(ValueType::String));
+    cols.insert("_0_version".into(), SchemaValue::new(ValueType::String));
+    let ts = TableSource::new(conn, "messages", cols, PrimaryKey::new(vec!["id".into()]))
+        .expect("TableSource::new messages");
+    Arc::new(ts)
+}
+
+fn two_table_client_schema() -> ClientSchema {
+    let mut tables = IndexMap::new();
+
+    let mut ch_cols = IndexMap::new();
+    ch_cols.insert("id".into(), ClientColumnSchemaJ { r#type: "number".into() });
+    ch_cols.insert("name".into(), ClientColumnSchemaJ { r#type: "string".into() });
+    tables.insert(
+        "channels".into(),
+        ClientTableSchemaJ { columns: ch_cols, primary_key: Some(vec!["id".into()]) },
+    );
+
+    let mut msg_cols = IndexMap::new();
+    msg_cols.insert("id".into(), ClientColumnSchemaJ { r#type: "number".into() });
+    msg_cols.insert("channelId".into(), ClientColumnSchemaJ { r#type: "number".into() });
+    msg_cols.insert("content".into(), ClientColumnSchemaJ { r#type: "string".into() });
+    tables.insert(
+        "messages".into(),
+        ClientTableSchemaJ { columns: msg_cols, primary_key: Some(vec!["id".into()]) },
+    );
+
+    ClientSchema { tables }
+}
+
+fn two_table_specs() -> IndexMap<String, LiteAndZqlSpec> {
+    let mut specs = IndexMap::new();
+
+    let mut ch_zql = IndexMap::new();
+    ch_zql.insert("id".into(), ZqlSchemaValue { r#type: "number".into() });
+    ch_zql.insert("name".into(), ZqlSchemaValue { r#type: "string".into() });
+    specs.insert(
+        "channels".into(),
+        LiteAndZqlSpec {
+            table_spec: LiteTableSpecWithKeys {
+                all_potential_primary_keys: vec![vec!["id".into()]],
+            },
+            zql_spec: ch_zql,
+        },
+    );
+
+    let mut msg_zql = IndexMap::new();
+    msg_zql.insert("id".into(), ZqlSchemaValue { r#type: "number".into() });
+    msg_zql.insert("channelId".into(), ZqlSchemaValue { r#type: "number".into() });
+    msg_zql.insert("content".into(), ZqlSchemaValue { r#type: "string".into() });
+    specs.insert(
+        "messages".into(),
+        LiteAndZqlSpec {
+            table_spec: LiteTableSpecWithKeys {
+                all_potential_primary_keys: vec![vec!["id".into()]],
+            },
+            zql_spec: msg_zql,
+        },
+    );
+    specs
+}
+
+fn two_table_full_tables() -> IndexMap<String, LiteTableSpec> {
+    let mut out = IndexMap::new();
+
+    let mut ch_cols = IndexMap::new();
+    ch_cols.insert("id".into(), LiteColumnSpec { data_type: "integer".into() });
+    ch_cols.insert("name".into(), LiteColumnSpec { data_type: "text".into() });
+    ch_cols.insert("_0_version".into(), LiteColumnSpec { data_type: "text".into() });
+    out.insert("channels".into(), LiteTableSpec { columns: ch_cols });
+
+    let mut msg_cols = IndexMap::new();
+    msg_cols.insert("id".into(), LiteColumnSpec { data_type: "integer".into() });
+    msg_cols.insert("channelId".into(), LiteColumnSpec { data_type: "integer".into() });
+    msg_cols.insert("content".into(), LiteColumnSpec { data_type: "text".into() });
+    msg_cols.insert("_0_version".into(), LiteColumnSpec { data_type: "text".into() });
+    out.insert("messages".into(), LiteTableSpec { columns: msg_cols });
+
+    out
+}
+
+/// Scenario JOIN-1: `advance_propagates_join_subquery_insert`.
+///
+/// Mirror of the xyne message-flicker scenario, in isolation.
+///
+/// Query: `SELECT * FROM channels` with related subquery
+/// `messages WHERE channelId = channels.id` aliased as `msgs`.
+///
+/// Actions:
+/// 1. Seed channel id=1.
+/// 2. Initialise driver + register `channels` and `messages` sources.
+/// 3. `add_query(q1)` — hydration yields the seeded channel with an
+///    empty `msgs` relationship.
+/// 4. Apply INSERT of a new message for channel 1 + append changeLog.
+/// 5. `advance()` and assert: an `edit` RowChange for the channel row
+///    (whose relationships now include the new message) OR an Add
+///    surfacing the message downstream. Either way, the row must NOT
+///    be silently dropped — the regression symptom is an empty
+///    `res.changes` from the advance.
+#[test]
+fn advance_propagates_join_subquery_insert() {
+    let dir = TempDir::new().unwrap();
+    let replica_path = make_replica_join(&dir);
+    seed_channel(&replica_path, 1, "general", "01");
+
+    let snapshotter = Snapshotter::new(replica_path.clone(), "my_app");
+    let storage = DatabaseStorage::open_in_memory(DatabaseStorageOptions::default())
+        .unwrap()
+        .create_client_group_storage("cg1");
+    let shard = ShardId {
+        app_id: "my_app".into(),
+        shard_num: 0,
+    };
+    let driver = PipelineDriver::new(
+        snapshotter,
+        shard,
+        storage,
+        "cg1",
+        Arc::new(NoopInspectorDelegate),
+        Arc::new(|| 1_000.0),
+        false,
+    );
+
+    driver
+        .init(
+            &two_table_client_schema(),
+            two_table_specs(),
+            two_table_full_tables(),
+        )
+        .unwrap();
+
+    driver.register_table_source("channels", make_channels_source(&replica_path));
+    driver.register_table_source("messages", make_messages_source(&replica_path));
+
+    // AST: channels with related `msgs` subquery over messages.channelId = channels.id
+    let sub_ast = AST {
+        schema: None,
+        table: "messages".into(),
+        alias: Some("msgs".into()),
+        where_clause: None,
+        related: None,
+        start: None,
+        limit: None,
+        order_by: None,
+    };
+    let ast = AST {
+        schema: None,
+        table: "channels".into(),
+        alias: None,
+        where_clause: None,
+        related: Some(vec![CorrelatedSubquery {
+            correlation: Correlation {
+                parent_field: Vec::from(["id".into()]),
+                child_field: Vec::from(["channelId".into()]),
+            },
+            subquery: Box::new(sub_ast),
+            system: None,
+            hidden: None,
+        }]),
+        start: None,
+        limit: None,
+        order_by: None,
+    };
+
+    let hydrate = driver.add_query("h", "q1", ast, &NoopTimer).unwrap();
+    // Seeded channel must appear in hydration.
+    assert!(
+        !adds_only(&hydrate).is_empty(),
+        "hydration must emit at least one Add"
+    );
+
+    // Simulate the replicator's DML + changeLog append for a new
+    // message on channel 1.
+    apply_insert_message(&replica_path, 42, 1, "hello", "02");
+    bump_version_and_log(
+        &replica_path,
+        "02",
+        0,
+        "messages",
+        r#"{"id":42}"#,
+        "s",
+    );
+
+    let res = driver.advance(&NoopTimer).unwrap();
+
+    // The bug: res.changes is empty — the messages push was dropped
+    // by unwired operator back-edges, so the query sees no change.
+    //
+    // The fix: the push propagates through the join pipeline. The
+    // observable surface is either (a) an edit on the channel row
+    // with the message in its `msgs` relationship, or (b) a direct
+    // add/edit/remove referencing the new message row. Either one
+    // demonstrates the push flow is wired end-to-end.
+    assert!(
+        !res.changes.is_empty(),
+        "advance must emit at least one row change for the message \
+         push propagating through the join subquery; got empty — \
+         operator back-edges are still unwired for this path",
+    );
+}

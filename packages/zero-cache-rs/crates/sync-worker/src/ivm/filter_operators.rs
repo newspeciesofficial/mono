@@ -146,15 +146,29 @@ pub struct FilterStart {
 }
 
 impl FilterStart {
-    /// TS `new FilterStart(input)`.
-    ///
-    /// Unlike TS, we do NOT call `input.setOutput(this)` here — the
-    /// pipeline driver handles that back-edge.  See module doc.
+    /// TS `new FilterStart(input)` — raw, unwired. Used by tests and
+    /// by [`Self::new_wired`] internally. Production code should use
+    /// [`Self::new_wired`] which installs the back-edge matching TS
+    /// `input.setOutput(this)`.
     pub fn new(input: Box<dyn Input>) -> Self {
         Self {
             input,
             output: Mutex::new(Box::new(ThrowFilterOutput)),
         }
+    }
+
+    /// TS `new FilterStart(input)` followed by `input.setOutput(this)`
+    /// — the back-edge TS installs in the constructor. Wires the
+    /// upstream input's output slot to a [`FilterStartPushBackEdge`]
+    /// so pushes from the TableSource connection flow through this
+    /// FilterStart. Strong cycle (child input → Arc<Mutex<FilterStart>>)
+    /// is bounded by pipeline lifetime.
+    pub fn new_wired(input: Box<dyn Input>) -> Arc<Mutex<Self>> {
+        let fs = Arc::new(Mutex::new(Self::new(input)));
+        let back: Box<dyn Output> =
+            Box::new(FilterStartPushBackEdge(Arc::clone(&fs)));
+        fs.lock().unwrap().input.set_output(back);
+        fs
     }
 
     /// TS `destroy()` — delegates to upstream `input.destroy()`.
@@ -249,6 +263,21 @@ impl FilterInput for FilterStart {
     }
 }
 
+/// Back-edge installed by [`FilterStart::new`] into the upstream
+/// `input.set_output(...)` slot. Forwards pushes from the upstream
+/// (TableSource connection) to the FilterStart's own `push` method —
+/// mirroring TS `input.setOutput(this)`.
+pub struct FilterStartPushBackEdge(Arc<Mutex<FilterStart>>);
+
+impl Output for FilterStartPushBackEdge {
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let mut guard = self.0.lock().expect("FilterStart back-edge mutex poisoned");
+        let items: Vec<Yield> = guard.push(change, pusher).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
 impl Output for FilterStart {
     fn push<'a>(&'a mut self, change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
         // TS: `yield* this.#output.push(change, this)`.  We pass the
@@ -307,9 +336,87 @@ impl FilterEnd {
         }
     }
 
+    /// Wired variant: matches TS `new FilterEnd(start, input)` followed
+    /// by `input.setFilterOutput(this)`. Returns `Arc<Mutex<Self>>`.
+    pub fn new_wired(
+        start: Arc<Mutex<FilterStart>>,
+        input: Box<dyn FilterInput>,
+    ) -> Arc<Mutex<Self>> {
+        let arc = Arc::new(Mutex::new(Self::new(start, input)));
+        let back: Box<dyn FilterOutput> = Box::new(FilterEndPushBackEdge(Arc::clone(&arc)));
+        arc.lock().unwrap().input.set_filter_output(back);
+        arc
+    }
+
     /// TS `setOutput(output: Output)`.
     pub fn set_output(&mut self, output: Box<dyn Output>) {
         *self.output.lock().expect("output mutex poisoned") = output;
+    }
+}
+
+/// Back-edge installed on [`FilterEnd::input`]. Created by
+/// [`FilterEnd::new_wired`].
+pub struct FilterEndPushBackEdge(pub Arc<Mutex<FilterEnd>>);
+
+impl Output for FilterEndPushBackEdge {
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let mut guard = self.0.lock().expect("filter_end back-edge mutex poisoned");
+        let items: Vec<Yield> = guard.push(change, pusher).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+impl FilterOutput for FilterEndPushBackEdge {
+    fn begin_filter(&mut self) {
+        self.0.lock().expect("filter_end back-edge mutex poisoned").begin_filter();
+    }
+    fn end_filter(&mut self) {
+        self.0.lock().expect("filter_end back-edge mutex poisoned").end_filter();
+    }
+    fn filter(&mut self, node: &crate::ivm::data::Node) -> (Stream<'_, Yield>, bool) {
+        let mut guard = self.0.lock().expect("filter_end back-edge mutex poisoned");
+        let (stream, keep) = guard.filter(node);
+        let collected: Vec<Yield> = stream.collect();
+        drop(guard);
+        (Box::new(collected.into_iter()), keep)
+    }
+}
+
+/// Adapter to plug a wired [`Arc<Mutex<FilterEnd>>`] back into the
+/// chain as `Box<dyn Input>`. Schema cached at construction.
+pub struct ArcFilterEndAsInput {
+    inner: Arc<Mutex<FilterEnd>>,
+    schema: SourceSchema,
+}
+
+impl ArcFilterEndAsInput {
+    pub fn new(inner: Arc<Mutex<FilterEnd>>) -> Self {
+        let schema = inner.lock().unwrap().get_schema().clone();
+        Self { inner, schema }
+    }
+
+    /// Test-only: expose the inner FilterEnd's FilterStart pointer.
+    #[cfg(test)]
+    pub fn start_arc(&self) -> Arc<Mutex<FilterStart>> {
+        Arc::clone(&self.inner.lock().unwrap().start)
+    }
+}
+
+impl InputBase for ArcFilterEndAsInput {
+    fn get_schema(&self) -> &SourceSchema { &self.schema }
+    fn destroy(&mut self) { self.inner.lock().unwrap().destroy(); }
+}
+
+impl Input for ArcFilterEndAsInput {
+    fn set_output(&mut self, output: Box<dyn Output>) {
+        self.inner.lock().unwrap().set_output(output);
+    }
+    fn fetch<'a>(&'a self, req: FetchRequest) -> Stream<'a, NodeOrYield> {
+        let guard = self.inner.lock().unwrap();
+        let items: Vec<NodeOrYield> = guard.fetch(req).collect();
+        drop(guard);
+        Box::new(items.into_iter())
     }
 }
 
@@ -402,20 +509,20 @@ pub fn build_filter_pipeline<F>(
     input: Box<dyn Input>,
     mut delegate_add_edge: impl FnMut(),
     pipeline: F,
-) -> FilterEnd
+) -> ArcFilterEndAsInput
 where
     F: FnOnce(Arc<Mutex<FilterStart>>) -> Box<dyn FilterInput>,
 {
-    let filter_start = Arc::new(Mutex::new(FilterStart::new(input)));
+    let filter_start = FilterStart::new_wired(input);
     // TS: delegate.addEdge(input, filterStart)
     delegate_add_edge();
     let middle = pipeline(Arc::clone(&filter_start));
     // TS: delegate.addEdge(filterStart, middle)
     delegate_add_edge();
-    let filter_end = FilterEnd::new(Arc::clone(&filter_start), middle);
+    let filter_end_arc = FilterEnd::new_wired(Arc::clone(&filter_start), middle);
     // TS: delegate.addEdge(middle, filterEnd)
     delegate_add_edge();
-    filter_end
+    ArcFilterEndAsInput::new(filter_end_arc)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────
@@ -1038,7 +1145,8 @@ mod tests {
                 })
             },
         );
-        let end_start_ptr = Arc::as_ptr(&end.start) as usize;
+        let end_start = end.start_arc();
+        let end_start_ptr = Arc::as_ptr(&end_start) as usize;
         assert_eq!(start_ptr.borrow().unwrap(), end_start_ptr);
     }
 }

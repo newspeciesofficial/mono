@@ -246,6 +246,23 @@ impl Take {
         }
     }
 
+    /// Wired variant: matches TS `new Take(...)` followed by
+    /// `input.setOutput(this)`. Returns `Arc<Mutex<Self>>` so the
+    /// back-edge adapter ([`TakePushBackEdge`]) can retain a strong
+    /// reference. Use [`ArcTakeAsInput`] to plug the result back
+    /// into the chain as `Box<dyn Input>`.
+    pub fn new_wired(
+        input: Box<dyn Input>,
+        storage: Box<dyn Storage>,
+        limit: usize,
+        partition_key: Option<PartitionKey>,
+    ) -> Arc<Mutex<Self>> {
+        let arc = Arc::new(Mutex::new(Self::new(input, storage, limit, partition_key)));
+        let back: Box<dyn Output> = Box::new(TakePushBackEdge(Arc::clone(&arc)));
+        arc.lock().unwrap().input.set_output(back);
+        arc
+    }
+
     fn storage_get(&self, key: &str) -> Option<JsonValue> {
         let s = self.storage.lock().expect("take storage mutex poisoned");
         s.get(key, None)
@@ -559,6 +576,62 @@ impl Output for Take {
 }
 
 impl Operator for Take {}
+
+/// Back-edge adapter installed on [`Take::input`] so pushes from the
+/// upstream (source connection) route into [`Take::push`]. Created by
+/// [`Take::new_wired`].
+pub struct TakePushBackEdge(pub Arc<Mutex<Take>>);
+
+impl Output for TakePushBackEdge {
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let mut guard = self.0.lock().expect("take back-edge mutex poisoned");
+        let items: Vec<Yield> = guard.push(change, pusher).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+/// Adapter that lets a wired [`Arc<Mutex<Take>>`] be plugged back into
+/// the chain as `Box<dyn Input>`. Schema cached at construction.
+pub struct ArcTakeAsInput {
+    inner: Arc<Mutex<Take>>,
+    schema: SourceSchema,
+}
+
+impl ArcTakeAsInput {
+    pub fn new(inner: Arc<Mutex<Take>>) -> Self {
+        let schema = inner.lock().unwrap().get_schema().clone();
+        Self { inner, schema }
+    }
+}
+
+impl InputBase for ArcTakeAsInput {
+    fn get_schema(&self) -> &SourceSchema { &self.schema }
+    fn destroy(&mut self) { self.inner.lock().unwrap().destroy(); }
+}
+
+impl Input for ArcTakeAsInput {
+    fn set_output(&mut self, output: Box<dyn Output>) {
+        self.inner.lock().unwrap().set_output(output);
+    }
+    fn fetch<'a>(&'a self, req: FetchRequest) -> Stream<'a, NodeOrYield> {
+        let guard = self.inner.lock().unwrap();
+        let items: Vec<NodeOrYield> = guard.fetch(req).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+impl Output for ArcTakeAsInput {
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let mut guard = self.inner.lock().unwrap();
+        let items: Vec<Yield> = guard.push(change, pusher).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+impl Operator for ArcTakeAsInput {}
 
 impl Take {
     fn push_impl(&self, change: Change, pusher: &dyn InputBase) -> Vec<Yield> {

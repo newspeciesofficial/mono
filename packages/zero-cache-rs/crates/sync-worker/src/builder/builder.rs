@@ -53,7 +53,7 @@ use crate::builder::filter::{create_predicate, simplify_condition};
 use crate::ivm::exists::{Exists, ExistsType};
 use crate::ivm::fan_in::FanIn;
 use crate::ivm::fan_out::FanOut;
-use crate::ivm::filter::Filter;
+use crate::ivm::filter::{ArcFilterAsInput, Filter};
 use crate::ivm::filter_operators::{FilterInput, FilterOutput, FilterStart, build_filter_pipeline};
 use crate::ivm::flipped_join::{FlippedJoin, FlippedJoinArgs};
 use crate::ivm::join::{Join, JoinArgs};
@@ -263,8 +263,11 @@ fn build_pipeline_internal(
             row: start.row.clone(),
             exclusive: start.exclusive,
         };
-        let skip_node = skip::Skip::new(end, skip_bound);
-        end = delegate.decorate_input(Box::new(skip_node), &format!("{name}:skip)"));
+        let skip_arc = skip::Skip::new_wired(end, skip_bound);
+        end = delegate.decorate_input(
+            Box::new(skip::ArcSkipAsInput::new(skip_arc)),
+            &format!("{name}:skip)"),
+        );
     }
 
     // Apply CSQ conditions (non-flipped) as subquery joins.
@@ -297,8 +300,11 @@ fn build_pipeline_internal(
     if let Some(limit) = ast.limit {
         let take_name = format!("{name}:take");
         let storage = delegate.create_storage(&take_name);
-        let take = Take::new(end, storage, limit as usize, partition_key.clone());
-        end = delegate.decorate_input(Box::new(take), &take_name);
+        let take_arc = Take::new_wired(end, storage, limit as usize, partition_key.clone());
+        end = delegate.decorate_input(
+            Box::new(crate::ivm::take::ArcTakeAsInput::new(take_arc)),
+            &take_name,
+        );
     }
 
     // Branch: ast.related → dedupe by alias, apply each as a join.
@@ -425,8 +431,7 @@ fn apply_filter_with_flips(
             );
             assert!(!with_flipped.is_empty(), "Impossible to have no flips here");
 
-            let ufo = UnionFanOut::new(input);
-            let ufo_arc: Arc<Mutex<UnionFanOut>> = Arc::new(Mutex::new(ufo));
+            let ufo_arc: Arc<Mutex<UnionFanOut>> = UnionFanOut::new_wired(input);
             // We need to pass ufo as an Input multiple times — use an
             // adapter that holds an Arc.
             let mut branches: Vec<Box<dyn Input>> = Vec::new();
@@ -451,8 +456,8 @@ fn apply_filter_with_flips(
             }
             // Build UnionFanIn from the ufo's schema and the branches.
             let fanin_schema = ufo_arc.lock().unwrap().get_schema().clone();
-            let ufi = UnionFanIn::new(fanin_schema, branches);
-            Box::new(ufi)
+            let ufi_arc = UnionFanIn::new_wired(fanin_schema, branches);
+            Box::new(crate::ivm::union_fan_in::ArcUnionFanInAsInput::new(ufi_arc))
         }
         Condition::CorrelatedSubquery { related, .. } => {
             let sq = (**related).clone();
@@ -468,7 +473,7 @@ fn apply_filter_with_flips(
                 .alias
                 .clone()
                 .expect("Subquery must have an alias");
-            let fj = FlippedJoin::new(FlippedJoinArgs {
+            let fj_arc = FlippedJoin::new_wired(FlippedJoinArgs {
                 parent: input,
                 child,
                 parent_key: sq.correlation.parent_field.clone(),
@@ -477,7 +482,7 @@ fn apply_filter_with_flips(
                 hidden: sq.hidden.unwrap_or(false),
                 system: sq.system.unwrap_or(System::Client),
             });
-            Box::new(fj)
+            Box::new(crate::ivm::flipped_join::ArcFlippedJoinAsInput::new(fj_arc))
         }
         Condition::Simple { .. } => unreachable!("asserted above"),
     }
@@ -564,12 +569,11 @@ pub fn apply_or_owned(
         };
         let pred = Arc::from(create_predicate(&combined));
         let filter = Filter::new(input, pred);
-        return Box::new(filter);
+        return Box::new(ArcFilterAsInput::new(filter));
     }
 
     // Branch: subqueries present → fan-out + fan-in.
-    let fan_out = FanOut::new(input);
-    let fan_out_arc: Arc<Mutex<FanOut>> = Arc::new(Mutex::new(fan_out));
+    let fan_out_arc = crate::ivm::fan_out::FanOut::new_wired(input);
     let mut branches: Vec<Box<dyn FilterInput>> = Vec::new();
     for sub in subquery_conditions.iter() {
         let branch_input: Box<dyn FilterInput> = Box::new(FanOutAdapter(Arc::clone(&fan_out_arc)));
@@ -582,11 +586,11 @@ pub fn apply_or_owned(
         let pred = Arc::from(create_predicate(&combined));
         let branch_input: Box<dyn FilterInput> = Box::new(FanOutAdapter(Arc::clone(&fan_out_arc)));
         let filter = Filter::new(branch_input, pred);
-        branches.push(Box::new(filter));
+        branches.push(Box::new(ArcFilterAsInput::new(filter)));
     }
     let schema = fan_out_arc.lock().unwrap().get_schema().clone();
-    let fan_in = FanIn::new(schema, branches);
-    Box::new(fan_in)
+    let fan_in_arc = crate::ivm::fan_in::FanIn::new_wired(schema, branches);
+    Box::new(crate::ivm::fan_in::ArcFanInAsInput::new(fan_in_arc))
 }
 
 struct FanOutAdapter(Arc<Mutex<FanOut>>);
@@ -654,7 +658,7 @@ fn apply_simple_condition(
         op_name(condition),
         value_pos_name_from_cond_right(condition)
     );
-    delegate.decorate_filter_input(Box::new(filter), &name)
+    delegate.decorate_filter_input(Box::new(ArcFilterAsInput::new(filter)), &name)
 }
 
 fn value_pos_name_from_cond_left(cond: &Condition) -> String {
@@ -720,7 +724,7 @@ fn apply_correlated_subquery(
         Some(sq.correlation.child_field.clone()),
     );
     let join_name = format!("{name}:join({alias})");
-    let join = Join::new(JoinArgs {
+    let join = Join::new_wired(JoinArgs {
         parent: end,
         child,
         parent_key: sq.correlation.parent_field.clone(),
@@ -729,7 +733,10 @@ fn apply_correlated_subquery(
         hidden: sq.hidden.unwrap_or(false),
         system: sq.system.unwrap_or(System::Client),
     });
-    delegate.decorate_input(Box::new(join), &join_name)
+    delegate.decorate_input(
+        Box::new(crate::ivm::join::ArcJoinAsInput::new(join)),
+        &join_name,
+    )
 }
 
 // ─── apply_correlated_subquery_condition (EXISTS / NOT EXISTS) ───────
@@ -757,7 +764,7 @@ fn apply_correlated_subquery_condition(
             CorrelatedSubqueryOp::NotExists => Arc::new(|_r| true),
         };
         let filter = Filter::new(input, pred);
-        return Box::new(filter);
+        return Box::new(ArcFilterAsInput::new(filter));
     }
     let alias = related.subquery.alias.clone().expect("alias required");
     let exists_name = format!("{name}:exists({alias})");
@@ -765,13 +772,16 @@ fn apply_correlated_subquery_condition(
         CorrelatedSubqueryOp::EXISTS => ExistsType::Exists,
         CorrelatedSubqueryOp::NotExists => ExistsType::NotExists,
     };
-    let exists = Exists::new(
+    let exists_arc = crate::ivm::exists::Exists::new_wired(
         input,
         alias,
         related.correlation.parent_field.clone(),
         exists_type,
     );
-    delegate.decorate_filter_input(Box::new(exists), &exists_name)
+    delegate.decorate_filter_input(
+        Box::new(crate::ivm::exists::ArcExistsAsInput::new(exists_arc)),
+        &exists_name,
+    )
 }
 
 // ─── Helpers ports ───────────────────────────────────────────────────

@@ -117,6 +117,37 @@ impl Join {
         }
     }
 
+    /// Wired variant: constructs a [`Join`] and immediately installs
+    /// the back-edges TS writes via `parent.setOutput(this)` and
+    /// `child.setOutput(this)` in the constructor. Returns
+    /// `Arc<Mutex<Self>>` so the back-edge adapters (which impl
+    /// `Output`) can hold a strong reference.
+    ///
+    /// Strong cycle (parent/child input → Join) is bounded by
+    /// pipeline lifetime: the driver destroys the whole pipeline
+    /// together on reset / remove_query.
+    pub fn new_wired(args: JoinArgs) -> Arc<Mutex<Self>> {
+        let arc = Arc::new(Mutex::new(Self::new(args)));
+        let parent_back: Box<dyn Output> =
+            Box::new(JoinParentBackEdge(Arc::clone(&arc)));
+        let child_back: Box<dyn Output> =
+            Box::new(JoinChildBackEdge(Arc::clone(&arc)));
+        {
+            let guard = arc.lock().unwrap();
+            guard
+                .parent
+                .lock()
+                .expect("join parent mutex poisoned")
+                .set_output(parent_back);
+            guard
+                .child
+                .lock()
+                .expect("join child mutex poisoned")
+                .set_output(child_back);
+        }
+        arc
+    }
+
     /// Build the relationship factory for a parent node. Clones
     /// Arc-shared references so the factory can outlive a single fetch
     /// call.
@@ -387,6 +418,85 @@ impl Output for Join {
 }
 
 impl Operator for Join {}
+
+/// Back-edge adapter installed on [`Join::parent`] so pushes from the
+/// parent input route into [`Join::push_parent`]. Created by
+/// [`Join::new_wired`]. Strong Arc; see that function for cycle notes.
+pub struct JoinParentBackEdge(pub Arc<Mutex<Join>>);
+
+impl Output for JoinParentBackEdge {
+    fn push<'a>(&'a mut self, change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let guard = self.0.lock().expect("join back-edge mutex poisoned");
+        let items: Vec<Yield> = guard.push_parent(change).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+/// Back-edge adapter installed on [`Join::child`] so pushes from the
+/// child input (e.g. the messages TableSource connection) route into
+/// [`Join::push_child`]. This is the fix for the xyne message-flicker
+/// symptom: without this wire the child's connection `output` slot
+/// stays `None` and `TableSource::push_change` silently drops the
+/// change.
+pub struct JoinChildBackEdge(pub Arc<Mutex<Join>>);
+
+impl Output for JoinChildBackEdge {
+    fn push<'a>(&'a mut self, change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let guard = self.0.lock().expect("join back-edge mutex poisoned");
+        let items: Vec<Yield> = guard.push_child(change).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+/// Adapter that lets a wired [`Arc<Mutex<Join>>`] be plugged back into
+/// the chain as `Box<dyn Input>`. Schema is cached at construction
+/// to keep `get_schema(&self) -> &SourceSchema` lifetime-clean under
+/// the `Arc<Mutex<>>` wrap.
+pub struct ArcJoinAsInput {
+    inner: Arc<Mutex<Join>>,
+    schema: SourceSchema,
+}
+
+impl ArcJoinAsInput {
+    pub fn new(inner: Arc<Mutex<Join>>) -> Self {
+        let schema = inner.lock().unwrap().get_schema().clone();
+        Self { inner, schema }
+    }
+}
+
+impl InputBase for ArcJoinAsInput {
+    fn get_schema(&self) -> &SourceSchema {
+        &self.schema
+    }
+    fn destroy(&mut self) {
+        self.inner.lock().unwrap().destroy();
+    }
+}
+
+impl Input for ArcJoinAsInput {
+    fn set_output(&mut self, output: Box<dyn Output>) {
+        self.inner.lock().unwrap().set_output(output);
+    }
+    fn fetch<'a>(&'a self, req: FetchRequest) -> Stream<'a, NodeOrYield> {
+        let guard = self.inner.lock().unwrap();
+        let items: Vec<NodeOrYield> = guard.fetch(req).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+impl Output for ArcJoinAsInput {
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let mut guard = self.inner.lock().unwrap();
+        let items: Vec<Yield> = guard.push(change, pusher).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+impl Operator for ArcJoinAsInput {}
 
 // ─── Tests ────────────────────────────────────────────────────────────
 

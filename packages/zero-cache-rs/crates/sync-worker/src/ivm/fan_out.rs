@@ -58,6 +58,15 @@ impl FanOut {
         }
     }
 
+    /// Wired variant: matches TS `new FanOut(...)` followed by
+    /// `input.setFilterOutput(this)`. Returns `Arc<Mutex<Self>>`.
+    pub fn new_wired(input: Box<dyn FilterInput>) -> Arc<Mutex<Self>> {
+        let arc = Arc::new(Mutex::new(Self::new(input)));
+        let back: Box<dyn FilterOutput> = Box::new(FanOutPushBackEdge(Arc::clone(&arc)));
+        arc.lock().unwrap().input.set_filter_output(back);
+        arc
+    }
+
     /// TS `setFanIn(fanIn)`.
     pub fn set_fan_in(&self, fan_in: Arc<Mutex<FanIn>>) {
         let mut guard = self.fan_in.lock().expect("fan_out fan_in mutex poisoned");
@@ -203,6 +212,87 @@ impl Output for FanOut {
 }
 
 impl FilterOperator for FanOut {}
+
+/// Back-edge adapter installed on [`FanOut::input`] (a FilterInput).
+/// Created by [`FanOut::new_wired`].
+pub struct FanOutPushBackEdge(pub Arc<Mutex<FanOut>>);
+
+impl Output for FanOutPushBackEdge {
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let mut guard = self.0.lock().expect("fan_out back-edge mutex poisoned");
+        let items: Vec<Yield> = guard.push(change, pusher).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+impl FilterOutput for FanOutPushBackEdge {
+    fn begin_filter(&mut self) {
+        self.0.lock().expect("fan_out back-edge mutex poisoned").begin_filter();
+    }
+    fn end_filter(&mut self) {
+        self.0.lock().expect("fan_out back-edge mutex poisoned").end_filter();
+    }
+    fn filter(&mut self, node: &Node) -> (Stream<'_, Yield>, bool) {
+        let mut guard = self.0.lock().expect("fan_out back-edge mutex poisoned");
+        let (stream, keep) = guard.filter(node);
+        let collected: Vec<Yield> = stream.collect();
+        drop(guard);
+        (Box::new(collected.into_iter()), keep)
+    }
+}
+
+/// Adapter to plug a wired [`Arc<Mutex<FanOut>>`] back into the chain
+/// as `Box<dyn FilterInput>`. Schema cached at construction.
+pub struct ArcFanOutAsInput {
+    inner: Arc<Mutex<FanOut>>,
+    schema: SourceSchema,
+}
+
+impl ArcFanOutAsInput {
+    pub fn new(inner: Arc<Mutex<FanOut>>) -> Self {
+        let schema = inner.lock().unwrap().get_schema().clone();
+        Self { inner, schema }
+    }
+}
+
+impl InputBase for ArcFanOutAsInput {
+    fn get_schema(&self) -> &SourceSchema { &self.schema }
+    fn destroy(&mut self) { self.inner.lock().unwrap().destroy(); }
+}
+
+impl FilterInput for ArcFanOutAsInput {
+    fn set_filter_output(&mut self, output: Box<dyn FilterOutput>) {
+        self.inner.lock().unwrap().set_filter_output(output);
+    }
+}
+
+impl Output for ArcFanOutAsInput {
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let mut guard = self.inner.lock().unwrap();
+        let items: Vec<Yield> = guard.push(change, pusher).collect();
+        drop(guard);
+        Box::new(items.into_iter())
+    }
+}
+
+impl FilterOutput for ArcFanOutAsInput {
+    fn begin_filter(&mut self) {
+        self.inner.lock().unwrap().begin_filter();
+    }
+    fn end_filter(&mut self) {
+        self.inner.lock().unwrap().end_filter();
+    }
+    fn filter(&mut self, node: &Node) -> (Stream<'_, Yield>, bool) {
+        let mut guard = self.inner.lock().unwrap();
+        let (stream, keep) = guard.filter(node);
+        let collected: Vec<Yield> = stream.collect();
+        drop(guard);
+        (Box::new(collected.into_iter()), keep)
+    }
+}
+
+impl FilterOperator for ArcFanOutAsInput {}
 
 // ─── Tests ────────────────────────────────────────────────────────────
 
