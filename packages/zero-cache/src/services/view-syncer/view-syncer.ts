@@ -45,6 +45,7 @@ import type {ZeroConfig} from '../../config/zero-config.ts';
 import type {CustomQueryTransformer} from '../../custom-queries/transform-query.ts';
 import type {HeaderOptions} from '../../custom/fetch.ts';
 import {
+  LATENCY_BOUNDARIES_SECONDS,
   getOrCreateCounter,
   getOrCreateHistogram,
   getOrCreateUpDownCounter,
@@ -267,6 +268,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
   readonly #hydrationTime = getOrCreateHistogram('sync', 'hydration-time', {
     description: 'Time to hydrate a query.',
     unit: 's',
+    advice: {explicitBucketBoundaries: LATENCY_BOUNDARIES_SECONDS},
   });
   readonly #transactionAdvanceTime = getOrCreateHistogram(
     'sync',
@@ -275,6 +277,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       description:
         'Time to advance all queries for a given client group after applying a new transaction to the replica.',
       unit: 's',
+      advice: {explicitBucketBoundaries: LATENCY_BOUNDARIES_SECONDS},
     },
   );
   readonly #queryTransformations = getOrCreateCounter(
@@ -288,6 +291,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
     {
       description: 'Time to transform custom queries via API server',
       unit: 's',
+      advice: {explicitBucketBoundaries: LATENCY_BOUNDARIES_SECONDS},
     },
   );
   readonly #queryTransformationHashChanges = getOrCreateCounter(
