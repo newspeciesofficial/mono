@@ -66,6 +66,12 @@ crossbeam-channel = "0.5"
 dashmap = "6"
 rayon = "1"
 
+# Generators on stable Rust (TS function*/yield equivalent for IVM operators)
+genawaiter = { version = "0.99", default-features = false, features = ["proc_macro"] }
+
+# LIKE/ILIKE pattern matching for AST predicate translation
+regex-lite = "0.1"
+
 # Data structures
 smallvec = { version = "1", features = ["serde"] }
 indexmap = { version = "2", features = ["serde"] }

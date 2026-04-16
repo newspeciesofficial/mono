@@ -212,6 +212,16 @@ export class PipelineDriver {
     assert(!this.#snapshotter.initialized(), 'Already initialized');
     this.#snapshotter.init();
     this.#initAndResetCommon(clientSchema);
+    // Parity log — same key/values emitted by RustPipelineDriverV2.init
+    // so side-by-side diffing tools can confirm both drivers agree on
+    // the post-init world. Keep field order stable.
+    this.#lc.info?.('[ivm:init]', {
+      driver: 'ts',
+      replicaVersion: this.#replicaVersion,
+      syncedTables: this.#tableSpecs.size,
+      allTables: this.#allTableNames.size,
+      primaryKeys: this.#primaryKeys?.size ?? 0,
+    });
   }
 
   /**
@@ -335,6 +345,7 @@ export class PipelineDriver {
   destroy() {
     this.#storage.destroy();
     this.#snapshotter.destroy();
+    this.#lc.info?.('[ivm:destroy]', {driver: 'ts'});
   }
 
   /** @return Map from query ID to PipelineInfo for all added queries. */
@@ -492,15 +503,20 @@ export class PipelineDriver {
         },
       });
 
-      yield* hydrateInternal(
+      let rows = 0;
+      for (const item of hydrateInternal(
         input,
         queryID,
         must(this.#primaryKeys),
         this.#tableSpecs,
-      );
+      )) {
+        if (item !== 'yield') rows++;
+        yield item;
+      }
 
       for (const {table, row} of companionRows) {
         const primaryKey = mustGetPrimaryKey(this.#primaryKeys, table);
+        rows++;
         yield {
           type: 'add',
           queryID,
@@ -511,6 +527,13 @@ export class PipelineDriver {
       }
 
       const hydrationTimeMs = timer.totalElapsed();
+      this.#lc.info?.('[ivm:addQuery]', {
+        driver: 'ts',
+        queryID,
+        transformationHash,
+        hydrationTimeMs,
+        rows,
+      });
       if (runtimeDebugFlags.trackRowCountsVended) {
         if (hydrationTimeMs > this.#logConfig.slowHydrateThreshold) {
           let totalRowsConsidered = 0;

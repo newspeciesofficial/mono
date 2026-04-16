@@ -119,32 +119,32 @@ impl Join {
 
     /// Wired variant: constructs a [`Join`] and immediately installs
     /// the back-edges TS writes via `parent.setOutput(this)` and
-    /// `child.setOutput(this)` in the constructor. Returns
-    /// `Arc<Mutex<Self>>` so the back-edge adapters (which impl
-    /// `Output`) can hold a strong reference.
+    /// `child.setOutput(this)` in the constructor. Returns `Arc<Self>`
+    /// — no outer `Mutex` is used because [`push_parent`] /
+    /// [`push_child`] take `&self` (Join already has interior
+    /// mutability on the fields it actually mutates: `output`,
+    /// `inprogress_child_change`, `parent`, `child`).
     ///
-    /// Strong cycle (parent/child input → Join) is bounded by
-    /// pipeline lifetime: the driver destroys the whole pipeline
-    /// together on reset / remove_query.
-    pub fn new_wired(args: JoinArgs) -> Arc<Mutex<Self>> {
-        let arc = Arc::new(Mutex::new(Self::new(args)));
+    /// The previous `Arc<Mutex<Self>>` form deadlocked on multi-table
+    /// advances because [`JoinChildBackEdge::push`] held the outer
+    /// Mutex across [`push_child`]'s `self.parent.lock()` call — and
+    /// any sibling operator on the same advance whose own back-edge
+    /// happened to lock something downstream of `parent` would find
+    /// the outer Mutex already held and never make progress.
+    pub fn new_wired(args: JoinArgs) -> Arc<Self> {
+        let arc = Arc::new(Self::new(args));
         let parent_back: Box<dyn Output> =
             Box::new(JoinParentBackEdge(Arc::clone(&arc)));
         let child_back: Box<dyn Output> =
             Box::new(JoinChildBackEdge(Arc::clone(&arc)));
-        {
-            let guard = arc.lock().unwrap();
-            guard
-                .parent
-                .lock()
-                .expect("join parent mutex poisoned")
-                .set_output(parent_back);
-            guard
-                .child
-                .lock()
-                .expect("join child mutex poisoned")
-                .set_output(child_back);
-        }
+        arc.parent
+            .lock()
+            .expect("join parent mutex poisoned")
+            .set_output(parent_back);
+        arc.child
+            .lock()
+            .expect("join child mutex poisoned")
+            .set_output(child_back);
         arc
     }
 
@@ -346,18 +346,18 @@ impl Join {
     }
 
     fn push_to_output<'a>(&'a self, change: Change) -> Stream<'a, Yield> {
+        // Do NOT hold `self.parent` lock across downstream `sink.push`.
+        // Downstream operators (Take, etc.) frequently call back into
+        // `Join::fetch` which locks `self.parent`. With std::sync::Mutex
+        // (non-reentrant), the same thread reacquiring the parent lock
+        // deadlocks. Use `self` as the pusher identity instead — Join
+        // implements InputBase via the cached schema.
         let mut out = self.output.lock().expect("join output mutex poisoned");
         match out.as_mut() {
             None => panic!("Output not set"),
             Some(sink) => {
-                // Pusher identity: use the parent input (the upstream this
-                // op represents). We can't easily reborrow; collect eagerly.
-                //
-                // For pusher, lock parent and reborrow its reference for
-                // the call — then drop after collect.
-                let parent_guard = self.parent.lock().expect("join parent mutex poisoned");
-                let pusher: &dyn InputBase = &**parent_guard;
-                let collected: Vec<Yield> = sink.push(change, pusher).collect();
+                let collected: Vec<Yield> =
+                    sink.push(change, self as &dyn InputBase).collect();
                 Box::new(collected.into_iter())
             }
         }
@@ -421,47 +421,50 @@ impl Operator for Join {}
 
 /// Back-edge adapter installed on [`Join::parent`] so pushes from the
 /// parent input route into [`Join::push_parent`]. Created by
-/// [`Join::new_wired`]. Strong Arc; see that function for cycle notes.
-pub struct JoinParentBackEdge(pub Arc<Mutex<Join>>);
+/// [`Join::new_wired`]. Holds [`Arc<Join>`] (no outer Mutex) — the
+/// previous `Arc<Mutex<Join>>` form deadlocked because `push_parent`
+/// internally locks `self.parent` while a sibling operator on the
+/// same advance was still holding it via its own back-edge chain.
+pub struct JoinParentBackEdge(pub Arc<Join>);
 
 impl Output for JoinParentBackEdge {
     fn push<'a>(&'a mut self, change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let guard = self.0.lock().expect("join back-edge mutex poisoned");
-        let items: Vec<Yield> = guard.push_parent(change).collect();
-        drop(guard);
+        eprintln!("[TRACE ivm] Join::parent::push enter");
+        let items: Vec<Yield> = self.0.push_parent(change).collect();
+        eprintln!("[TRACE ivm] Join::parent::push exit yields={}", items.len());
         Box::new(items.into_iter())
     }
 }
 
-/// Back-edge adapter installed on [`Join::child`] so pushes from the
-/// child input (e.g. the messages TableSource connection) route into
-/// [`Join::push_child`]. This is the fix for the xyne message-flicker
-/// symptom: without this wire the child's connection `output` slot
-/// stays `None` and `TableSource::push_change` silently drops the
-/// change.
-pub struct JoinChildBackEdge(pub Arc<Mutex<Join>>);
+/// Back-edge adapter installed on [`Join::child`]. Holds [`Arc<Join>`].
+/// See [`JoinParentBackEdge`] for why no outer Mutex.
+pub struct JoinChildBackEdge(pub Arc<Join>);
 
 impl Output for JoinChildBackEdge {
     fn push<'a>(&'a mut self, change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let guard = self.0.lock().expect("join back-edge mutex poisoned");
-        let items: Vec<Yield> = guard.push_child(change).collect();
-        drop(guard);
+        eprintln!("[TRACE ivm] Join::child::push enter");
+        let items: Vec<Yield> = self.0.push_child(change).collect();
+        eprintln!("[TRACE ivm] Join::child::push exit yields={}", items.len());
         Box::new(items.into_iter())
     }
 }
 
-/// Adapter that lets a wired [`Arc<Mutex<Join>>`] be plugged back into
-/// the chain as `Box<dyn Input>`. Schema is cached at construction
-/// to keep `get_schema(&self) -> &SourceSchema` lifetime-clean under
-/// the `Arc<Mutex<>>` wrap.
+/// Adapter that lets a wired [`Arc<Join>`] be plugged back into the
+/// chain as `Box<dyn Input>`. Schema is cached at construction.
+///
+/// `set_output(&mut self)` and `destroy(&mut self)` from the trait
+/// require `&mut Self` on the adapter, but Join's underlying state is
+/// already protected by interior `Mutex`es on `output`, `parent` and
+/// `child`. We therefore set the output via the inner `Mutex`
+/// directly — no outer `Mutex<Join>` needed.
 pub struct ArcJoinAsInput {
-    inner: Arc<Mutex<Join>>,
+    inner: Arc<Join>,
     schema: SourceSchema,
 }
 
 impl ArcJoinAsInput {
-    pub fn new(inner: Arc<Mutex<Join>>) -> Self {
-        let schema = inner.lock().unwrap().get_schema().clone();
+    pub fn new(inner: Arc<Join>) -> Self {
+        let schema = inner.get_schema().clone();
         Self { inner, schema }
     }
 }
@@ -471,28 +474,37 @@ impl InputBase for ArcJoinAsInput {
         &self.schema
     }
     fn destroy(&mut self) {
-        self.inner.lock().unwrap().destroy();
+        // Match Join::destroy semantics — destroy parent + child
+        // through their interior Mutexes.
+        if let Ok(mut p) = self.inner.parent.lock() {
+            p.destroy();
+        }
+        if let Ok(mut c) = self.inner.child.lock() {
+            c.destroy();
+        }
     }
 }
 
 impl Input for ArcJoinAsInput {
     fn set_output(&mut self, output: Box<dyn Output>) {
-        self.inner.lock().unwrap().set_output(output);
+        // Match Join's set_output via its interior Mutex.
+        *self.inner.output.lock().expect("join output mutex poisoned") =
+            Some(output);
     }
     fn fetch<'a>(&'a self, req: FetchRequest) -> Stream<'a, NodeOrYield> {
-        let guard = self.inner.lock().unwrap();
-        let items: Vec<NodeOrYield> = guard.fetch(req).collect();
-        drop(guard);
+        let items: Vec<NodeOrYield> = self.inner.fetch(req).collect();
         Box::new(items.into_iter())
     }
 }
 
 impl Output for ArcJoinAsInput {
-    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let mut guard = self.inner.lock().unwrap();
-        let items: Vec<Yield> = guard.push(change, pusher).collect();
-        drop(guard);
-        Box::new(items.into_iter())
+    fn push<'a>(&'a mut self, _change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        // Mirrors Join::push (which panics) — Join is push-routed
+        // explicitly via JoinParentBackEdge / JoinChildBackEdge.
+        panic!(
+            "ArcJoinAsInput::push called directly — push routing goes through \
+             JoinParentBackEdge / JoinChildBackEdge"
+        );
     }
 }
 

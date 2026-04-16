@@ -195,6 +195,174 @@ export type ShadowNative = {
     source: TableSourceHandle,
   ): void;
 
+  // ─── PipelineV2 (view_syncer_v2) — production, no diff ────────────
+  //
+  // Mirrors the public surface we actually use in production; JSON-typed
+  // inputs/outputs. No ClientSchema/Snapshotter/table_source handle —
+  // V2 owns its own SQLite connections via `ChannelSource` once tables
+  // are registered.
+
+  pipeline_v2_create(dbPath: string): PipelineV2Handle;
+  pipeline_v2_register_tables(
+    handle: PipelineV2Handle,
+    tablesJson: Record<
+      string,
+      {
+        columns: string[];
+        primaryKey: string[];
+        sort?: Array<[string, 'asc' | 'desc']>;
+      }
+    >,
+  ): void;
+  pipeline_v2_init(handle: PipelineV2Handle, replicaVersion: string): void;
+  pipeline_v2_initialized(handle: PipelineV2Handle): boolean;
+  pipeline_v2_replica_version(handle: PipelineV2Handle): string | null;
+  pipeline_v2_current_version(handle: PipelineV2Handle): string | null;
+  /**
+   * Reset the Rust-side PipelineV2 — clears all chains, query infos,
+   * in-flight hydrations, and lookup sources. Keeps `initialized`
+   * true; caller re-registers tables and calls `pipeline_v2_init` to
+   * refresh the replica version.
+   */
+  pipeline_v2_reset(handle: PipelineV2Handle): void;
+  /**
+   * Release the Rust-side read-snapshot pin and re-pin at the current
+   * DB head. The TS wrapper invokes this after each
+   * `Snapshotter.advance` / `advanceWithoutDiff` / `init` / `reset` so
+   * that subsequent Rust reads (hydrate, getRow, refetch) see the same
+   * version the driver believes it is at. Throws on SQLite error.
+   */
+  pipeline_v2_refresh_snapshot(handle: PipelineV2Handle): void;
+  pipeline_v2_destroy(handle: PipelineV2Handle): void;
+  pipeline_v2_add_query(
+    handle: PipelineV2Handle,
+    transformationHash: string,
+    queryId: string,
+    ast: unknown,
+  ): V2RowChange[];
+  /**
+   * Streaming hydration — start. Returns immediately; rows are drained
+   * via `pipeline_v2_next_chunk`. Pairs with `_next_chunk` to deliver
+   * rows in 100-row batches across the napi boundary, matching TS
+   * `PipelineDriver.addQuery` generator semantics.
+   */
+  pipeline_v2_add_query_start(
+    handle: PipelineV2Handle,
+    transformationHash: string,
+    queryId: string,
+    ast: unknown,
+  ): void;
+  /**
+   * Streaming hydration — drain. Blocks until the next chunk or the
+   * terminal event is ready. Loop in TS until `isFinal === true`.
+   *
+   * `hydrationTimeMs` is non-null only on the terminal chunk.
+   */
+  pipeline_v2_next_chunk(
+    handle: PipelineV2Handle,
+    queryId: string,
+  ): {
+    rows: V2RowChange[];
+    isFinal: boolean;
+    hydrationTimeMs: number | null;
+  };
+  pipeline_v2_add_queries(
+    handle: PipelineV2Handle,
+    batch: Array<{
+      transformationHash: string;
+      queryID: string;
+      ast: unknown;
+    }>,
+  ): Array<{
+    queryID: string;
+    hydrationTimeMs: number;
+    rows: V2RowChange[];
+  }>;
+  pipeline_v2_remove_query(handle: PipelineV2Handle, queryId: string): void;
+  pipeline_v2_advance(
+    handle: PipelineV2Handle,
+    table: string,
+    change: {
+      type: 'add' | 'remove' | 'edit';
+      row: Record<string, unknown>;
+      oldRow?: Record<string, unknown>;
+    },
+  ): V2RowChange[];
+  pipeline_v2_advance_without_diff(
+    handle: PipelineV2Handle,
+    newVersion: string,
+  ): void;
+  pipeline_v2_get_row(
+    handle: PipelineV2Handle,
+    table: string,
+    pk: Record<string, unknown>,
+  ): Record<string, unknown> | null;
+  pipeline_v2_queries(
+    handle: PipelineV2Handle,
+  ): Array<{
+    queryID: string;
+    transformationHash: string;
+    table: string;
+    hydrationTimeMs: number;
+  }>;
+  pipeline_v2_hydration_budget_breakdown(
+    handle: PipelineV2Handle,
+  ): Array<{id: string; table: string; ms: number}>;
+  pipeline_v2_total_hydration_time_ms(handle: PipelineV2Handle): number;
+
+  // ─── Snapshotter (view_syncer_v2::Snapshotter) ──────────────────────
+  //
+  // Rust-owned BEGIN CONCURRENT read-snapshot pinning with leapfrog
+  // prev/curr. Replaces the TS-native `Snapshotter` class — TS becomes
+  // a thin wrapper so both sides share one pinned connection pair and
+  // cannot race on snapshot acquisition.
+
+  snapshotter_create(dbPath: string): SnapshotterHandle;
+  snapshotter_init(handle: SnapshotterHandle): string;
+  snapshotter_initialized(handle: SnapshotterHandle): boolean;
+  snapshotter_current_version(handle: SnapshotterHandle): string | null;
+  snapshotter_prev_version(handle: SnapshotterHandle): string | null;
+  snapshotter_advance(
+    handle: SnapshotterHandle,
+  ): {prevVersion: string; currVersion: string};
+  snapshotter_num_changes_since(
+    handle: SnapshotterHandle,
+    prevVersion: string,
+  ): number;
+  snapshotter_changelog_start(
+    handle: SnapshotterHandle,
+    prevVersion: string,
+  ): void;
+  snapshotter_changelog_next_chunk(
+    handle: SnapshotterHandle,
+  ): {
+    rows: Array<Record<string, unknown>>;
+    isFinal: boolean;
+  };
+  snapshotter_changelog_cleanup(handle: SnapshotterHandle): void;
+  /**
+   * Run a read-only SQL query on the `curr` (current) pinned snapshot.
+   * Returns all matching rows. Used by TS diff iteration for per-row
+   * lookups inside the advance loop.
+   */
+  snapshotter_read_in_curr(
+    handle: SnapshotterHandle,
+    sql: string,
+    params: Array<unknown>,
+    columns: string[],
+  ): Array<Record<string, unknown>>;
+  /**
+   * Run a read-only SQL query on the `prev` pinned snapshot. Errors if
+   * no prev exists yet (i.e. `advance` hasn't been called).
+   */
+  snapshotter_read_in_prev(
+    handle: SnapshotterHandle,
+    sql: string,
+    params: Array<unknown>,
+    columns: string[],
+  ): Array<Record<string, unknown>>;
+  snapshotter_destroy(handle: SnapshotterHandle): void;
+
   /**
    * Shadow factory: open a Rust-side `rusqlite::Connection` on
    * `replicaPath` and wrap it in a `TableSource`. TS keeps its own
@@ -223,8 +391,37 @@ export type ShadowNative = {
 /** Opaque handle to a Rust-side `PipelineDriver`. */
 export type PipelineDriverHandle = {readonly __brand: 'PipelineDriverHandle'};
 
+/** Opaque handle to a Rust-side `view_syncer_v2::PipelineV2`. */
+export type PipelineV2Handle = {readonly __brand: 'PipelineV2Handle'};
+
+/** Opaque handle to a Rust-side `view_syncer_v2::Snapshotter`. */
+export type SnapshotterHandle = {readonly __brand: 'SnapshotterHandle'};
+
 /** Opaque handle to a Rust-side `TableSource`. */
 export type TableSourceHandle = {readonly __brand: 'TableSourceHandle'};
+
+/** Wire shape for a RowChange coming out of PipelineV2. */
+export type V2RowChange =
+  | {
+      type: 'add';
+      queryID: string;
+      table: string;
+      rowKey: Record<string, unknown>;
+      row: Record<string, unknown>;
+    }
+  | {
+      type: 'remove';
+      queryID: string;
+      table: string;
+      rowKey: Record<string, unknown>;
+    }
+  | {
+      type: 'edit';
+      queryID: string;
+      table: string;
+      rowKey: Record<string, unknown>;
+      row: Record<string, unknown>;
+    };
 
 /** Wire shape for a single row change coming out of the Rust shadow. */
 export type ShadowRowChange =

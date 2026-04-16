@@ -105,28 +105,22 @@ impl FlippedJoin {
         }
     }
 
-    /// Wired variant: matches TS `new FlippedJoin(...)` followed by
-    /// `parent.setOutput(this)` and `child.setOutput(this)`. Returns
-    /// `Arc<Mutex<Self>>`.
-    pub fn new_wired(args: FlippedJoinArgs) -> Arc<Mutex<Self>> {
-        let arc = Arc::new(Mutex::new(Self::new(args)));
+    /// Wired variant: returns `Arc<Self>` (no outer Mutex) so back-edges
+    /// forward pushes via `&self` without reentrant-lock deadlock.
+    pub fn new_wired(args: FlippedJoinArgs) -> Arc<Self> {
+        let arc = Arc::new(Self::new(args));
         let parent_back: Box<dyn Output> =
             Box::new(FlippedJoinParentBackEdge(Arc::clone(&arc)));
         let child_back: Box<dyn Output> =
             Box::new(FlippedJoinChildBackEdge(Arc::clone(&arc)));
-        {
-            let guard = arc.lock().unwrap();
-            guard
-                .parent
-                .lock()
-                .expect("flipped_join parent mutex poisoned")
-                .set_output(parent_back);
-            guard
-                .child
-                .lock()
-                .expect("flipped_join child mutex poisoned")
-                .set_output(child_back);
-        }
+        arc.parent
+            .lock()
+            .expect("flipped_join parent mutex poisoned")
+            .set_output(parent_back);
+        arc.child
+            .lock()
+            .expect("flipped_join child mutex poisoned")
+            .set_output(child_back);
         arc
     }
 
@@ -397,16 +391,38 @@ impl FlippedJoin {
     }
 
     fn push_to_output<'a>(&'a self, change: Change) -> Stream<'a, Yield> {
+        // Do NOT hold `self.parent` lock across downstream push — the
+        // downstream may call back into `FlippedJoin::fetch` (which
+        // locks `self.parent`), causing a reentrant Mutex deadlock.
+        // Use `self` as the pusher identity (FlippedJoin implements
+        // InputBase via cached schema).
         let mut out = self.output.lock().expect("flipped-join output poisoned");
         match out.as_mut() {
             None => panic!("Output not set"),
             Some(sink) => {
-                let parent_guard = self.parent.lock().expect("flipped-join parent poisoned");
-                let pusher: &dyn InputBase = &**parent_guard;
-                let collected: Vec<Yield> = sink.push(change, pusher).collect();
+                let collected: Vec<Yield> = sink.push(change, self as &dyn InputBase).collect();
                 Box::new(collected.into_iter())
             }
         }
+    }
+}
+
+impl FlippedJoin {
+    /// &self variant of destroy — call from `Arc<Self>`.
+    pub fn destroy_arc(&self) {
+        {
+            let mut c = self.child.lock().expect("flipped-join child poisoned");
+            c.destroy();
+        }
+        {
+            let mut p = self.parent.lock().expect("flipped-join parent poisoned");
+            p.destroy();
+        }
+    }
+
+    /// &self variant of set_output.
+    pub fn set_output_arc(&self, output: Box<dyn Output>) {
+        *self.output.lock().expect("flipped-join output poisoned") = Some(output);
     }
 }
 
@@ -416,15 +432,7 @@ impl InputBase for FlippedJoin {
     }
 
     fn destroy(&mut self) {
-        // TS: `this.#child.destroy(); this.#parent.destroy();` (note order).
-        {
-            let mut c = self.child.lock().expect("flipped-join child poisoned");
-            c.destroy();
-        }
-        {
-            let mut p = self.parent.lock().expect("flipped-join parent poisoned");
-            p.destroy();
-        }
+        self.destroy_arc();
     }
 }
 
@@ -653,69 +661,64 @@ impl Output for FlippedJoin {
 
 impl Operator for FlippedJoin {}
 
-/// Back-edge installed on [`FlippedJoin::parent`]. Created by
-/// [`FlippedJoin::new_wired`].
-pub struct FlippedJoinParentBackEdge(pub Arc<Mutex<FlippedJoin>>);
+/// Back-edge installed on [`FlippedJoin::parent`]. Holds `Arc<FlippedJoin>`
+/// directly (no outer Mutex); all methods on FlippedJoin already take
+/// `&self` thanks to interior Mutex wrappers.
+pub struct FlippedJoinParentBackEdge(pub Arc<FlippedJoin>);
 
 impl Output for FlippedJoinParentBackEdge {
     fn push<'a>(&'a mut self, change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let guard = self.0.lock().expect("flipped_join back-edge mutex poisoned");
-        let items: Vec<Yield> = guard.push_parent(change).collect();
-        drop(guard);
+        eprintln!("[TRACE ivm] FlippedJoin::parent::push enter");
+        let items: Vec<Yield> = self.0.push_parent(change).collect();
+        eprintln!("[TRACE ivm] FlippedJoin::parent::push exit yields={}", items.len());
         Box::new(items.into_iter())
     }
 }
 
-/// Back-edge installed on [`FlippedJoin::child`]. Created by
-/// [`FlippedJoin::new_wired`].
-pub struct FlippedJoinChildBackEdge(pub Arc<Mutex<FlippedJoin>>);
+/// Back-edge installed on [`FlippedJoin::child`]. Holds `Arc<FlippedJoin>`.
+pub struct FlippedJoinChildBackEdge(pub Arc<FlippedJoin>);
 
 impl Output for FlippedJoinChildBackEdge {
     fn push<'a>(&'a mut self, change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let guard = self.0.lock().expect("flipped_join back-edge mutex poisoned");
-        let items: Vec<Yield> = guard.push_child(change).collect();
-        drop(guard);
+        eprintln!("[TRACE ivm] FlippedJoin::child::push enter");
+        let items: Vec<Yield> = self.0.push_child(change).collect();
+        eprintln!("[TRACE ivm] FlippedJoin::child::push exit yields={}", items.len());
         Box::new(items.into_iter())
     }
 }
 
-/// Adapter to plug a wired [`Arc<Mutex<FlippedJoin>>`] back into the
-/// chain as `Box<dyn Input>`. Schema cached at construction.
+/// Adapter to plug a wired [`Arc<FlippedJoin>`] back into the chain
+/// as `Box<dyn Input>`. Schema cached at construction.
 pub struct ArcFlippedJoinAsInput {
-    inner: Arc<Mutex<FlippedJoin>>,
+    inner: Arc<FlippedJoin>,
     schema: SourceSchema,
 }
 
 impl ArcFlippedJoinAsInput {
-    pub fn new(inner: Arc<Mutex<FlippedJoin>>) -> Self {
-        let schema = inner.lock().unwrap().get_schema().clone();
+    pub fn new(inner: Arc<FlippedJoin>) -> Self {
+        let schema = inner.get_schema().clone();
         Self { inner, schema }
     }
 }
 
 impl InputBase for ArcFlippedJoinAsInput {
     fn get_schema(&self) -> &SourceSchema { &self.schema }
-    fn destroy(&mut self) { self.inner.lock().unwrap().destroy(); }
+    fn destroy(&mut self) { self.inner.destroy_arc(); }
 }
 
 impl Input for ArcFlippedJoinAsInput {
     fn set_output(&mut self, output: Box<dyn Output>) {
-        self.inner.lock().unwrap().set_output(output);
+        self.inner.set_output_arc(output);
     }
     fn fetch<'a>(&'a self, req: FetchRequest) -> Stream<'a, NodeOrYield> {
-        let guard = self.inner.lock().unwrap();
-        let items: Vec<NodeOrYield> = guard.fetch(req).collect();
-        drop(guard);
+        let items: Vec<NodeOrYield> = self.inner.fetch(req).collect();
         Box::new(items.into_iter())
     }
 }
 
 impl Output for ArcFlippedJoinAsInput {
-    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let mut guard = self.inner.lock().unwrap();
-        let items: Vec<Yield> = guard.push(change, pusher).collect();
-        drop(guard);
-        Box::new(items.into_iter())
+    fn push<'a>(&'a mut self, _change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        panic!("ArcFlippedJoinAsInput::push — use push_parent / push_child on FlippedJoin");
     }
 }
 

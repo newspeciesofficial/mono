@@ -92,22 +92,20 @@ pub enum ExistsType {
 
 /// TS `Exists` — filters parent rows on `EXISTS` / `NOT EXISTS`.
 pub struct Exists {
-    input: Box<dyn FilterInput>,
+    input: Mutex<Box<dyn FilterInput>>,
+    schema: SourceSchema,
     relationship_name: String,
     /// TS `#not = type === 'NOT EXISTS'`.
     not: bool,
     parent_join_key: CompoundKey,
     /// TS `#noSizeReuse = areEqual(parentJoinKey, primaryKey)`.
-    ///
-    /// When `true`, the per-parent cache is skipped (since each row has
-    /// a unique join-key value, cache lookups can't hit).
     no_size_reuse: bool,
     /// TS `#cache: Map<string, boolean>`.
-    cache: HashMap<String, bool>,
+    cache: Mutex<HashMap<String, bool>>,
     /// TS `#cacheHitCountsForTesting?: Map<string, number>`.
     cache_hit_counts_for_testing: Option<Arc<Mutex<HashMap<String, usize>>>>,
     /// TS `#inPush`.
-    in_push: bool,
+    in_push: Mutex<bool>,
     output: Mutex<Box<dyn FilterOutput>>,
 }
 
@@ -160,42 +158,128 @@ impl Exists {
         );
         let not = matches!(exists_type, ExistsType::NotExists);
 
-        // TS: #noSizeReuse = areEqual(parentJoinKey, primaryKey)
-        // — element-wise equality.
-        let pk_cols: &[String] = input.get_schema().primary_key.columns();
+        let schema = input.get_schema().clone();
+        let pk_cols: &[String] = schema.primary_key.columns();
         let no_size_reuse =
             parent_join_key.len() == pk_cols.len() && parent_join_key.iter().eq(pk_cols.iter());
 
         Self {
-            input,
+            input: Mutex::new(input),
+            schema,
             relationship_name,
             not,
             parent_join_key,
             no_size_reuse,
-            cache: HashMap::new(),
+            cache: Mutex::new(HashMap::new()),
             cache_hit_counts_for_testing,
-            in_push: false,
+            in_push: Mutex::new(false),
             output: Mutex::new(Box::new(ThrowFilterOutput)),
         }
     }
 
     /// Wired variant: matches TS `new Exists(...)` followed by
-    /// `input.setFilterOutput(this)`. Returns `Arc<Mutex<Self>>`.
+    /// `input.setFilterOutput(this)`. Returns `Arc<Self>`.
     pub fn new_wired(
         input: Box<dyn FilterInput>,
         relationship_name: String,
         parent_join_key: CompoundKey,
         exists_type: ExistsType,
-    ) -> Arc<Mutex<Self>> {
-        let arc = Arc::new(Mutex::new(Self::new(
+    ) -> Arc<Self> {
+        let arc = Arc::new(Self::new(
             input,
             relationship_name,
             parent_join_key,
             exists_type,
-        )));
+        ));
         let back: Box<dyn FilterOutput> = Box::new(ExistsPushBackEdge(Arc::clone(&arc)));
-        arc.lock().unwrap().input.set_filter_output(back);
+        arc.input
+            .lock()
+            .expect("exists input mutex poisoned")
+            .set_filter_output(back);
         arc
+    }
+
+    pub fn destroy_arc(&self) {
+        self.input
+            .lock()
+            .expect("exists input mutex poisoned")
+            .destroy();
+    }
+
+    pub fn set_filter_output_arc(&self, output: Box<dyn FilterOutput>) {
+        *self.output.lock().expect("exists output mutex poisoned") = output;
+    }
+
+    pub fn begin_filter_arc(&self) {
+        let mut o = self.output.lock().expect("exists output mutex poisoned");
+        o.begin_filter();
+    }
+
+    pub fn end_filter_arc(&self) {
+        self.cache.lock().expect("exists cache mutex poisoned").clear();
+        let mut o = self.output.lock().expect("exists output mutex poisoned");
+        o.end_filter();
+    }
+
+    pub fn filter_arc(&self, node: &Node) -> (Vec<Yield>, bool) {
+        let mut exists: Option<bool> = None;
+        let mut collected_yields: Vec<Yield> = Vec::new();
+
+        let in_push = *self.in_push.lock().expect("exists in_push mutex poisoned");
+        if !self.no_size_reuse && !in_push {
+            let key = Self::cache_key(node, &self.parent_join_key);
+            let cached = {
+                let cache_guard = self.cache.lock().expect("exists cache mutex poisoned");
+                cache_guard.get(&key).copied()
+            };
+            match cached {
+                Some(c) => {
+                    exists = Some(c);
+                    if let Some(counts) = &self.cache_hit_counts_for_testing {
+                        let mut map = counts
+                            .lock()
+                            .expect("exists cache-hit counts mutex poisoned");
+                        *map.entry(key.clone()).or_insert(0) += 1;
+                    }
+                }
+                None => {
+                    let (yields, computed) = self.fetch_exists(node);
+                    collected_yields.extend(yields);
+                    exists = Some(computed);
+                    self.cache
+                        .lock()
+                        .expect("exists cache mutex poisoned")
+                        .insert(key, computed);
+                }
+            }
+        }
+
+        let (yields, self_keep) = self.compute_filter(node, exists);
+        collected_yields.extend(yields);
+
+        let keep = if !self_keep {
+            false
+        } else {
+            let mut o = self.output.lock().expect("exists output mutex poisoned");
+            let (downstream_stream, downstream_keep) = o.filter(node);
+            for y in downstream_stream {
+                collected_yields.push(y);
+            }
+            downstream_keep
+        };
+
+        (collected_yields, keep)
+    }
+
+    pub fn push_arc(&self, change: Change, _pusher: &dyn InputBase) -> Vec<Yield> {
+        {
+            let mut flag = self.in_push.lock().expect("exists in_push mutex poisoned");
+            assert!(!*flag, "Unexpected re-entrancy");
+            *flag = true;
+        }
+        let yields = self.push_inner_arc(change);
+        *self.in_push.lock().expect("exists in_push mutex poisoned") = false;
+        yields
     }
 
     /// Compute the cache key from the parent row's join-key columns.
@@ -256,23 +340,21 @@ impl Exists {
         (yields, keep)
     }
 
-    /// TS `#pushWithFilter(change, exists?)`:
-    ///   `if (yield* #filter(change.node, exists)) yield* output.push(change, this)`.
-    ///
-    /// Returns a `Vec<Yield>` — caller re-wraps.  We do not take `self`
-    /// as mut inside the &mut push path; the caller (`push`) is already
-    /// `&mut self`, so we inline this by receiving `&mut` access to the
-    /// output lock guard via closure-style arguments.
-    fn push_with_filter(&mut self, change: Change, exists: Option<bool>) -> Vec<Yield> {
+    /// TS `#pushWithFilter(change, exists?)` — &self variant.
+    fn push_with_filter_arc(&self, change: Change, exists: Option<bool>) -> Vec<Yield> {
         let (mut yields, keep) = self.compute_filter(change.node(), exists);
         if keep {
-            let pusher_ptr: &dyn InputBase = &*self.input;
             let mut o = self.output.lock().expect("exists output mutex poisoned");
-            for y in o.push(change, pusher_ptr) {
+            for y in o.push(change, self as &dyn InputBase) {
                 yields.push(y);
             }
         }
         yields
+    }
+
+    /// Deprecated &mut variant retained for tests; delegates.
+    fn push_with_filter(&mut self, change: Change, exists: Option<bool>) -> Vec<Yield> {
+        self.push_with_filter_arc(change, exists)
     }
 }
 
@@ -280,245 +362,156 @@ impl Exists {
 
 impl InputBase for Exists {
     fn get_schema(&self) -> &SourceSchema {
-        // TS `getSchema(): return this.#input.getSchema();`
-        self.input.get_schema()
+        &self.schema
     }
 
     fn destroy(&mut self) {
-        // TS `destroy(): this.#input.destroy();`
-        self.input.destroy();
+        self.destroy_arc();
     }
 }
 
 impl FilterInput for Exists {
     fn set_filter_output(&mut self, output: Box<dyn FilterOutput>) {
-        *self.output.lock().expect("exists output mutex poisoned") = output;
+        self.set_filter_output_arc(output);
     }
 }
 
 impl FilterOutput for Exists {
     fn begin_filter(&mut self) {
-        // TS: `this.#output.beginFilter();`
-        let mut o = self.output.lock().expect("exists output mutex poisoned");
-        o.begin_filter();
+        self.begin_filter_arc();
     }
 
     fn end_filter(&mut self) {
-        // TS `endFilter`:
-        //   this.#cache = new Map();
-        //   this.#output.endFilter();
-        self.cache.clear();
-        let mut o = self.output.lock().expect("exists output mutex poisoned");
-        o.end_filter();
+        self.end_filter_arc();
     }
 
     fn filter(&mut self, node: &Node) -> (Stream<'_, Yield>, bool) {
-        // Mirrors TS `*filter(node)`.
-        let mut exists: Option<bool> = None;
-        let mut collected_yields: Vec<Yield> = Vec::new();
-
-        if !self.no_size_reuse && !self.in_push {
-            let key = Self::cache_key(node, &self.parent_join_key);
-            match self.cache.get(&key).copied() {
-                Some(cached) => {
-                    exists = Some(cached);
-                    // TS: if cacheHitCountsForTesting, bump.
-                    if let Some(counts) = &self.cache_hit_counts_for_testing {
-                        let mut map = counts
-                            .lock()
-                            .expect("exists cache-hit counts mutex poisoned");
-                        *map.entry(key.clone()).or_insert(0) += 1;
-                    }
-                }
-                None => {
-                    let (yields, computed) = self.fetch_exists(node);
-                    collected_yields.extend(yields);
-                    exists = Some(computed);
-                    self.cache.insert(key, computed);
-                }
-            }
-        }
-
-        // TS: `(yield* this.#filter(node, exists)) && (yield* this.#output.filter(node))`.
-        let (yields, self_keep) = self.compute_filter(node, exists);
-        collected_yields.extend(yields);
-
-        let keep = if !self_keep {
-            // Short-circuit: do NOT call downstream.filter.
-            false
-        } else {
-            let mut o = self.output.lock().expect("exists output mutex poisoned");
-            let (downstream_stream, downstream_keep) = o.filter(node);
-            for y in downstream_stream {
-                collected_yields.push(y);
-            }
-            downstream_keep
-        };
-
-        (Box::new(collected_yields.into_iter()), keep)
+        let (yields, keep) = self.filter_arc(node);
+        (Box::new(yields.into_iter()), keep)
     }
 }
 
 impl Output for Exists {
-    fn push<'a>(&'a mut self, change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        // TS: `assert(!this.#inPush, 'Unexpected re-entrancy');`
-        assert!(!self.in_push, "Unexpected re-entrancy");
-        self.in_push = true;
-
-        // Drop guard: ensures `in_push = false` even on panic (TS
-        // `try/finally`).  We can't use a sub-struct with a mutable
-        // borrow of `self` here, so we rely on catch_unwind-free
-        // semantics: in the normal case we clear the flag at the end;
-        // the panic path is acceptable to leak the flag because the
-        // whole operator is unusable after a panic anyway.  Matches
-        // `push_accumulated.rs` which takes the same tack.
-        let yields = self.push_inner(change);
-        self.in_push = false;
-
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let yields = self.push_arc(change, pusher);
         Box::new(yields.into_iter())
     }
 }
 
 impl FilterOperator for Exists {}
 
-/// Back-edge installed on [`Exists::input`]. Created by
-/// [`Exists::new_wired`].
-pub struct ExistsPushBackEdge(pub Arc<Mutex<Exists>>);
+/// Back-edge installed on [`Exists::input`]. Holds `Arc<Exists>`
+/// directly (no outer Mutex) and forwards via `*_arc` helpers.
+pub struct ExistsPushBackEdge(pub Arc<Exists>);
 
 impl Output for ExistsPushBackEdge {
     fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let mut guard = self.0.lock().expect("exists back-edge mutex poisoned");
-        let items: Vec<Yield> = guard.push(change, pusher).collect();
-        drop(guard);
+        eprintln!("[TRACE ivm] Exists::push enter");
+        let items = self.0.push_arc(change, pusher);
+        eprintln!("[TRACE ivm] Exists::push exit yields={}", items.len());
         Box::new(items.into_iter())
     }
 }
 
 impl FilterOutput for ExistsPushBackEdge {
     fn begin_filter(&mut self) {
-        self.0.lock().expect("exists back-edge mutex poisoned").begin_filter();
+        self.0.begin_filter_arc();
     }
     fn end_filter(&mut self) {
-        self.0.lock().expect("exists back-edge mutex poisoned").end_filter();
+        self.0.end_filter_arc();
     }
     fn filter(&mut self, node: &Node) -> (Stream<'_, Yield>, bool) {
-        let mut guard = self.0.lock().expect("exists back-edge mutex poisoned");
-        let (stream, keep) = guard.filter(node);
-        let collected: Vec<Yield> = stream.collect();
-        drop(guard);
-        (Box::new(collected.into_iter()), keep)
+        let (yields, keep) = self.0.filter_arc(node);
+        (Box::new(yields.into_iter()), keep)
     }
 }
 
-/// Adapter to plug a wired [`Arc<Mutex<Exists>>`] back into the chain
+/// Adapter to plug a wired [`Arc<Exists>`] back into the chain
 /// as `Box<dyn FilterInput>`. Schema cached at construction.
 pub struct ArcExistsAsInput {
-    inner: Arc<Mutex<Exists>>,
+    inner: Arc<Exists>,
     schema: SourceSchema,
 }
 
 impl ArcExistsAsInput {
-    pub fn new(inner: Arc<Mutex<Exists>>) -> Self {
-        let schema = inner.lock().unwrap().get_schema().clone();
+    pub fn new(inner: Arc<Exists>) -> Self {
+        let schema = inner.get_schema().clone();
         Self { inner, schema }
     }
 }
 
 impl InputBase for ArcExistsAsInput {
     fn get_schema(&self) -> &SourceSchema { &self.schema }
-    fn destroy(&mut self) { self.inner.lock().unwrap().destroy(); }
+    fn destroy(&mut self) { self.inner.destroy_arc(); }
 }
 
 impl FilterInput for ArcExistsAsInput {
     fn set_filter_output(&mut self, output: Box<dyn FilterOutput>) {
-        self.inner.lock().unwrap().set_filter_output(output);
+        self.inner.set_filter_output_arc(output);
     }
 }
 
 impl Output for ArcExistsAsInput {
     fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let mut guard = self.inner.lock().unwrap();
-        let items: Vec<Yield> = guard.push(change, pusher).collect();
-        drop(guard);
+        let items = self.inner.push_arc(change, pusher);
         Box::new(items.into_iter())
     }
 }
 
 impl FilterOutput for ArcExistsAsInput {
     fn begin_filter(&mut self) {
-        self.inner.lock().unwrap().begin_filter();
+        self.inner.begin_filter_arc();
     }
     fn end_filter(&mut self) {
-        self.inner.lock().unwrap().end_filter();
+        self.inner.end_filter_arc();
     }
     fn filter(&mut self, node: &Node) -> (Stream<'_, Yield>, bool) {
-        let mut guard = self.inner.lock().unwrap();
-        let (stream, keep) = guard.filter(node);
-        let collected: Vec<Yield> = stream.collect();
-        drop(guard);
-        (Box::new(collected.into_iter()), keep)
+        let (yields, keep) = self.inner.filter_arc(node);
+        (Box::new(yields.into_iter()), keep)
     }
 }
 
 impl FilterOperator for ArcExistsAsInput {}
 
 impl Exists {
-    /// Core of `push` — separated so the outer can manage `#inPush`.
-    fn push_inner(&mut self, change: Change) -> Vec<Yield> {
+    /// &self core of push — interior mutability via Mutex fields.
+    fn push_inner_arc(&self, change: Change) -> Vec<Yield> {
         match change.change_type() {
-            // Branches that cannot change the relationship's size:
-            // simply push-with-filter.
             ChangeType::Add | ChangeType::Edit | ChangeType::Remove => {
-                return self.push_with_filter(change, None);
+                return self.push_with_filter_arc(change, None);
             }
-            ChangeType::Child => {
-                // Fallthrough to child-handling below.
-            }
+            ChangeType::Child => {}
         }
 
-        // From here, `change` is a Child.
         let Change::Child(child_change) = change else {
-            // Unreachable: we matched ChangeType::Child above.
-            unreachable!("push_inner: ChangeType::Child variant expected");
+            unreachable!("push_inner_arc: ChangeType::Child variant expected");
         };
 
-        // TS: "Only add and remove child changes for relationshipName
-        // can change the size of the relationship; other child changes
-        // simply #pushWithFilter."
         let is_target_rel = child_change.child.relationship_name == self.relationship_name;
         let inner_type = child_change.child.change.change_type();
         let is_resizing_inner = matches!(inner_type, ChangeType::Add | ChangeType::Remove);
         if !is_target_rel || !is_resizing_inner {
-            // Reconstruct the Change::Child and push-with-filter.
-            return self.push_with_filter(Change::Child(child_change), None);
+            return self.push_with_filter_arc(Change::Child(child_change), None);
         }
 
-        // We now know:
-        //   - child_change.child.relationship_name == self.relationship_name
-        //   - inner change is Add or Remove
-        //
-        // Fetch current size of the relationship on change.node, then
-        // branch on inner type:
         match inner_type {
-            ChangeType::Add => self.push_child_add(child_change),
-            ChangeType::Remove => self.push_child_remove(child_change),
+            ChangeType::Add => self.push_child_add_arc(child_change),
+            ChangeType::Remove => self.push_child_remove_arc(child_change),
             _ => unreachable!("is_resizing_inner guards above"),
         }
     }
 
-    /// TS child-add branch inside `push`.
-    ///
-    /// - `size == 1` ⇒ this is the first child.
-    ///     * `!not` (EXISTS) ⇒ emit parent `Add`.
-    ///     * `not` (NOT EXISTS) ⇒ emit parent `Remove` with the
-    ///       added child excluded from the parent's relationship.
-    /// - `size > 1` ⇒ push-with-filter, hint exists=true.
-    fn push_child_add(&mut self, child_change: ChildChange) -> Vec<Yield> {
+    /// Deprecated &mut variant kept for tests; delegates.
+    fn push_inner(&mut self, change: Change) -> Vec<Yield> {
+        self.push_inner_arc(change)
+    }
+
+    /// &self child-add branch.
+    fn push_child_add_arc(&self, child_change: ChildChange) -> Vec<Yield> {
         let (mut yields, size) = self.fetch_size(&child_change.node);
 
         if size == 1 {
             let out_change: Change = if self.not {
-                // TS branch: excludes the added child from the relationship.
                 Change::Remove(RemoveChange {
                     node: node_with_relationship_replaced(
                         &child_change.node,
@@ -527,37 +520,25 @@ impl Exists {
                     ),
                 })
             } else {
-                // TS branch: emit Add with original node.
                 Change::Add(crate::ivm::change::AddChange {
                     node: clone_node_shallow(&child_change.node),
                 })
             };
-            let pusher_ptr: &dyn InputBase = &*self.input;
             let mut o = self.output.lock().expect("exists output mutex poisoned");
-            for y in o.push(out_change, pusher_ptr) {
+            for y in o.push(out_change, self as &dyn InputBase) {
                 yields.push(y);
             }
             yields
         } else {
-            // size > 1 (never 0: we just added a child).
-            // TS: `yield* this.#pushWithFilter(change, size > 0);`
-            // (Same value of the hint — exists=true — regardless.)
             let rebuilt = Change::Child(child_change);
-            // Splice the already-collected yields with push_with_filter output.
-            let more = self.push_with_filter(rebuilt, Some(size > 0));
+            let more = self.push_with_filter_arc(rebuilt, Some(size > 0));
             yields.extend(more);
             yields
         }
     }
 
-    /// TS child-remove branch inside `push`.
-    ///
-    /// - `size == 0` ⇒ the removed child was the last one.
-    ///     * `!not` (EXISTS) ⇒ emit parent `Remove` with the removed
-    ///       child re-inserted into the parent's relationship.
-    ///     * `not` (NOT EXISTS) ⇒ emit parent `Add`.
-    /// - `size > 0` ⇒ push-with-filter, hint exists=true.
-    fn push_child_remove(&mut self, child_change: ChildChange) -> Vec<Yield> {
+    /// &self child-remove branch.
+    fn push_child_remove_arc(&self, child_change: ChildChange) -> Vec<Yield> {
         let (mut yields, size) = self.fetch_size(&child_change.node);
 
         if size == 0 {
@@ -566,7 +547,6 @@ impl Exists {
                     node: clone_node_shallow(&child_change.node),
                 })
             } else {
-                // TS: includes the removed child in the parent's relationship.
                 let removed_inner_node = match &*child_change.child.change {
                     Change::Remove(r) => clone_node_shallow(&r.node),
                     _ => unreachable!("caller guarantees inner Remove"),
@@ -583,16 +563,14 @@ impl Exists {
                     ),
                 })
             };
-            let pusher_ptr: &dyn InputBase = &*self.input;
             let mut o = self.output.lock().expect("exists output mutex poisoned");
-            for y in o.push(out_change, pusher_ptr) {
+            for y in o.push(out_change, self as &dyn InputBase) {
                 yields.push(y);
             }
             yields
         } else {
-            // size > 0 — relationship still non-empty after remove.
             let rebuilt = Change::Child(child_change);
-            let more = self.push_with_filter(rebuilt, Some(size > 0));
+            let more = self.push_with_filter_arc(rebuilt, Some(size > 0));
             yields.extend(more);
             yields
         }
@@ -1176,9 +1154,9 @@ mod tests {
 
         let n1 = node_with_rel(row_id_fk(1, 10), "rel", 1);
         let _ = e.filter(&n1).0.count();
-        assert_eq!(e.cache.len(), 1);
+        assert_eq!(e.cache.lock().unwrap().len(), 1);
         e.end_filter();
-        assert_eq!(e.cache.len(), 0, "end_filter must clear cache");
+        assert_eq!(e.cache.lock().unwrap().len(), 0, "end_filter must clear cache");
         assert_eq!(shared.ends.load(AtOrdering::SeqCst), 1);
     }
 
@@ -1571,7 +1549,7 @@ mod tests {
             vec!["fk".into()],
             ExistsType::Exists,
         );
-        e.in_push = true;
+        *e.in_push.lock().unwrap() = true;
         let pusher = dummy_pusher();
         let _ = e
             .push(
@@ -1593,9 +1571,9 @@ mod tests {
             vec!["fk".into()],
             ExistsType::Exists,
         );
-        e.in_push = true;
+        *e.in_push.lock().unwrap() = true;
         let n = node_with_rel(row_id_fk(1, 10), "rel", 1);
         let _ = e.filter(&n).0.count();
-        assert!(e.cache.is_empty(), "in_push path must not populate cache");
+        assert!(e.cache.lock().unwrap().is_empty(), "in_push path must not populate cache");
     }
 }

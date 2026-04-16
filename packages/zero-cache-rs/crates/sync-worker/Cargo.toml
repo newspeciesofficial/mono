@@ -23,6 +23,11 @@ rusqlite = { workspace = true }
 # Each worker's per-query state stays local; only inserts into the
 # shared `pipelines` map cross threads, behind the existing mutex.
 rayon = { workspace = true }
+crossbeam-channel = { workspace = true }
+regex-lite = { workspace = true }
+# Generators on stable Rust — used by IVM operators that mirror
+# TS `function*` / `yield` patterns. Pilot in `ivm/filter_gen.rs`.
+genawaiter = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1"

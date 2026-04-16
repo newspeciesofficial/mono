@@ -58,7 +58,8 @@ enum ComputedStart {
 
 /// TS `Skip` — stateful operator that drops rows preceding its [`Bound`].
 pub struct Skip {
-    input: Box<dyn Input>,
+    input: Mutex<Box<dyn Input>>,
+    schema: SourceSchema,
     bound: Bound,
     comparator: Arc<Comparator>,
     output: Mutex<Box<dyn Output>>,
@@ -66,31 +67,99 @@ pub struct Skip {
 
 impl Skip {
     /// TS `new Skip(input, bound)`.
-    ///
-    /// TS wires the back-edge with `input.setOutput(this)` in the
-    /// constructor. As with [`crate::ivm::filter::Filter`], we defer that
-    /// wiring to the pipeline driver (Rust cannot take `&mut self` while
-    /// `self` is mid-construction).
     pub fn new(input: Box<dyn Input>, bound: Bound) -> Self {
-        // TS: `this.#comparator = input.getSchema().compareRows;`
-        let comparator = Arc::clone(&input.get_schema().compare_rows);
+        let schema = input.get_schema().clone();
+        let comparator = Arc::clone(&schema.compare_rows);
         Self {
-            input,
+            input: Mutex::new(input),
+            schema,
             bound,
             comparator,
             output: Mutex::new(Box::new(ThrowOutput)),
         }
     }
 
-    /// Wired variant: matches TS `new Skip(...)` followed by
-    /// `input.setOutput(this)`. Returns `Arc<Mutex<Self>>` so the
-    /// back-edge adapter ([`SkipPushBackEdge`]) can retain a strong
-    /// reference. Use [`ArcSkipAsInput`] to plug back into the chain.
-    pub fn new_wired(input: Box<dyn Input>, bound: Bound) -> Arc<Mutex<Self>> {
-        let arc = Arc::new(Mutex::new(Self::new(input, bound)));
+    /// Wired variant: returns `Arc<Self>` (no outer Mutex) so back-edges
+    /// forward pushes without reentrant-lock deadlocks.
+    pub fn new_wired(input: Box<dyn Input>, bound: Bound) -> Arc<Self> {
+        let arc = Arc::new(Self::new(input, bound));
         let back: Box<dyn Output> = Box::new(SkipPushBackEdge(Arc::clone(&arc)));
-        arc.lock().unwrap().input.set_output(back);
+        arc.input
+            .lock()
+            .expect("skip input mutex poisoned")
+            .set_output(back);
         arc
+    }
+
+    pub fn destroy_arc(&self) {
+        self.input
+            .lock()
+            .expect("skip input mutex poisoned")
+            .destroy();
+    }
+
+    pub fn set_output_arc(&self, output: Box<dyn Output>) {
+        *self.output.lock().expect("skip output mutex poisoned") = output;
+    }
+
+    pub fn push_arc(&self, change: Change, _pusher: &dyn InputBase) -> Vec<Yield> {
+        let bound_row = self.bound.row.clone();
+        let bound_exclusive = self.bound.exclusive;
+        let comparator = Arc::clone(&self.comparator);
+        let predicate = move |row: &Row| -> bool {
+            let cmp = (comparator)(&bound_row, row);
+            cmp == CmpOrdering::Less || (cmp == CmpOrdering::Equal && !bound_exclusive)
+        };
+
+        match change {
+            Change::Edit(edit_change) => {
+                let mut out = self.output.lock().expect("skip output mutex poisoned");
+                maybe_split_and_push_edit_change(edit_change, &predicate, &mut **out, self as &dyn InputBase)
+                    .collect()
+            }
+            other => {
+                if !predicate(&other.node().row) {
+                    return Vec::new();
+                }
+                let mut out = self.output.lock().expect("skip output mutex poisoned");
+                out.push(other, self as &dyn InputBase).collect()
+            }
+        }
+    }
+
+    pub fn fetch_arc(&self, req: FetchRequest) -> Vec<NodeOrYield> {
+        let reverse = req.reverse.unwrap_or(false);
+        let start = self.get_start(&req);
+        let start = match start {
+            ComputedStart::Empty => return Vec::new(),
+            ComputedStart::PassThrough => None,
+            ComputedStart::Bound(s) => Some(s),
+        };
+        let req_for_upstream = FetchRequest {
+            constraint: req.constraint,
+            reverse: req.reverse,
+            start,
+        };
+        let upstream: Vec<NodeOrYield> = {
+            let guard = self.input.lock().expect("skip input mutex poisoned");
+            guard.fetch(req_for_upstream).collect()
+        };
+        if !reverse {
+            return upstream;
+        }
+        let mut out: Vec<NodeOrYield> = Vec::with_capacity(upstream.len());
+        for item in upstream {
+            match item {
+                NodeOrYield::Yield => out.push(NodeOrYield::Yield),
+                NodeOrYield::Node(node) => {
+                    if !self.should_be_present(&node.row) {
+                        break;
+                    }
+                    out.push(NodeOrYield::Node(node));
+                }
+            }
+        }
+        out
     }
 
     /// TS private method `#shouldBePresent(row)`.
@@ -178,177 +247,79 @@ impl Skip {
 
 impl InputBase for Skip {
     fn get_schema(&self) -> &SourceSchema {
-        // TS: `return this.#input.getSchema();`
-        self.input.get_schema()
+        &self.schema
     }
 
     fn destroy(&mut self) {
-        // TS: `this.#input.destroy();`
-        self.input.destroy();
+        self.destroy_arc();
     }
 }
 
 impl Input for Skip {
     fn set_output(&mut self, output: Box<dyn Output>) {
-        // TS: `setOutput(output) { this.#output = output; }`
-        *self.output.lock().expect("skip output mutex poisoned") = output;
+        self.set_output_arc(output);
     }
 
     fn fetch<'a>(&'a self, req: FetchRequest) -> Stream<'a, NodeOrYield> {
-        // TS:
-        //   const start = this.#getStart(req);
-        //   if (start === 'empty') return;
-        //   const nodes = this.#input.fetch({ ...req, start });
-        //   if (!req.reverse) { yield* nodes; return; }
-        //   for (const node of nodes) {
-        //     if (node === 'yield') { yield node; continue; }
-        //     if (!this.#shouldBePresent(node.row)) return;
-        //     yield node;
-        //   }
-        let reverse = req.reverse.unwrap_or(false);
-
-        let start = self.get_start(&req);
-        let start = match start {
-            ComputedStart::Empty => {
-                return Box::new(std::iter::empty());
-            }
-            ComputedStart::PassThrough => None,
-            ComputedStart::Bound(s) => Some(s),
-        };
-
-        let req_for_upstream = FetchRequest {
-            constraint: req.constraint,
-            reverse: req.reverse,
-            start,
-        };
-
-        // Collect eagerly so borrowed upstream lifetime doesn't leak.
-        let upstream: Vec<NodeOrYield> = self.input.fetch(req_for_upstream).collect();
-
-        if !reverse {
-            // TS: `yield* nodes;` — forward as-is.
-            return Box::new(upstream.into_iter());
-        }
-
-        // Reverse direction — stop at the first node that precedes the bound.
-        let mut out: Vec<NodeOrYield> = Vec::with_capacity(upstream.len());
-        for item in upstream {
-            match item {
-                NodeOrYield::Yield => {
-                    out.push(NodeOrYield::Yield);
-                }
-                NodeOrYield::Node(node) => {
-                    if !self.should_be_present(&node.row) {
-                        // TS: `return;` — abort without yielding this node.
-                        break;
-                    }
-                    out.push(NodeOrYield::Node(node));
-                }
-            }
-        }
-        Box::new(out.into_iter())
+        let items = self.fetch_arc(req);
+        Box::new(items.into_iter())
     }
 }
 
 impl Output for Skip {
-    fn push<'a>(&'a mut self, change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        // TS:
-        //   const shouldBePresent = (row) => this.#shouldBePresent(row);
-        //   if (change.type === 'edit') {
-        //     yield* maybeSplitAndPushEditChange(change, shouldBePresent, this.#output, this);
-        //     return;
-        //   }
-        //   change satisfies AddChange | RemoveChange | ChildChange;
-        //   if (shouldBePresent(change.node.row)) {
-        //     yield* this.#output.push(change, this);
-        //   }
-        //
-        // Rust: predicate captures `Arc<Comparator>` + bound by value so it
-        // doesn't borrow `self` for the lifetime of the delegated stream.
-        let bound_row = self.bound.row.clone();
-        let bound_exclusive = self.bound.exclusive;
-        let comparator = Arc::clone(&self.comparator);
-        let predicate = move |row: &Row| -> bool {
-            let cmp = (comparator)(&bound_row, row);
-            cmp == CmpOrdering::Less || (cmp == CmpOrdering::Equal && !bound_exclusive)
-        };
-
-        match change {
-            Change::Edit(edit_change) => {
-                let mut out = self.output.lock().expect("skip output mutex poisoned");
-                // Pass the upstream as pusher — we can't reborrow `self` as
-                // `&dyn InputBase` while `self` is already mutably borrowed.
-                let pusher: &dyn InputBase = &*self.input;
-                let items: Vec<Yield> =
-                    maybe_split_and_push_edit_change(edit_change, &predicate, &mut **out, pusher)
-                        .collect();
-                Box::new(items.into_iter())
-            }
-            other => {
-                // TS: `change satisfies AddChange | RemoveChange | ChildChange;`
-                if !predicate(&other.node().row) {
-                    return Box::new(std::iter::empty());
-                }
-                let mut out = self.output.lock().expect("skip output mutex poisoned");
-                let pusher: &dyn InputBase = &*self.input;
-                let items: Vec<Yield> = out.push(other, pusher).collect();
-                Box::new(items.into_iter())
-            }
-        }
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let items = self.push_arc(change, pusher);
+        Box::new(items.into_iter())
     }
 }
 
 impl Operator for Skip {}
 
-/// Back-edge adapter installed on [`Skip::input`]. Created by
-/// [`Skip::new_wired`].
-pub struct SkipPushBackEdge(pub Arc<Mutex<Skip>>);
+/// Back-edge adapter installed on [`Skip::input`]. Holds `Arc<Skip>`
+/// directly (no outer Mutex) and forwards via `push_arc`.
+pub struct SkipPushBackEdge(pub Arc<Skip>);
 
 impl Output for SkipPushBackEdge {
     fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let mut guard = self.0.lock().expect("skip back-edge mutex poisoned");
-        let items: Vec<Yield> = guard.push(change, pusher).collect();
-        drop(guard);
+        eprintln!("[TRACE ivm] Skip::push enter");
+        let items = self.0.push_arc(change, pusher);
+        eprintln!("[TRACE ivm] Skip::push exit yields={}", items.len());
         Box::new(items.into_iter())
     }
 }
 
-/// Adapter to plug a wired [`Arc<Mutex<Skip>>`] back into the chain
+/// Adapter to plug a wired [`Arc<Skip>`] back into the chain
 /// as `Box<dyn Input>`. Schema cached at construction.
 pub struct ArcSkipAsInput {
-    inner: Arc<Mutex<Skip>>,
+    inner: Arc<Skip>,
     schema: SourceSchema,
 }
 
 impl ArcSkipAsInput {
-    pub fn new(inner: Arc<Mutex<Skip>>) -> Self {
-        let schema = inner.lock().unwrap().get_schema().clone();
+    pub fn new(inner: Arc<Skip>) -> Self {
+        let schema = inner.get_schema().clone();
         Self { inner, schema }
     }
 }
 
 impl InputBase for ArcSkipAsInput {
     fn get_schema(&self) -> &SourceSchema { &self.schema }
-    fn destroy(&mut self) { self.inner.lock().unwrap().destroy(); }
+    fn destroy(&mut self) { self.inner.destroy_arc(); }
 }
 
 impl Input for ArcSkipAsInput {
     fn set_output(&mut self, output: Box<dyn Output>) {
-        self.inner.lock().unwrap().set_output(output);
+        self.inner.set_output_arc(output);
     }
     fn fetch<'a>(&'a self, req: FetchRequest) -> Stream<'a, NodeOrYield> {
-        let guard = self.inner.lock().unwrap();
-        let items: Vec<NodeOrYield> = guard.fetch(req).collect();
-        drop(guard);
+        let items = self.inner.fetch_arc(req);
         Box::new(items.into_iter())
     }
 }
 
 impl Output for ArcSkipAsInput {
     fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let mut guard = self.inner.lock().unwrap();
-        let items: Vec<Yield> = guard.push(change, pusher).collect();
-        drop(guard);
+        let items = self.inner.push_arc(change, pusher);
         Box::new(items.into_iter())
     }
 }

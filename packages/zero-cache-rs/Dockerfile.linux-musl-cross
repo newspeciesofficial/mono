@@ -1,0 +1,88 @@
+# Cross-build the shadow-ffi .node for x86_64-unknown-linux-musl using
+# napi-rs's officially supported toolchain: cargo-zigbuild + zig as the
+# linker. This is the approach napi-rs uses in its own package-template
+# CI (.github/workflows/CI.yml — `mlugg/setup-zig` + `cargo-zigbuild`).
+# Zig's linker provides musl libc + compiler-rt + libunwind in one
+# self-contained package, sidestepping every libgcc_s / dlopen pitfall
+# we hit with rust-lld and alpine.
+#
+# Usage:
+#   cd packages/zero-cache-rs
+#   docker build --platform linux/amd64 \
+#     -f Dockerfile.linux-musl-cross \
+#     --target export -o crates/shadow-ffi .
+#
+# Outputs into ./crates/shadow-ffi/:
+#   zero-cache-shadow-ffi.linux-x64-musl.node
+
+FROM rust:1.88-bookworm AS builder
+
+# Toolchain:
+#   - clang/libclang for bindgen (dlopen works on glibc bookworm)
+#   - Node 22 for napi-rs CLI
+#   - zig 0.14 + cargo-zigbuild for the musl cross-link
+#   - basic build tools cargo's `cc` build scripts need
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang \
+        libclang-dev \
+        cmake \
+        make \
+        pkg-config \
+        curl \
+        ca-certificates \
+        xz-utils \
+        git \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Zig 0.16.0 — current stable. cargo-zigbuild uses zig as the
+# linker; the version doesn't matter much as long as it can produce
+# musl static binaries.
+RUN curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
+        -o /tmp/zig.tar.xz \
+    && tar -xJf /tmp/zig.tar.xz -C /opt \
+    && ln -sf /opt/zig-x86_64-linux-0.16.0/zig /usr/local/bin/zig \
+    && rm /tmp/zig.tar.xz
+
+# cargo-zigbuild wraps `cargo build` with zig as the linker.
+RUN cargo install --locked cargo-zigbuild
+
+# Bindgen needs libclang via dlopen.
+ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
+
+# Musl Rust target defaults to `+crt-static`, which disables cdylib
+# (the napi `.node` artifact). The runtime (alpine + Node) provides
+# its own libc, so we can safely flip to `-crt-static` and produce a
+# dynamically-linked cdylib.
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+
+WORKDIR /work
+
+# Copy the workspace + vendored sqlite.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY vendor ./vendor
+COPY crates ./crates
+
+# Add the Linux musl Rust target. Done after COPY so that
+# rust-toolchain.toml's pinned channel is in effect.
+RUN rustup target add x86_64-unknown-linux-musl
+
+WORKDIR /work/crates/shadow-ffi
+RUN npm install --no-audit --no-fund @napi-rs/cli@^3
+
+# napi-rs CLI 3.x supports `--use-cross` / zigbuild via env detection,
+# but the simplest reliable path is: build the cdylib via
+# cargo-zigbuild ourselves, then wrap it as a .node file. The .so
+# rename matches the convention napi-rs's own CI uses.
+RUN cargo zigbuild --release --target x86_64-unknown-linux-musl \
+        --package zero-cache-shadow-ffi \
+        --manifest-path /work/Cargo.toml \
+    && cp /work/target/x86_64-unknown-linux-musl/release/libzero_cache_shadow_ffi.so \
+          /work/crates/shadow-ffi/zero-cache-shadow-ffi.linux-x64-musl.node
+
+# Stage 2: just the .node file, exported via `--target export`.
+FROM scratch AS export
+COPY --from=builder \
+    /work/crates/shadow-ffi/zero-cache-shadow-ffi.linux-x64-musl.node \
+    /

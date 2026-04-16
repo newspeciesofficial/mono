@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 
 /// TS `FanIn` — merges N upstream filter streams into one.
 pub struct FanIn {
-    inputs: Vec<Box<dyn FilterInput>>,
+    inputs: Mutex<Vec<Box<dyn FilterInput>>>,
     schema: SourceSchema,
     output: Mutex<Box<dyn FilterOutput>>,
     accumulated_pushes: Mutex<Vec<Change>>,
@@ -42,20 +42,7 @@ pub struct FanIn {
 
 impl FanIn {
     /// TS `new FanIn(fanOut, inputs)`.
-    ///
-    /// Takes the schema from the upstream fan-out directly (instead of
-    /// the fan-out reference, which is the TS shape) — the only thing
-    /// the TS constructor reads from `fanOut` is `fanOut.getSchema()`.
-    /// Decoupling avoids a circular handle between `FanOut` and `FanIn`.
-    ///
-    /// TS asserts that every input's schema is `===` the fan-out schema.
-    /// See module doc for how we adapt that check in Rust.
     pub fn new(schema: SourceSchema, inputs: Vec<Box<dyn FilterInput>>) -> Self {
-        // TS: `assert(this.#schema === input.getSchema(), 'Schema mismatch in fan-in')`.
-        //
-        // We can't compare schema references (they'd be different clones).
-        // Sanity-check table_name / primary_key / sort match — the only
-        // fields observed downstream.
         for input in &inputs {
             let input_schema = input.get_schema();
             assert!(
@@ -75,7 +62,7 @@ impl FanIn {
         }
 
         Self {
-            inputs,
+            inputs: Mutex::new(inputs),
             schema,
             output: Mutex::new(Box::new(ThrowFilterOutput)),
             accumulated_pushes: Mutex::new(Vec::new()),
@@ -84,32 +71,74 @@ impl FanIn {
 
     /// Wired variant: matches TS `new FanIn(...)` followed by
     /// `input.setFilterOutput(this)` for every upstream branch.
-    /// Returns `Arc<Mutex<Self>>`.
-    pub fn new_wired(
-        schema: SourceSchema,
-        inputs: Vec<Box<dyn FilterInput>>,
-    ) -> Arc<Mutex<Self>> {
-        let arc = Arc::new(Mutex::new(Self::new(schema, inputs)));
-        // Wire each branch's filter-output to this FanIn.
-        let n_inputs = arc.lock().unwrap().inputs.len();
+    /// Returns `Arc<Self>` (no outer Mutex) so back-edges push through
+    /// interior `*_arc` helpers without reentrant-lock deadlock.
+    pub fn new_wired(schema: SourceSchema, inputs: Vec<Box<dyn FilterInput>>) -> Arc<Self> {
+        let arc = Arc::new(Self::new(schema, inputs));
+        let n_inputs = arc
+            .inputs
+            .lock()
+            .expect("fan_in inputs mutex poisoned")
+            .len();
         for i in 0..n_inputs {
             let back: Box<dyn FilterOutput> = Box::new(FanInPushBackEdge(Arc::clone(&arc)));
-            arc.lock().unwrap().inputs[i].set_filter_output(back);
+            arc.inputs
+                .lock()
+                .expect("fan_in inputs mutex poisoned")[i]
+                .set_filter_output(back);
         }
         arc
     }
 
-    /// TS `*fanOutDonePushingToAllBranches(fanOutChangeType)`.
-    ///
-    /// Drains `accumulatedPushes` and forwards a single representative
-    /// change downstream. If `#inputs.length === 0` this asserts that no
-    /// pushes were accumulated.
-    pub fn fan_out_done_pushing_to_all_branches<'a>(
-        &'a mut self,
+    /// &self variant of `set_filter_output`.
+    pub fn set_filter_output_arc(&self, output: Box<dyn FilterOutput>) {
+        *self.output.lock().expect("fan_in output mutex poisoned") = output;
+    }
+
+    /// &self variant of `destroy`.
+    pub fn destroy_arc(&self) {
+        let mut inputs = self.inputs.lock().expect("fan_in inputs mutex poisoned");
+        for input in inputs.iter_mut() {
+            input.destroy();
+        }
+    }
+
+    /// &self variant of `push` — enqueues onto accumulated_pushes.
+    pub fn push_arc(&self, change: Change, _pusher: &dyn InputBase) -> Vec<Yield> {
+        self.accumulated_pushes
+            .lock()
+            .expect("fan_in accumulated_pushes mutex poisoned")
+            .push(change);
+        Vec::new()
+    }
+
+    /// &self begin_filter.
+    pub fn begin_filter_arc(&self) {
+        let mut o = self.output.lock().expect("fan_in output mutex poisoned");
+        o.begin_filter();
+    }
+
+    /// &self end_filter.
+    pub fn end_filter_arc(&self) {
+        let mut o = self.output.lock().expect("fan_in output mutex poisoned");
+        o.end_filter();
+    }
+
+    /// &self filter.
+    pub fn filter_arc(&self, node: &Node) -> (Vec<Yield>, bool) {
+        let mut o = self.output.lock().expect("fan_in output mutex poisoned");
+        let (stream, keep) = o.filter(node);
+        let yields: Vec<Yield> = stream.collect();
+        (yields, keep)
+    }
+
+    /// &self variant of `fan_out_done_pushing_to_all_branches`.
+    pub fn fan_out_done_pushing_to_all_branches_arc(
+        &self,
         fan_out_change_type: ChangeType,
-    ) -> Stream<'a, Yield> {
-        // TS: if (this.#inputs.length === 0) { assert(... === 0); return; }
-        if self.inputs.is_empty() {
+    ) -> Vec<Yield> {
+        let inputs_guard = self.inputs.lock().expect("fan_in inputs mutex poisoned");
+        if inputs_guard.is_empty() {
             let accumulated = self
                 .accumulated_pushes
                 .lock()
@@ -118,13 +147,9 @@ impl FanIn {
                 accumulated.is_empty(),
                 "If there are no inputs then fan-in should not receive any pushes."
             );
-            return Box::new(std::iter::empty());
+            return Vec::new();
         }
 
-        // TS: yield* pushAccumulatedChanges(
-        //   #accumulatedPushes, #output, this, fanOutChangeType,
-        //   identity, identity,
-        // );
         let mut accumulated = self
             .accumulated_pushes
             .lock()
@@ -132,18 +157,11 @@ impl FanIn {
         let mut drained: Vec<Change> = accumulated.drain(..).collect();
         drop(accumulated);
 
-        // push_accumulated_changes expects `Output`; we pass our
-        // downstream `FilterOutput` (which extends `Output`).
         let mut out_guard = self.output.lock().expect("fan_in output mutex poisoned");
         let out: &mut dyn Output = &mut **out_guard;
-        // Pusher identity: use the first upstream input as proxy; in the
-        // absence of `this` we can't reborrow (same pattern used
-        // elsewhere in the port). With empty inputs the branch above
-        // handles it.
-        let pusher: &dyn InputBase = &*self.inputs[0];
+        let pusher: &dyn InputBase = &**&inputs_guard[0];
         let identity_merge = |_l: Change, r: Change| r;
         let identity_empty = |c: Change| c;
-        // Collect eagerly so we can release `out_guard` before returning.
         let collected: Vec<Yield> = push_accumulated_changes(
             &mut drained,
             out,
@@ -154,147 +172,129 @@ impl FanIn {
         )
         .collect();
         drop(out_guard);
-        Box::new(collected.into_iter())
+        drop(inputs_guard);
+        collected
+    }
+
+    /// Deprecated &mut variant kept for tests.
+    pub fn fan_out_done_pushing_to_all_branches<'a>(
+        &'a mut self,
+        fan_out_change_type: ChangeType,
+    ) -> Stream<'a, Yield> {
+        let items = self.fan_out_done_pushing_to_all_branches_arc(fan_out_change_type);
+        Box::new(items.into_iter())
     }
 }
 
 impl InputBase for FanIn {
     fn get_schema(&self) -> &SourceSchema {
-        // TS: `return this.#schema;`
         &self.schema
     }
 
     fn destroy(&mut self) {
-        // TS: `for (const input of this.#inputs) input.destroy();`
-        for input in self.inputs.iter_mut() {
-            input.destroy();
-        }
+        self.destroy_arc();
     }
 }
 
 impl FilterInput for FanIn {
     fn set_filter_output(&mut self, output: Box<dyn FilterOutput>) {
-        // TS: `this.#output = output;`
-        *self.output.lock().expect("fan_in output mutex poisoned") = output;
+        self.set_filter_output_arc(output);
     }
 }
 
 impl FilterOutput for FanIn {
     fn begin_filter(&mut self) {
-        // TS: `this.#output.beginFilter();`
-        let mut o = self.output.lock().expect("fan_in output mutex poisoned");
-        o.begin_filter();
+        self.begin_filter_arc();
     }
 
     fn end_filter(&mut self) {
-        // TS: `this.#output.endFilter();`
-        let mut o = self.output.lock().expect("fan_in output mutex poisoned");
-        o.end_filter();
+        self.end_filter_arc();
     }
 
     fn filter(&mut self, node: &Node) -> (Stream<'_, Yield>, bool) {
-        // TS: `return yield* this.#output.filter(node);`
-        let mut o = self.output.lock().expect("fan_in output mutex poisoned");
-        let (stream, keep) = o.filter(node);
-        // Drain eagerly so the lock can be released.
-        let yields: Vec<Yield> = stream.collect();
+        let (yields, keep) = self.filter_arc(node);
         (Box::new(yields.into_iter()), keep)
     }
 }
 
 impl Output for FanIn {
-    fn push<'a>(&'a mut self, change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        // TS:
-        //   push(change: Change) {
-        //     this.#accumulatedPushes.push(change);
-        //     return emptyArray;
-        //   }
-        self.accumulated_pushes
-            .lock()
-            .expect("fan_in accumulated_pushes mutex poisoned")
-            .push(change);
-        Box::new(std::iter::empty())
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let items = self.push_arc(change, pusher);
+        Box::new(items.into_iter())
     }
 }
 
 impl FilterOperator for FanIn {}
 
 /// Back-edge adapter installed on every [`FanIn::inputs`] entry.
-/// Created by [`FanIn::new_wired`].
-pub struct FanInPushBackEdge(pub Arc<Mutex<FanIn>>);
+/// Created by [`FanIn::new_wired`]. Holds `Arc<FanIn>` directly (no
+/// outer Mutex) and delegates to `*_arc` helpers.
+pub struct FanInPushBackEdge(pub Arc<FanIn>);
 
 impl Output for FanInPushBackEdge {
     fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let mut guard = self.0.lock().expect("fan_in back-edge mutex poisoned");
-        let items: Vec<Yield> = guard.push(change, pusher).collect();
-        drop(guard);
+        eprintln!("[TRACE ivm] FanIn::push enter");
+        let items = self.0.push_arc(change, pusher);
+        eprintln!("[TRACE ivm] FanIn::push exit yields={}", items.len());
         Box::new(items.into_iter())
     }
 }
 
 impl FilterOutput for FanInPushBackEdge {
     fn begin_filter(&mut self) {
-        self.0.lock().expect("fan_in back-edge mutex poisoned").begin_filter();
+        self.0.begin_filter_arc();
     }
     fn end_filter(&mut self) {
-        self.0.lock().expect("fan_in back-edge mutex poisoned").end_filter();
+        self.0.end_filter_arc();
     }
     fn filter(&mut self, node: &Node) -> (Stream<'_, Yield>, bool) {
-        let mut guard = self.0.lock().expect("fan_in back-edge mutex poisoned");
-        let (stream, keep) = guard.filter(node);
-        let collected: Vec<Yield> = stream.collect();
-        drop(guard);
-        (Box::new(collected.into_iter()), keep)
+        let (yields, keep) = self.0.filter_arc(node);
+        (Box::new(yields.into_iter()), keep)
     }
 }
 
-/// Adapter to plug a wired [`Arc<Mutex<FanIn>>`] back into the chain
+/// Adapter to plug a wired [`Arc<FanIn>`] back into the chain
 /// as `Box<dyn FilterInput>`. Schema cached at construction.
 pub struct ArcFanInAsInput {
-    inner: Arc<Mutex<FanIn>>,
+    inner: Arc<FanIn>,
     schema: SourceSchema,
 }
 
 impl ArcFanInAsInput {
-    pub fn new(inner: Arc<Mutex<FanIn>>) -> Self {
-        let schema = inner.lock().unwrap().get_schema().clone();
+    pub fn new(inner: Arc<FanIn>) -> Self {
+        let schema = inner.get_schema().clone();
         Self { inner, schema }
     }
 }
 
 impl InputBase for ArcFanInAsInput {
     fn get_schema(&self) -> &SourceSchema { &self.schema }
-    fn destroy(&mut self) { self.inner.lock().unwrap().destroy(); }
+    fn destroy(&mut self) { self.inner.destroy_arc(); }
 }
 
 impl FilterInput for ArcFanInAsInput {
     fn set_filter_output(&mut self, output: Box<dyn FilterOutput>) {
-        self.inner.lock().unwrap().set_filter_output(output);
+        self.inner.set_filter_output_arc(output);
     }
 }
 
 impl Output for ArcFanInAsInput {
     fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let mut guard = self.inner.lock().unwrap();
-        let items: Vec<Yield> = guard.push(change, pusher).collect();
-        drop(guard);
+        let items = self.inner.push_arc(change, pusher);
         Box::new(items.into_iter())
     }
 }
 
 impl FilterOutput for ArcFanInAsInput {
     fn begin_filter(&mut self) {
-        self.inner.lock().unwrap().begin_filter();
+        self.inner.begin_filter_arc();
     }
     fn end_filter(&mut self) {
-        self.inner.lock().unwrap().end_filter();
+        self.inner.end_filter_arc();
     }
     fn filter(&mut self, node: &Node) -> (Stream<'_, Yield>, bool) {
-        let mut guard = self.inner.lock().unwrap();
-        let (stream, keep) = guard.filter(node);
-        let collected: Vec<Yield> = stream.collect();
-        drop(guard);
-        (Box::new(collected.into_iter()), keep)
+        let (yields, keep) = self.inner.filter_arc(node);
+        (Box::new(yields.into_iter()), keep)
     }
 }
 

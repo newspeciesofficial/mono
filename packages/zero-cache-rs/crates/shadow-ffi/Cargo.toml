@@ -28,6 +28,10 @@ zero-cache-types = { workspace = true }
 # its own connection on the same file; WAL handles concurrency.
 rusqlite = { workspace = true }
 
+# Used by snapshotter's changelog iteration — the handle holds a receiver
+# while TS drains chunks across multiple napi calls.
+crossbeam-channel = { workspace = true }
+
 [build-dependencies]
 napi-build = "2"
 

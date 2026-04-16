@@ -198,15 +198,12 @@ fn make_partition_key_comparator(partition_key: &[String]) -> Comparator {
 
 /// TS `Take` — a bounded (`limit`) operator, optionally partitioned.
 pub struct Take {
-    input: Box<dyn Input>,
+    input: Mutex<Box<dyn Input>>,
+    schema: SourceSchema,
     storage: Mutex<Box<dyn Storage>>,
     limit: usize,
     partition_key: Option<PartitionKey>,
-    /// TS `#partitionKeyComparator` — used to assert edits don't cross
-    /// partition boundaries.
     partition_key_comparator: Option<Comparator>,
-    /// TS `#rowHiddenFromFetch` — transient fetch overlay during split
-    /// pushes.
     row_hidden_from_fetch: Mutex<Option<Row>>,
     output: Mutex<Box<dyn Output>>,
 }
@@ -227,16 +224,14 @@ impl Take {
         // `usize` cannot be negative; we still document the contract.
         //
         // TS: `assertOrderingIncludesPK(input.getSchema().sort, ... .primaryKey)`.
-        let schema = input.get_schema();
+        let schema = input.get_schema().clone();
         assert_ordering_includes_pk(&schema.sort, schema.primary_key.columns());
-        // TS: `input.setOutput(this)` — we defer back-edge wiring to the
-        // pipeline driver, matching `filter.rs` (same Rust ownership
-        // cycle reason).
         let partition_key_comparator = partition_key
             .as_ref()
             .map(|k| make_partition_key_comparator(k));
         Self {
-            input,
+            input: Mutex::new(input),
+            schema,
             storage: Mutex::new(storage),
             limit,
             partition_key,
@@ -246,21 +241,47 @@ impl Take {
         }
     }
 
-    /// Wired variant: matches TS `new Take(...)` followed by
-    /// `input.setOutput(this)`. Returns `Arc<Mutex<Self>>` so the
-    /// back-edge adapter ([`TakePushBackEdge`]) can retain a strong
-    /// reference. Use [`ArcTakeAsInput`] to plug the result back
-    /// into the chain as `Box<dyn Input>`.
+    /// Wired variant: returns `Arc<Self>` (no outer Mutex) so the
+    /// back-edge forwards pushes via `&self` without reentrant-lock
+    /// deadlocks.
     pub fn new_wired(
         input: Box<dyn Input>,
         storage: Box<dyn Storage>,
         limit: usize,
         partition_key: Option<PartitionKey>,
-    ) -> Arc<Mutex<Self>> {
-        let arc = Arc::new(Mutex::new(Self::new(input, storage, limit, partition_key)));
+    ) -> Arc<Self> {
+        let arc = Arc::new(Self::new(input, storage, limit, partition_key));
         let back: Box<dyn Output> = Box::new(TakePushBackEdge(Arc::clone(&arc)));
-        arc.lock().unwrap().input.set_output(back);
+        arc.input
+            .lock()
+            .expect("take input mutex poisoned")
+            .set_output(back);
         arc
+    }
+
+    /// &self destroy.
+    pub fn destroy_arc(&self) {
+        self.input
+            .lock()
+            .expect("take input mutex poisoned")
+            .destroy();
+    }
+
+    /// &self set_output.
+    pub fn set_output_arc(&self, output: Box<dyn Output>) {
+        *self.output.lock().expect("take output mutex poisoned") = output;
+    }
+
+    /// Lock input, perform fetch, collect results. Used by all internal
+    /// fetch sites — the Mutex<Box<dyn Input>> wrap requires us to drain
+    /// eagerly before returning since the stream borrows the guard.
+    fn input_fetch(&self, req: FetchRequest) -> Vec<NodeOrYield> {
+        eprintln!("[TRACE Take] input_fetch: locking input");
+        let guard = self.input.lock().expect("take input mutex poisoned");
+        eprintln!("[TRACE Take] input_fetch: locked input, calling upstream.fetch");
+        let r: Vec<NodeOrYield> = guard.fetch(req).collect();
+        eprintln!("[TRACE Take] input_fetch: upstream.fetch done, items={}", r.len());
+        r
     }
 
     fn storage_get(&self, key: &str) -> Option<JsonValue> {
@@ -298,7 +319,7 @@ impl Take {
             let update_max = match max_bound {
                 None => true,
                 Some(mb) => {
-                    let cmp = (self.input.get_schema().compare_rows)(b, mb);
+                    let cmp = ((&self.schema).compare_rows)(b, mb);
                     cmp == std::cmp::Ordering::Greater
                 }
             };
@@ -355,7 +376,7 @@ impl Take {
             return Vec::new();
         };
 
-        let schema = self.input.get_schema();
+        let schema = (&self.schema);
         let compare_rows = Arc::clone(&schema.compare_rows);
         let hidden = self
             .row_hidden_from_fetch
@@ -364,7 +385,7 @@ impl Take {
             .clone();
 
         let mut out: Vec<NodeOrYield> = Vec::new();
-        for inode in self.input.fetch(req) {
+        for inode in self.input_fetch(req) {
             match inode {
                 NodeOrYield::Yield => {
                     out.push(NodeOrYield::Yield);
@@ -393,11 +414,11 @@ impl Take {
         let Some(max_bound) = self.get_max_bound() else {
             return Vec::new();
         };
-        let schema = self.input.get_schema();
+        let schema = (&self.schema);
         let compare_rows = Arc::clone(&schema.compare_rows);
 
         let mut out: Vec<NodeOrYield> = Vec::new();
-        for inode in self.input.fetch(req) {
+        for inode in self.input_fetch(req) {
             match inode {
                 NodeOrYield::Yield => {
                     out.push(NodeOrYield::Yield);
@@ -458,7 +479,7 @@ impl Take {
         let mut size: usize = 0;
         let mut bound: Option<Row> = None;
         let mut out: Vec<NodeOrYield> = Vec::new();
-        for inode in self.input.fetch(req) {
+        for inode in self.input_fetch(req) {
             match inode {
                 NodeOrYield::Yield => {
                     out.push(NodeOrYield::Yield);
@@ -503,9 +524,13 @@ impl Take {
 
     /// Call the downstream output's `push` and collect yields.
     fn output_push(&self, change: Change, pusher: &dyn InputBase) -> Vec<Yield> {
+        eprintln!("[TRACE Take] output_push: locking output");
         let mut o = self.output.lock().expect("take output mutex poisoned");
+        eprintln!("[TRACE Take] output_push: locked output, calling downstream.push");
         let stream = o.push(change, pusher);
-        stream.collect()
+        let r: Vec<Yield> = stream.collect();
+        eprintln!("[TRACE Take] output_push: downstream.push done, yields={}", r.len());
+        r
     }
 }
 
@@ -529,11 +554,11 @@ fn assert_ordering_includes_pk(sort: &[(String, zero_cache_types::ast::Direction
 
 impl InputBase for Take {
     fn get_schema(&self) -> &SourceSchema {
-        self.input.get_schema()
+        (&self.schema)
     }
 
     fn destroy(&mut self) {
-        self.input.destroy();
+        self.destroy_arc();
     }
 }
 
@@ -563,13 +588,7 @@ impl Input for Take {
 }
 
 impl Output for Take {
-    fn push<'a>(&'a mut self, change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        // Borrow the upstream as `&dyn InputBase` to forward downstream
-        // as the pusher identity. This matches `filter.rs`: `&*self.input`
-        // is a shared reborrow and `self.input` is never mutably
-        // borrowed concurrently below (internal mutation happens through
-        // the `Mutex`s on `storage` / `output` / `row_hidden_from_fetch`).
-        let pusher: &dyn InputBase = &*self.input;
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
         let yields = self.push_impl(change, pusher);
         Box::new(yields.into_iter())
     }
@@ -577,56 +596,51 @@ impl Output for Take {
 
 impl Operator for Take {}
 
-/// Back-edge adapter installed on [`Take::input`] so pushes from the
-/// upstream (source connection) route into [`Take::push`]. Created by
-/// [`Take::new_wired`].
-pub struct TakePushBackEdge(pub Arc<Mutex<Take>>);
+/// Back-edge adapter installed on [`Take::input`]. Holds `Arc<Take>`
+/// directly (no outer Mutex) and forwards via `push_impl`.
+pub struct TakePushBackEdge(pub Arc<Take>);
 
 impl Output for TakePushBackEdge {
     fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let mut guard = self.0.lock().expect("take back-edge mutex poisoned");
-        let items: Vec<Yield> = guard.push(change, pusher).collect();
-        drop(guard);
+        eprintln!("[TRACE ivm] Take::push enter");
+        let items = self.0.push_impl(change, pusher);
+        eprintln!("[TRACE ivm] Take::push exit yields={}", items.len());
         Box::new(items.into_iter())
     }
 }
 
-/// Adapter that lets a wired [`Arc<Mutex<Take>>`] be plugged back into
-/// the chain as `Box<dyn Input>`. Schema cached at construction.
+/// Adapter that lets a wired [`Arc<Take>`] be plugged back into the
+/// chain as `Box<dyn Input>`. Schema cached at construction.
 pub struct ArcTakeAsInput {
-    inner: Arc<Mutex<Take>>,
+    inner: Arc<Take>,
     schema: SourceSchema,
 }
 
 impl ArcTakeAsInput {
-    pub fn new(inner: Arc<Mutex<Take>>) -> Self {
-        let schema = inner.lock().unwrap().get_schema().clone();
+    pub fn new(inner: Arc<Take>) -> Self {
+        let schema = inner.get_schema().clone();
         Self { inner, schema }
     }
 }
 
 impl InputBase for ArcTakeAsInput {
     fn get_schema(&self) -> &SourceSchema { &self.schema }
-    fn destroy(&mut self) { self.inner.lock().unwrap().destroy(); }
+    fn destroy(&mut self) { self.inner.destroy_arc(); }
 }
 
 impl Input for ArcTakeAsInput {
     fn set_output(&mut self, output: Box<dyn Output>) {
-        self.inner.lock().unwrap().set_output(output);
+        self.inner.set_output_arc(output);
     }
     fn fetch<'a>(&'a self, req: FetchRequest) -> Stream<'a, NodeOrYield> {
-        let guard = self.inner.lock().unwrap();
-        let items: Vec<NodeOrYield> = guard.fetch(req).collect();
-        drop(guard);
+        let items: Vec<NodeOrYield> = self.inner.fetch(req).collect();
         Box::new(items.into_iter())
     }
 }
 
 impl Output for ArcTakeAsInput {
     fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let mut guard = self.inner.lock().unwrap();
-        let items: Vec<Yield> = guard.push(change, pusher).collect();
-        drop(guard);
+        let items = self.inner.push_impl(change, pusher);
         Box::new(items.into_iter())
     }
 }
@@ -636,21 +650,26 @@ impl Operator for ArcTakeAsInput {}
 impl Take {
     fn push_impl(&self, change: Change, pusher: &dyn InputBase) -> Vec<Yield> {
         // TS `push(change)`.
+        eprintln!("[TRACE Take] push_impl enter type={:?}", change.change_type());
         if let Change::Edit(edit) = &change {
+            eprintln!("[TRACE Take] push_impl → push_edit_change");
             return self.push_edit_change(edit.clone(), pusher);
         }
 
         let row_ref = change.node().row.clone();
+        eprintln!("[TRACE Take] push_impl → get_state_and_constraint");
         let (take_state, take_state_key, max_bound, constraint) =
             self.get_state_and_constraint(&row_ref);
         let Some(take_state) = take_state else {
+            eprintln!("[TRACE Take] push_impl no take_state, return empty");
             return Vec::new();
         };
 
-        let compare_rows = Arc::clone(&self.input.get_schema().compare_rows);
+        let compare_rows = Arc::clone(&(&self.schema).compare_rows);
 
         match &change {
             Change::Add(AddChange { node }) => {
+                eprintln!("[TRACE Take] push_impl Add: size={} limit={}", take_state.size, self.limit);
                 if take_state.size < self.limit {
                     // Below limit: accept unconditionally and maybe extend bound.
                     let new_bound = match take_state.bound.as_ref() {
@@ -669,19 +688,26 @@ impl Take {
                         new_bound,
                         max_bound.as_ref(),
                     );
-                    return self.output_push(change, pusher);
+                    eprintln!("[TRACE Take] push_impl → output_push (below-limit Add)");
+                    let r = self.output_push(change, pusher);
+                    eprintln!("[TRACE Take] push_impl ← output_push returned, yields={}", r.len());
+                    return r;
                 }
                 // At limit. Reject if >= bound.
+                eprintln!("[TRACE Take] push_impl at-limit: getting bound");
                 let bound = take_state
                     .bound
                     .as_ref()
                     .expect("size == limit implies bound set");
+                eprintln!("[TRACE Take] push_impl at-limit: comparing row to bound");
                 if compare_rows(&node.row, bound) != std::cmp::Ordering::Less {
+                    eprintln!("[TRACE Take] push_impl at-limit: row >= bound, reject");
                     return Vec::new();
                 }
-                // Row goes strictly below bound: evict the current bound.
+                eprintln!("[TRACE Take] push_impl at-limit: row < bound, calling find_evict_targets");
                 let (bound_node, before_bound_node) =
                     self.find_evict_targets(bound, constraint.as_ref());
+                eprintln!("[TRACE Take] push_impl at-limit: find_evict_targets done");
                 let bound_node = bound_node.expect("Take: boundNode must be found during fetch");
 
                 let remove_change = Change::Remove(RemoveChange {
@@ -733,7 +759,7 @@ impl Take {
                         reverse: Some(true),
                     };
                     let mut out: Option<Node> = None;
-                    for n in self.input.fetch(req) {
+                    for n in self.input_fetch(req) {
                         match n {
                             NodeOrYield::Yield => continue,
                             NodeOrYield::Node(node) => {
@@ -762,7 +788,7 @@ impl Take {
                         constraint: constraint.clone(),
                         reverse: Some(false),
                     };
-                    for n in self.input.fetch(req) {
+                    for n in self.input_fetch(req) {
                         match n {
                             NodeOrYield::Yield => continue,
                             NodeOrYield::Node(node) => {
@@ -841,7 +867,7 @@ impl Take {
                 reverse: Some(false),
             };
             let mut bound_node: Option<Node> = None;
-            for n in self.input.fetch(req) {
+            for n in self.input_fetch(req) {
                 match n {
                     NodeOrYield::Yield => continue,
                     NodeOrYield::Node(node) => {
@@ -862,7 +888,7 @@ impl Take {
             };
             let mut bound_node: Option<Node> = None;
             let mut before_bound: Option<Node> = None;
-            for n in self.input.fetch(req) {
+            for n in self.input_fetch(req) {
                 match n {
                     NodeOrYield::Yield => continue,
                     NodeOrYield::Node(node) => {
@@ -894,7 +920,7 @@ impl Take {
             return Vec::new();
         };
         let bound = take_state.bound.clone().expect("Bound should be set");
-        let compare_rows = Arc::clone(&self.input.get_schema().compare_rows);
+        let compare_rows = Arc::clone(&(&self.schema).compare_rows);
         let old_cmp = compare_rows(&change.old_node.row, &bound);
         let new_cmp = compare_rows(&change.node.row, &bound);
 
@@ -930,7 +956,7 @@ impl Take {
                     reverse: Some(true),
                 };
                 let mut before_bound: Option<Node> = None;
-                for n in self.input.fetch(req) {
+                for n in self.input_fetch(req) {
                     match n {
                         NodeOrYield::Yield => continue,
                         NodeOrYield::Node(node) => {
@@ -963,7 +989,7 @@ impl Take {
                 reverse: Some(false),
             };
             let mut new_bound_node: Option<Node> = None;
-            for n in self.input.fetch(req) {
+            for n in self.input_fetch(req) {
                 match n {
                     NodeOrYield::Yield => continue,
                     NodeOrYield::Node(node) => {
@@ -1022,7 +1048,7 @@ impl Take {
             };
             let mut old_bound_node: Option<Node> = None;
             let mut new_bound_node: Option<Node> = None;
-            for n in self.input.fetch(req) {
+            for n in self.input_fetch(req) {
                 match n {
                     NodeOrYield::Yield => continue,
                     NodeOrYield::Node(node) => {
@@ -1083,7 +1109,7 @@ impl Take {
             reverse: Some(false),
         };
         let mut after_bound: Option<Node> = None;
-        for n in self.input.fetch(req) {
+        for n in self.input_fetch(req) {
             match n {
                 NodeOrYield::Yield => continue,
                 NodeOrYield::Node(node) => {

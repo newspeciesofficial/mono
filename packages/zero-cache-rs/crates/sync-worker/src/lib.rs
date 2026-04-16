@@ -15,9 +15,6 @@
 //! Shadow exposure happens in `crates/shadow-ffi/src/exports/sync_worker/`.
 //! This crate stays pure Rust; it doesn't know about napi.
 
-pub mod builder;
 pub mod ivm;
-pub mod planner;
-pub mod query;
-pub mod view_syncer;
-pub mod zqlite;
+pub mod ivm_v2;
+pub mod view_syncer_v2;

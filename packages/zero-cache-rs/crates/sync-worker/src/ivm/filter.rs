@@ -24,48 +24,49 @@ use crate::ivm::stream::Stream;
 use zero_cache_types::value::Row;
 
 /// Arc-based back-edge for [`Filter`]. Wires the back-pointer that TS
-/// `input.setFilterOutput(this)` installs in the constructor, without
-/// a Rust ownership cycle by holding a strong `Arc<Mutex<Filter>>` —
-/// pipelines are short-lived so the strong cycle (child input → parent
-/// Filter) is acceptable (the whole pipeline is destroyed together).
-pub struct ArcFilterBackEdge(Arc<Mutex<Filter>>);
+/// `input.setFilterOutput(this)` installs in the constructor.
+///
+/// Holds [`Arc<Filter>`] (no outer Mutex). All Filter methods that the
+/// trait spells `&mut self` only mutate `self.output` (already a
+/// `Mutex<Box<dyn FilterOutput>>`), so they're called via `&self`-shape
+/// `*_arc` helpers below. This avoids the deadlock pattern of
+/// holding an outer `Mutex<Filter>` across `output.push(…)` while a
+/// sibling operator on the same advance is also locking through us.
+pub struct ArcFilterBackEdge(Arc<Filter>);
 
 impl Output for ArcFilterBackEdge {
     fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let mut guard = self.0.lock().expect("ArcFilterBackEdge mutex poisoned");
-        let items: Vec<Yield> = guard.push(change, pusher).collect();
-        drop(guard);
+        eprintln!("[TRACE ivm] Filter::push enter");
+        let items: Vec<Yield> = self.0.push_arc(change, pusher);
+        eprintln!("[TRACE ivm] Filter::push exit yields={}", items.len());
         Box::new(items.into_iter())
     }
 }
 
 impl FilterOutput for ArcFilterBackEdge {
     fn begin_filter(&mut self) {
-        self.0.lock().expect("ArcFilterBackEdge mutex poisoned").begin_filter();
+        self.0.begin_filter_arc();
     }
     fn end_filter(&mut self) {
-        self.0.lock().expect("ArcFilterBackEdge mutex poisoned").end_filter();
+        self.0.end_filter_arc();
     }
     fn filter(&mut self, node: &Node) -> (Stream<'_, Yield>, bool) {
-        let mut guard = self.0.lock().expect("ArcFilterBackEdge mutex poisoned");
-        let (stream, keep) = guard.filter(node);
-        let collected: Vec<Yield> = stream.collect();
-        drop(guard);
-        (Box::new(collected.into_iter()), keep)
+        let (stream, keep) = self.0.filter_arc(node);
+        (Box::new(stream.into_iter()), keep)
     }
 }
 
-/// Adapter passing an `Arc<Mutex<Filter>>` as `Box<dyn FilterInput>`
-/// up the chain. Caches the schema at construction time so
+/// Adapter passing an `Arc<Filter>` as `Box<dyn FilterInput>` up the
+/// chain. Caches the schema at construction so
 /// `get_schema(&self) -> &SourceSchema` stays lifetime-clean.
 pub struct ArcFilterAsInput {
-    inner: Arc<Mutex<Filter>>,
+    inner: Arc<Filter>,
     schema: SourceSchema,
 }
 
 impl ArcFilterAsInput {
-    pub fn new(inner: Arc<Mutex<Filter>>) -> Self {
-        let schema = inner.lock().unwrap().get_schema().clone();
+    pub fn new(inner: Arc<Filter>) -> Self {
+        let schema = inner.get_schema().clone();
         Self { inner, schema }
     }
 }
@@ -75,38 +76,37 @@ impl InputBase for ArcFilterAsInput {
         &self.schema
     }
     fn destroy(&mut self) {
-        self.inner.lock().unwrap().destroy();
+        // Filter::destroy is `&mut self` but only delegates to
+        // input.destroy. Without an outer Mutex, we can't borrow
+        // `input` mutably through `Arc<Filter>`. Instead expose the
+        // same behaviour via `destroy_arc` below.
+        self.inner.destroy_arc();
     }
 }
 
 impl FilterInput for ArcFilterAsInput {
     fn set_filter_output(&mut self, output: Box<dyn FilterOutput>) {
-        self.inner.lock().unwrap().set_filter_output(output);
+        self.inner.set_filter_output_arc(output);
     }
 }
 
 impl Output for ArcFilterAsInput {
     fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let mut guard = self.inner.lock().unwrap();
-        let items: Vec<Yield> = guard.push(change, pusher).collect();
-        drop(guard);
+        let items: Vec<Yield> = self.inner.push_arc(change, pusher);
         Box::new(items.into_iter())
     }
 }
 
 impl FilterOutput for ArcFilterAsInput {
     fn begin_filter(&mut self) {
-        self.inner.lock().unwrap().begin_filter();
+        self.inner.begin_filter_arc();
     }
     fn end_filter(&mut self) {
-        self.inner.lock().unwrap().end_filter();
+        self.inner.end_filter_arc();
     }
     fn filter(&mut self, node: &Node) -> (Stream<'_, Yield>, bool) {
-        let mut guard = self.inner.lock().unwrap();
-        let (stream, keep) = guard.filter(node);
-        let collected: Vec<Yield> = stream.collect();
-        drop(guard);
-        (Box::new(collected.into_iter()), keep)
+        let (stream, keep) = self.inner.filter_arc(node);
+        (Box::new(stream.into_iter()), keep)
     }
 }
 
@@ -119,46 +119,131 @@ impl FilterOperator for ArcFilterAsInput {}
 pub type Predicate = Arc<dyn Fn(&Row) -> bool + Send + Sync>;
 
 /// TS `Filter` — stateless predicate-based [`FilterOperator`].
+///
+/// `input` is wrapped in a `Mutex` so back-edge adapters that hold
+/// only `&Filter` (via `Arc<Filter>`) can still mutate it for
+/// destroy and back-edge wiring. On the hot push/filter paths the
+/// only inner lock acquired is `output`. `schema` is cached at
+/// construction so `get_schema(&self) -> &SourceSchema` can return a
+/// stable borrow without locking the input mutex.
 pub struct Filter {
-    input: Box<dyn FilterInput>,
+    input: Mutex<Box<dyn FilterInput>>,
     predicate: Predicate,
     output: Mutex<Box<dyn FilterOutput>>,
+    schema: SourceSchema,
 }
 
 impl Filter {
     /// TS `new Filter(input, predicate)`.
     ///
     /// Matches TS which calls `input.setFilterOutput(this)` in the
-    /// constructor. We use `Arc<Mutex<Self>>` + a strong back-edge
-    /// adapter ([`ArcFilterBackEdge`]) to express the same cycle
-    /// without smuggling self-refs out of the constructor. The
-    /// resulting `Arc` is typically wrapped in [`ArcFilterAsInput`]
-    /// by the builder so it can be passed up the chain as
-    /// `Box<dyn FilterInput>`.
-    pub fn new(input: Box<dyn FilterInput>, predicate: Predicate) -> Arc<Mutex<Self>> {
-        let filter = Arc::new(Mutex::new(Self {
-            input,
+    /// constructor. Returns `Arc<Self>` (no outer Mutex). Mutation of
+    /// `input` and `output` happens through their own inner Mutexes.
+    /// The back-edge adapter ([`ArcFilterBackEdge`]) holds a strong
+    /// `Arc<Filter>` and routes pushes via `*_arc` helpers — none of
+    /// which hold an outer lock across the call, eliminating the
+    /// deadlock that the previous `Arc<Mutex<Self>>` form caused.
+    pub fn new(input: Box<dyn FilterInput>, predicate: Predicate) -> Arc<Self> {
+        let schema = input.get_schema().clone();
+        let filter = Arc::new(Self {
+            input: Mutex::new(input),
             predicate,
             output: Mutex::new(Box::new(ThrowFilterOutput)),
-        }));
-        // Wire the back-edge. Strong-cycle: child input retains an
-        // Arc to the parent Filter. Pipelines are destroyed together
-        // (driver.reset / remove_query), so the cycle is bounded.
+            schema,
+        });
+        // Wire the back-edge. Strong-Arc cycle (child input → parent
+        // Filter) is bounded by pipeline lifetime — driver.reset /
+        // remove_query drops everything together.
         let back: Box<dyn FilterOutput> = Box::new(ArcFilterBackEdge(Arc::clone(&filter)));
-        filter.lock().unwrap().input.set_filter_output(back);
         filter
+            .input
+            .lock()
+            .expect("filter input mutex poisoned")
+            .set_filter_output(back);
+        filter
+    }
+
+    // ─── Arc-friendly &self method shapes ──────────────────────────
+    //
+    // The trait impls below take `&mut self` because that's the
+    // shape `Output` / `FilterOutput` / `FilterInput` define.
+    // `ArcFilterBackEdge` and `ArcFilterAsInput` only have
+    // `Arc<Filter>`, so they call these `_arc` versions which use
+    // interior Mutexes for the same effect.
+
+    pub fn push_arc(&self, change: Change, _pusher: &dyn InputBase) -> Vec<Yield> {
+        // Do NOT hold `self.input` lock across downstream push — if
+        // downstream re-enters Filter's fetch or a shared input state,
+        // the non-reentrant std::sync::Mutex would deadlock.
+        // Use `self` as the pusher identity (Filter implements InputBase).
+        let predicate = Arc::clone(&self.predicate);
+        let mut output_g = self.output.lock().expect("filter output mutex poisoned");
+        let mut items: Vec<Yield> = Vec::new();
+        for y in filter_push(
+            change,
+            &mut **output_g,
+            self as &dyn InputBase,
+            Some(predicate.as_ref()),
+        ) {
+            items.push(y);
+        }
+        items
+    }
+
+    pub fn begin_filter_arc(&self) {
+        self.output
+            .lock()
+            .expect("filter output mutex poisoned")
+            .begin_filter();
+    }
+
+    pub fn end_filter_arc(&self) {
+        self.output
+            .lock()
+            .expect("filter output mutex poisoned")
+            .end_filter();
+    }
+
+    pub fn filter_arc(&self, node: &Node) -> (Vec<Yield>, bool) {
+        if !(self.predicate)(&node.row) {
+            return (Vec::new(), false);
+        }
+        let mut o = self.output.lock().expect("filter output mutex poisoned");
+        let (stream, keep) = o.filter(node);
+        let yields: Vec<Yield> = stream.collect();
+        (yields, keep)
+    }
+
+    pub fn set_filter_output_arc(&self, output: Box<dyn FilterOutput>) {
+        *self
+            .output
+            .lock()
+            .expect("filter output mutex poisoned") = output;
+    }
+
+    pub fn destroy_arc(&self) {
+        self.input
+            .lock()
+            .expect("filter input mutex poisoned")
+            .destroy();
     }
 }
 
 impl InputBase for Filter {
     fn get_schema(&self) -> &SourceSchema {
-        // TS: `return this.#input.getSchema();`
-        self.input.get_schema()
+        // Returns the cached schema (computed once at construction).
+        // TS reads `this.#input.getSchema()` lazily on every call;
+        // we cache to keep `&self` lifetime-clean under
+        // `Mutex<Box<dyn FilterInput>>`.
+        &self.schema
     }
 
     fn destroy(&mut self) {
         // TS: `this.#input.destroy();`
-        self.input.destroy();
+        self.input
+            .lock()
+            .expect("filter input mutex poisoned")
+            .destroy();
     }
 }
 
@@ -204,28 +289,10 @@ impl FilterOutput for Filter {
 }
 
 impl Output for Filter {
-    fn push<'a>(&'a mut self, change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        // TS: `yield* filterPush(change, this.#output, this, this.#predicate);`
-        //
-        // filter_push needs `&mut dyn Output` for the downstream and
-        // `&dyn InputBase` for the pusher identity.  We clone the
-        // `Arc<Predicate>` so filter_push owns a reference to the same
-        // closure.
-        //
-        // We collect eagerly; the underlying push sites in
-        // filter_push do the same.  The eager collection releases the
-        // output mutex before returning the stream.
-        let predicate = Arc::clone(&self.predicate);
-        let mut out = self.output.lock().expect("filter output mutex poisoned");
-        // As pusher we pass the upstream FilterInput — same reasoning
-        // as FilterStart: we cannot reborrow `self` as `&dyn InputBase`
-        // while `self` is mutably borrowed.
-        let pusher: &dyn InputBase = &*self.input;
-        let mut items: Vec<Yield> = Vec::new();
-        for y in filter_push(change, &mut **out, pusher, Some(predicate.as_ref())) {
-            items.push(y);
-        }
-        Box::new(items.into_iter())
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        // Delegate to the &self-shape helper used by Arc-based
+        // back-edges; trait shape requires &mut self.
+        Box::new(self.push_arc(change, pusher).into_iter())
     }
 }
 
@@ -352,33 +419,29 @@ mod tests {
 
     /// Test-only wrapper that derefs to `Filter` via Mutex so the
     /// existing `(mut f, _) = mk_filter(...)` call shape compiles.
-    struct LockedFilter(Arc<Mutex<Filter>>);
-    impl std::ops::Deref for LockedFilter {
-        type Target = Mutex<Filter>;
-        fn deref(&self) -> &Self::Target { &self.0 }
-    }
+    /// Test wrapper around `Arc<Filter>` that delegates to Filter's
+    /// `_arc` helpers. Tests originally wrote `(mut f, _) =
+    /// mk_filter(...)` and called `f.set_filter_output(…)` directly;
+    /// keeping the same surface lets the existing test bodies compile
+    /// unchanged after the new `Arc<Filter>` design.
+    struct LockedFilter(Arc<Filter>);
     impl LockedFilter {
         fn set_filter_output(&mut self, output: Box<dyn FilterOutput>) {
-            self.0.lock().unwrap().set_filter_output(output);
+            self.0.set_filter_output_arc(output);
         }
         fn filter(&mut self, node: &Node) -> (Stream<'_, Yield>, bool) {
-            let mut guard = self.0.lock().unwrap();
-            let (stream, keep) = guard.filter(node);
-            let items: Vec<Yield> = stream.collect();
-            drop(guard);
+            let (items, keep) = self.0.filter_arc(node);
             (Box::new(items.into_iter()), keep)
         }
         fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-            let mut guard = self.0.lock().unwrap();
-            let items: Vec<Yield> = guard.push(change, pusher).collect();
-            drop(guard);
+            let items = self.0.push_arc(change, pusher);
             Box::new(items.into_iter())
         }
-        fn destroy(&mut self) { self.0.lock().unwrap().destroy(); }
-        fn begin_filter(&mut self) { self.0.lock().unwrap().begin_filter(); }
-        fn end_filter(&mut self) { self.0.lock().unwrap().end_filter(); }
+        fn destroy(&mut self) { self.0.destroy_arc(); }
+        fn begin_filter(&mut self) { self.0.begin_filter_arc(); }
+        fn end_filter(&mut self) { self.0.end_filter_arc(); }
         fn get_schema(&self) -> SourceSchema {
-            self.0.lock().unwrap().get_schema().clone()
+            self.0.get_schema().clone()
         }
     }
 

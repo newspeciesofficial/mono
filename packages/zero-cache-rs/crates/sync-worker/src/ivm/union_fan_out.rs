@@ -28,10 +28,11 @@ use crate::ivm::union_fan_in::UnionFanIn;
 
 /// TS `UnionFanOut`.
 pub struct UnionFanOut {
-    input: Box<dyn Input>,
+    input: Mutex<Box<dyn Input>>,
     outputs: Mutex<Vec<Box<dyn Output>>>,
-    union_fan_in: Mutex<Option<Arc<Mutex<UnionFanIn>>>>,
+    union_fan_in: Mutex<Option<Arc<UnionFanIn>>>,
     destroy_count: Mutex<usize>,
+    schema: SourceSchema,
 }
 
 impl UnionFanOut {
@@ -39,28 +40,31 @@ impl UnionFanOut {
     ///
     /// Does NOT call `input.setOutput(this)`; see module doc.
     pub fn new(input: Box<dyn Input>) -> Self {
+        let schema = input.get_schema().clone();
         Self {
-            input,
+            input: Mutex::new(input),
             outputs: Mutex::new(Vec::new()),
             union_fan_in: Mutex::new(None),
             destroy_count: Mutex::new(0),
+            schema,
         }
     }
 
     /// Wired variant: matches TS `new UnionFanOut(...)` followed by
-    /// `input.setOutput(this)`. Returns `Arc<Mutex<Self>>`.
-    pub fn new_wired(input: Box<dyn Input>) -> Arc<Mutex<Self>> {
-        let arc = Arc::new(Mutex::new(Self::new(input)));
+    /// `input.setOutput(this)`. Returns `Arc<Self>` (no outer Mutex) —
+    /// back-edges use `*_arc` helpers with interior mutation to avoid
+    /// reentrant-lock deadlocks.
+    pub fn new_wired(input: Box<dyn Input>) -> Arc<Self> {
+        let arc = Arc::new(Self::new(input));
         let back: Box<dyn Output> = Box::new(UnionFanOutPushBackEdge(Arc::clone(&arc)));
-        arc.lock().unwrap().input.set_output(back);
+        arc.input
+            .lock()
+            .expect("union_fan_out input mutex poisoned")
+            .set_output(back);
         arc
     }
 
-    /// TS `setFanIn(fanIn)`.
-    ///
-    /// TS asserts that `#unionFanIn` is unset before setting. We enforce
-    /// the same invariant.
-    pub fn set_fan_in(&self, fan_in: Arc<Mutex<UnionFanIn>>) {
+    pub fn set_fan_in(&self, fan_in: Arc<UnionFanIn>) {
         let mut guard = self
             .union_fan_in
             .lock()
@@ -69,8 +73,14 @@ impl UnionFanOut {
         *guard = Some(fan_in);
     }
 
-    /// TS `destroy()`. Same count-based semantics as [`super::fan_out::FanOut`].
-    pub fn destroy_downstream(&mut self) {
+    pub fn set_output_arc(&self, output: Box<dyn Output>) {
+        self.outputs
+            .lock()
+            .expect("union_fan_out outputs mutex poisoned")
+            .push(output);
+    }
+
+    pub fn destroy_arc(&self) {
         let n_outputs = self
             .outputs
             .lock()
@@ -84,52 +94,31 @@ impl UnionFanOut {
             *count += 1;
             if *count == n_outputs {
                 drop(count);
-                self.input.destroy();
+                self.input
+                    .lock()
+                    .expect("union_fan_out input mutex poisoned")
+                    .destroy();
             }
         } else {
-            // TS: `throw new Error('FanOut already destroyed once for each output')`.
             panic!("FanOut already destroyed once for each output");
         }
     }
-}
 
-impl InputBase for UnionFanOut {
-    fn get_schema(&self) -> &SourceSchema {
-        // TS: `return this.#input.getSchema();`
-        self.input.get_schema()
+    /// Deprecated &mut variant.
+    pub fn destroy_downstream(&mut self) {
+        self.destroy_arc();
     }
 
-    fn destroy(&mut self) {
-        self.destroy_downstream();
-    }
-}
-
-impl Input for UnionFanOut {
-    fn set_output(&mut self, output: Box<dyn Output>) {
-        // TS: `this.#outputs.push(output);`
-        self.outputs
+    pub fn fetch_arc(&self, req: FetchRequest) -> Stream<'_, NodeOrYield> {
+        let input_guard = self
+            .input
             .lock()
-            .expect("union_fan_out outputs mutex poisoned")
-            .push(output);
-    }
-
-    fn fetch<'a>(&'a self, req: FetchRequest) -> Stream<'a, NodeOrYield> {
-        // TS: `return this.#input.fetch(req);`
-        //
-        // Eagerly collect to return an owned iterator — the upstream
-        // iterator borrows upstream internals that may not outlive this
-        // call in Rust.
-        let collected: Vec<NodeOrYield> = self.input.fetch(req).collect();
+            .expect("union_fan_out input mutex poisoned");
+        let collected: Vec<NodeOrYield> = input_guard.fetch(req).collect();
         Box::new(collected.into_iter())
     }
-}
 
-impl Output for UnionFanOut {
-    fn push<'a>(&'a mut self, change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        // TS:
-        //   must(this.#unionFanIn).fanOutStartedPushing();
-        //   for (const output of this.#outputs) yield* output.push(change, this);
-        //   yield* must(this.#unionFanIn).fanOutDonePushing(change.type);
+    pub fn push_arc(&self, change: Change, _pusher: &dyn InputBase) -> Vec<Yield> {
         let change_type = change.change_type();
         let fan_in = {
             let guard = self
@@ -142,90 +131,103 @@ impl Output for UnionFanOut {
                 .clone()
         };
 
-        // fanOutStartedPushing
-        {
-            let mut fi = fan_in.lock().expect("union_fan_in mutex poisoned");
-            fi.fan_out_started_pushing();
-        }
+        fan_in.fan_out_started_pushing_arc();
 
-        // broadcast push to every output
         let mut yields: Vec<Yield> = Vec::new();
         {
             let mut outs = self
                 .outputs
                 .lock()
                 .expect("union_fan_out outputs mutex poisoned");
-            let pusher: &dyn InputBase = &*self.input;
             for out in outs.iter_mut() {
-                for y in out.push(change.clone(), pusher) {
+                for y in out.push(change.clone(), self as &dyn InputBase) {
                     yields.push(y);
                 }
             }
         }
 
-        // fanOutDonePushing
-        {
-            let mut fi = fan_in.lock().expect("union_fan_in mutex poisoned");
-            for y in fi.fan_out_done_pushing(change_type) {
-                yields.push(y);
-            }
+        for y in fan_in.fan_out_done_pushing_arc(change_type) {
+            yields.push(y);
         }
 
-        Box::new(yields.into_iter())
+        yields
+    }
+}
+
+impl InputBase for UnionFanOut {
+    fn get_schema(&self) -> &SourceSchema {
+        &self.schema
+    }
+
+    fn destroy(&mut self) {
+        self.destroy_arc();
+    }
+}
+
+impl Input for UnionFanOut {
+    fn set_output(&mut self, output: Box<dyn Output>) {
+        self.set_output_arc(output);
+    }
+
+    fn fetch<'a>(&'a self, req: FetchRequest) -> Stream<'a, NodeOrYield> {
+        self.fetch_arc(req)
+    }
+}
+
+impl Output for UnionFanOut {
+    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        let items = self.push_arc(change, pusher);
+        Box::new(items.into_iter())
     }
 }
 
 impl Operator for UnionFanOut {}
 
 /// Back-edge installed on [`UnionFanOut::input`]. Created by
-/// [`UnionFanOut::new_wired`].
-pub struct UnionFanOutPushBackEdge(pub Arc<Mutex<UnionFanOut>>);
+/// [`UnionFanOut::new_wired`]. Holds `Arc<UnionFanOut>` — no outer
+/// Mutex — and delegates to `push_arc`.
+pub struct UnionFanOutPushBackEdge(pub Arc<UnionFanOut>);
 
 impl Output for UnionFanOutPushBackEdge {
     fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let mut guard = self.0.lock().expect("union_fan_out back-edge mutex poisoned");
-        let items: Vec<Yield> = guard.push(change, pusher).collect();
-        drop(guard);
+        eprintln!("[TRACE ivm] UnionFanOut::push enter");
+        let items = self.0.push_arc(change, pusher);
+        eprintln!("[TRACE ivm] UnionFanOut::push exit yields={}", items.len());
         Box::new(items.into_iter())
     }
 }
 
-/// Adapter to plug a wired [`Arc<Mutex<UnionFanOut>>`] back into the
-/// chain as `Box<dyn Input>`. Schema cached at construction.
+/// Adapter to plug a wired [`Arc<UnionFanOut>`] back into the chain
+/// as `Box<dyn Input>`. Schema cached at construction.
 pub struct ArcUnionFanOutAsInput {
-    inner: Arc<Mutex<UnionFanOut>>,
+    inner: Arc<UnionFanOut>,
     schema: SourceSchema,
 }
 
 impl ArcUnionFanOutAsInput {
-    pub fn new(inner: Arc<Mutex<UnionFanOut>>) -> Self {
-        let schema = inner.lock().unwrap().get_schema().clone();
+    pub fn new(inner: Arc<UnionFanOut>) -> Self {
+        let schema = inner.get_schema().clone();
         Self { inner, schema }
     }
 }
 
 impl InputBase for ArcUnionFanOutAsInput {
     fn get_schema(&self) -> &SourceSchema { &self.schema }
-    fn destroy(&mut self) { self.inner.lock().unwrap().destroy(); }
+    fn destroy(&mut self) { self.inner.destroy_arc(); }
 }
 
 impl Input for ArcUnionFanOutAsInput {
     fn set_output(&mut self, output: Box<dyn Output>) {
-        self.inner.lock().unwrap().set_output(output);
+        self.inner.set_output_arc(output);
     }
     fn fetch<'a>(&'a self, req: FetchRequest) -> Stream<'a, NodeOrYield> {
-        let guard = self.inner.lock().unwrap();
-        let items: Vec<NodeOrYield> = guard.fetch(req).collect();
-        drop(guard);
-        Box::new(items.into_iter())
+        self.inner.fetch_arc(req)
     }
 }
 
 impl Output for ArcUnionFanOutAsInput {
     fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let mut guard = self.inner.lock().unwrap();
-        let items: Vec<Yield> = guard.push(change, pusher).collect();
-        drop(guard);
+        let items = self.inner.push_arc(change, pusher);
         Box::new(items.into_iter())
     }
 }
@@ -368,7 +370,7 @@ mod tests {
     fn union_fan_out_set_fan_in_stores_once() {
         let (input, _) = stub_input(vec![]);
         let ufo = UnionFanOut::new(input);
-        let fi = Arc::new(Mutex::new(UnionFanIn::new(make_schema("t"), vec![])));
+        let fi = Arc::new(UnionFanIn::new(make_schema("t"), vec![]));
         ufo.set_fan_in(Arc::clone(&fi));
         assert!(ufo.union_fan_in.lock().unwrap().is_some());
     }
@@ -379,8 +381,8 @@ mod tests {
     fn union_fan_out_set_fan_in_twice_panics() {
         let (input, _) = stub_input(vec![]);
         let ufo = UnionFanOut::new(input);
-        let fi1 = Arc::new(Mutex::new(UnionFanIn::new(make_schema("t"), vec![])));
-        let fi2 = Arc::new(Mutex::new(UnionFanIn::new(make_schema("t"), vec![])));
+        let fi1 = Arc::new(UnionFanIn::new(make_schema("t"), vec![]));
+        let fi2 = Arc::new(UnionFanIn::new(make_schema("t"), vec![]));
         ufo.set_fan_in(fi1);
         ufo.set_fan_in(fi2);
     }
@@ -484,7 +486,7 @@ mod tests {
             pushes: Arc::clone(&p2),
         }));
 
-        let fi = Arc::new(Mutex::new(UnionFanIn::new(make_schema("t"), vec![])));
+        let fi = Arc::new(UnionFanIn::new(make_schema("t"), vec![]));
         ufo.set_fan_in(Arc::clone(&fi));
 
         let (pusher_input, _) = stub_input(vec![]);

@@ -131,28 +131,38 @@ impl UnionFanIn {
     }
 
     /// Wired variant: matches TS `new UnionFanIn(...)` followed by
-    /// `input.setOutput(this)` for every branch. Returns
-    /// `Arc<Mutex<Self>>`.
+    /// `input.setOutput(this)` for every branch. Returns `Arc<Self>`
+    /// (no outer Mutex) — back-edges use `*_arc` helpers via interior
+    /// mutation to avoid reentrant-lock deadlocks.
     pub fn new_wired(
         fan_out_schema: SourceSchema,
         inputs: Vec<Box<dyn Input>>,
-    ) -> Arc<Mutex<Self>> {
-        let arc = Arc::new(Mutex::new(Self::new(fan_out_schema, inputs)));
-        let n = arc.lock().unwrap().inputs.lock().unwrap().len();
+    ) -> Arc<Self> {
+        let arc = Arc::new(Self::new(fan_out_schema, inputs));
+        let n = arc
+            .inputs
+            .lock()
+            .expect("union_fan_in inputs mutex poisoned")
+            .len();
         for i in 0..n {
-            let back: Box<dyn Output> = Box::new(UnionFanInPushBackEdge(Arc::clone(&arc)));
-            arc.lock().unwrap().inputs.lock().unwrap()[i].set_output(back);
+            let back: Box<dyn Output> = Box::new(UnionFanInPushBackEdge {
+                inner: Arc::clone(&arc),
+                pusher_index: i,
+            });
+            arc.inputs
+                .lock()
+                .expect("union_fan_in inputs mutex poisoned")[i]
+                .set_output(back);
         }
         arc
     }
 
-    /// TS `fanOutStartedPushing()`.
-    pub fn fan_out_started_pushing(&mut self) {
+    /// &self variant of `fan_out_started_pushing`.
+    pub fn fan_out_started_pushing_arc(&self) {
         let mut flag = self
             .fan_out_push_started
             .lock()
             .expect("union_fan_in push_started mutex poisoned");
-        // TS: `assert(this.#fanOutPushStarted === false, '...')`.
         assert!(
             !*flag,
             "UnionFanIn: fanOutStartedPushing called while already pushing"
@@ -160,17 +170,42 @@ impl UnionFanIn {
         *flag = true;
     }
 
-    /// TS `*fanOutDonePushing(fanOutChangeType)`.
-    pub fn fan_out_done_pushing<'a>(
-        &'a mut self,
-        fan_out_change_type: ChangeType,
-    ) -> Stream<'a, Yield> {
+    /// TS `fanOutStartedPushing()` (mut variant).
+    pub fn fan_out_started_pushing(&mut self) {
+        self.fan_out_started_pushing_arc();
+    }
+
+    /// &self set_output.
+    pub fn set_output_arc(&self, output: Box<dyn Output>) {
+        *self
+            .output
+            .lock()
+            .expect("union_fan_in output mutex poisoned") = output;
+    }
+
+    /// &self destroy.
+    pub fn destroy_arc(&self) {
+        let mut inputs = self
+            .inputs
+            .lock()
+            .expect("union_fan_in inputs mutex poisoned");
+        for input in inputs.iter_mut() {
+            input.destroy();
+        }
+    }
+
+    /// &self variant of `fan_out_done_pushing` that returns a Vec.
+    pub fn fan_out_done_pushing_arc(&self, fan_out_change_type: ChangeType) -> Vec<Yield> {
+        let items = self.fan_out_done_pushing_inner(fan_out_change_type);
+        items
+    }
+
+    fn fan_out_done_pushing_inner(&self, fan_out_change_type: ChangeType) -> Vec<Yield> {
         {
             let mut flag = self
                 .fan_out_push_started
                 .lock()
                 .expect("union_fan_in push_started mutex poisoned");
-            // TS: `assert(this.#fanOutPushStarted, '...')`.
             assert!(
                 *flag,
                 "UnionFanIn: fanOutDonePushing called without fanOutStartedPushing"
@@ -178,30 +213,23 @@ impl UnionFanIn {
             *flag = false;
         }
 
-        // TS: `if (this.#inputs.length === 0) return;`
         if self
             .inputs
             .lock()
             .expect("union_fan_in inputs mutex poisoned")
             .is_empty()
         {
-            return Box::new(std::iter::empty());
+            return Vec::new();
         }
 
-        // TS: `if (this.#accumulatedPushes.length === 0) return;`
         let mut accumulated_guard = self
             .accumulated_pushes
             .lock()
             .expect("union_fan_in accumulated_pushes mutex poisoned");
         if accumulated_guard.is_empty() {
-            return Box::new(std::iter::empty());
+            return Vec::new();
         }
 
-        // TS:
-        //   yield* pushAccumulatedChanges(
-        //     #accumulatedPushes, #output, this, fanOutChangeType,
-        //     mergeRelationships, makeAddEmptyRelationships(#schema),
-        //   );
         let mut drained: Vec<Change> = accumulated_guard.drain(..).collect();
         drop(accumulated_guard);
 
@@ -228,7 +256,16 @@ impl UnionFanIn {
         .collect();
         drop(inputs);
         drop(out_guard);
-        Box::new(collected.into_iter())
+        collected
+    }
+
+    /// TS `*fanOutDonePushing(fanOutChangeType)` (mut variant).
+    pub fn fan_out_done_pushing<'a>(
+        &'a mut self,
+        fan_out_change_type: ChangeType,
+    ) -> Stream<'a, Yield> {
+        let items = self.fan_out_done_pushing_inner(fan_out_change_type);
+        Box::new(items.into_iter())
     }
 
     /// TS `#pushInternalChange(change, pusher)`.
@@ -353,61 +390,108 @@ impl UnionFanIn {
         change: Change,
         pusher_index: usize,
     ) -> Stream<'a, Yield> {
-        // TS:
-        //   if (!this.#fanOutPushStarted) {
-        //     yield* this.#pushInternalChange(change, pusher);
-        //   } else {
-        //     this.#accumulatedPushes.push(change);
-        //   }
+        let items = self.push_indexed_arc(change, pusher_index);
+        Box::new(items.into_iter())
+    }
+
+    /// &self variant of push_indexed.
+    pub fn push_indexed_arc(&self, change: Change, pusher_index: usize) -> Vec<Yield> {
         let started = *self
             .fan_out_push_started
             .lock()
             .expect("union_fan_in push_started mutex poisoned");
         if !started {
-            self.push_internal_change_from(change, pusher_index)
+            self.push_internal_change_from_arc(change, pusher_index)
         } else {
             self.accumulated_pushes
                 .lock()
                 .expect("union_fan_in accumulated_pushes mutex poisoned")
                 .push(change);
-            Box::new(std::iter::empty())
+            Vec::new()
         }
     }
-}
 
-impl InputBase for UnionFanIn {
-    fn get_schema(&self) -> &SourceSchema {
-        &self.schema
-    }
+    /// &self variant of push_internal_change_from.
+    fn push_internal_change_from_arc(&self, change: Change, pusher_index: usize) -> Vec<Yield> {
+        if matches!(change.change_type(), ChangeType::Child) {
+            let mut out = self
+                .output
+                .lock()
+                .expect("union_fan_in output mutex poisoned");
+            let inputs = self
+                .inputs
+                .lock()
+                .expect("union_fan_in inputs mutex poisoned");
+            let pusher: &dyn InputBase =
+                &**inputs.get(pusher_index).expect("pusher index in range");
+            let collected: Vec<Yield> = out.push(change, pusher).collect();
+            drop(inputs);
+            drop(out);
+            return collected;
+        }
 
-    fn destroy(&mut self) {
-        // TS: `for (const input of this.#inputs) input.destroy();`
-        let mut inputs = self
+        match change.change_type() {
+            ChangeType::Add | ChangeType::Remove => {}
+            other => panic!("UnionFanIn: expected add or remove change type, got {other:?}"),
+        }
+
+        let mut had_match = false;
+        {
+            let inputs = self
+                .inputs
+                .lock()
+                .expect("union_fan_in inputs mutex poisoned");
+            for (i, input) in inputs.iter().enumerate() {
+                if i == pusher_index {
+                    had_match = true;
+                    continue;
+                }
+                let mut constraint: Constraint = IndexMap::new();
+                for key in self.schema.primary_key.columns() {
+                    let v = change.node().row.get(key).cloned().unwrap_or(None);
+                    constraint.insert(key.clone(), v);
+                }
+                let req = FetchRequest {
+                    constraint: Some(constraint),
+                    ..FetchRequest::default()
+                };
+                let mut any = false;
+                for item in input.fetch(req) {
+                    if let NodeOrYield::Node(_) = item {
+                        any = true;
+                        break;
+                    }
+                }
+                if any {
+                    return Vec::new();
+                }
+            }
+        }
+
+        assert!(
+            had_match,
+            "Pusher was not one of the inputs to union-fan-in!"
+        );
+
+        let mut out = self
+            .output
+            .lock()
+            .expect("union_fan_in output mutex poisoned");
+        let inputs = self
             .inputs
             .lock()
             .expect("union_fan_in inputs mutex poisoned");
-        for input in inputs.iter_mut() {
-            input.destroy();
-        }
+        let pusher: &dyn InputBase = &**inputs.get(pusher_index).expect("checked had_match above");
+        let collected: Vec<Yield> = out.push(change, pusher).collect();
+        drop(inputs);
+        drop(out);
+        collected
     }
 }
 
-impl Input for UnionFanIn {
-    fn set_output(&mut self, output: Box<dyn Output>) {
-        // TS: `this.#output = output;`
-        *self
-            .output
-            .lock()
-            .expect("union_fan_in output mutex poisoned") = output;
-    }
-
-    fn fetch<'a>(&'a self, req: FetchRequest) -> Stream<'a, NodeOrYield> {
-        // TS:
-        //   const iterables = this.#inputs.map(input => input.fetch(req));
-        //   return mergeFetches(iterables, (l, r) => this.#schema.compareRows(l.row, r.row));
-        //
-        // Collect each input's fetch eagerly to own the items. The
-        // comparator is cloned from the shared Arc for the closure.
+impl UnionFanIn {
+    /// &self variant of `fetch`.
+    pub fn fetch_arc(&self, req: FetchRequest) -> Stream<'_, NodeOrYield> {
         let inputs = self
             .inputs
             .lock()
@@ -415,8 +499,6 @@ impl Input for UnionFanIn {
         let iterables: Vec<Vec<NodeOrYield>> = inputs
             .iter()
             .map(|inp| {
-                // Each fetch request is cloned because FetchRequest is not
-                // Copy.
                 let cloned = FetchRequest {
                     constraint: req.constraint.clone(),
                     start: req.start.clone(),
@@ -434,14 +516,27 @@ impl Input for UnionFanIn {
     }
 }
 
+impl InputBase for UnionFanIn {
+    fn get_schema(&self) -> &SourceSchema {
+        &self.schema
+    }
+
+    fn destroy(&mut self) {
+        self.destroy_arc();
+    }
+}
+
+impl Input for UnionFanIn {
+    fn set_output(&mut self, output: Box<dyn Output>) {
+        self.set_output_arc(output);
+    }
+
+    fn fetch<'a>(&'a self, req: FetchRequest) -> Stream<'a, NodeOrYield> {
+        self.fetch_arc(req)
+    }
+}
+
 impl Output for UnionFanIn {
-    /// TS `*push(change, pusher)`.
-    ///
-    /// NOTE: the trait-level `push` can't identify the pusher by index
-    /// since `&dyn InputBase` cannot be compared for trait-object
-    /// identity in safe Rust without extra plumbing. This implementation
-    /// panics to surface callers that attempt the TS-style
-    /// pointer-identity path; use [`UnionFanIn::push_indexed`] instead.
     fn push<'a>(&'a mut self, _change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
         panic!(
             "UnionFanIn::push — pipeline driver must route through push_indexed; \
@@ -453,55 +548,56 @@ impl Output for UnionFanIn {
 impl Operator for UnionFanIn {}
 
 /// Back-edge installed on every [`UnionFanIn::inputs`] entry. Created
-/// by [`UnionFanIn::new_wired`].
-pub struct UnionFanInPushBackEdge(pub Arc<Mutex<UnionFanIn>>);
+/// by [`UnionFanIn::new_wired`]. Holds `Arc<UnionFanIn>` directly and
+/// records which input index it corresponds to so we can route pushes
+/// with correct pusher identity.
+pub struct UnionFanInPushBackEdge {
+    pub inner: Arc<UnionFanIn>,
+    pub pusher_index: usize,
+}
 
 impl Output for UnionFanInPushBackEdge {
-    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let mut guard = self.0.lock().expect("union_fan_in back-edge mutex poisoned");
-        let items: Vec<Yield> = guard.push(change, pusher).collect();
-        drop(guard);
+    fn push<'a>(&'a mut self, change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        eprintln!("[TRACE ivm] UnionFanIn::push enter idx={}", self.pusher_index);
+        let items = self.inner.push_indexed_arc(change, self.pusher_index);
+        eprintln!("[TRACE ivm] UnionFanIn::push exit yields={}", items.len());
         Box::new(items.into_iter())
     }
 }
 
-/// Adapter to plug a wired [`Arc<Mutex<UnionFanIn>>`] back into the
-/// chain as `Box<dyn Input>`. Schema cached at construction.
+/// Adapter to plug a wired [`Arc<UnionFanIn>`] back into the chain as
+/// `Box<dyn Input>`. Schema cached at construction.
 pub struct ArcUnionFanInAsInput {
-    inner: Arc<Mutex<UnionFanIn>>,
+    inner: Arc<UnionFanIn>,
     schema: SourceSchema,
 }
 
 impl ArcUnionFanInAsInput {
-    pub fn new(inner: Arc<Mutex<UnionFanIn>>) -> Self {
-        let schema = inner.lock().unwrap().get_schema().clone();
+    pub fn new(inner: Arc<UnionFanIn>) -> Self {
+        let schema = inner.get_schema().clone();
         Self { inner, schema }
     }
 }
 
 impl InputBase for ArcUnionFanInAsInput {
     fn get_schema(&self) -> &SourceSchema { &self.schema }
-    fn destroy(&mut self) { self.inner.lock().unwrap().destroy(); }
+    fn destroy(&mut self) { self.inner.destroy_arc(); }
 }
 
 impl Input for ArcUnionFanInAsInput {
     fn set_output(&mut self, output: Box<dyn Output>) {
-        self.inner.lock().unwrap().set_output(output);
+        self.inner.set_output_arc(output);
     }
     fn fetch<'a>(&'a self, req: FetchRequest) -> Stream<'a, NodeOrYield> {
-        let guard = self.inner.lock().unwrap();
-        let items: Vec<NodeOrYield> = guard.fetch(req).collect();
-        drop(guard);
-        Box::new(items.into_iter())
+        self.inner.fetch_arc(req)
     }
 }
 
 impl Output for ArcUnionFanInAsInput {
-    fn push<'a>(&'a mut self, change: Change, pusher: &dyn InputBase) -> Stream<'a, Yield> {
-        let mut guard = self.inner.lock().unwrap();
-        let items: Vec<Yield> = guard.push(change, pusher).collect();
-        drop(guard);
-        Box::new(items.into_iter())
+    fn push<'a>(&'a mut self, _change: Change, _pusher: &dyn InputBase) -> Stream<'a, Yield> {
+        panic!(
+            "ArcUnionFanInAsInput::push — pipeline driver must route through push_indexed"
+        );
     }
 }
 
