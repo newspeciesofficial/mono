@@ -8,6 +8,7 @@ import * as Mode from '../../db/mode-enum.ts';
 import {runTx} from '../../db/run-transaction.ts';
 import {TransactionPool} from '../../db/transaction-pool.ts';
 import {
+  LATENCY_BOUNDARIES_SECONDS,
   getOrCreateCounter,
   getOrCreateHistogram,
 } from '../../observability/metrics.ts';
@@ -107,6 +108,7 @@ export class RowRecordCache {
       'Time to flush a CVR transaction. This includes both synchronous ' +
       'and asynchronous flushes, distinguished by the flush.type attribute',
     unit: 's',
+    advice: {explicitBucketBoundaries: LATENCY_BOUNDARIES_SECONDS},
   });
   readonly #cvrRowsFlushed = getOrCreateCounter(
     'sync',

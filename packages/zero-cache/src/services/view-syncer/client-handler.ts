@@ -25,6 +25,7 @@ import {primaryKeyValueRecordSchema} from '../../../../zero-protocol/src/primary
 import {mutationResultSchema} from '../../../../zero-protocol/src/push.ts';
 import type {RowPatchOp} from '../../../../zero-protocol/src/row-patch.ts';
 import {
+  LATENCY_BOUNDARIES_SECONDS,
   getOrCreateCounter,
   getOrCreateHistogram,
 } from '../../observability/metrics.ts';
@@ -128,6 +129,7 @@ export class ClientHandler {
     description:
       'Time elapsed for each poke transaction. Canceled / noop pokes are excluded.',
     unit: 's',
+    advice: {explicitBucketBoundaries: LATENCY_BOUNDARIES_SECONDS},
   });
 
   readonly #pokeTransactions = getOrCreateCounter(

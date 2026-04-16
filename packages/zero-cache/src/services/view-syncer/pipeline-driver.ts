@@ -42,6 +42,7 @@ import type {LogConfig, ZeroConfig} from '../../config/zero-config.ts';
 import {computeZqlSpecs, mustGetTableSpec} from '../../db/lite-tables.ts';
 import type {LiteAndZqlSpec, LiteTableSpec} from '../../db/specs.ts';
 import {
+  LATENCY_BOUNDARIES_SECONDS,
   getOrCreateCounter,
   getOrCreateHistogram,
 } from '../../observability/metrics.ts';
@@ -158,6 +159,7 @@ export class PipelineDriver {
     description:
       'Time to advance all queries for a given client group for in response to a single change.',
     unit: 's',
+    advice: {explicitBucketBoundaries: LATENCY_BOUNDARIES_SECONDS},
   });
 
   readonly #conflictRowsDeleted = getOrCreateCounter(
