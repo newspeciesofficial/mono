@@ -35,6 +35,11 @@ import {buildPipeline} from '../../../../zql/src/builder/builder.ts';
 import type {Node} from '../../../../zql/src/ivm/data.ts';
 import {skipYields, type Input, type Storage} from '../../../../zql/src/ivm/operator.ts';
 import type {SourceInput} from '../../../../zql/src/ivm/source.ts';
+import {planQuery} from '../../../../zql/src/planner/planner-builder.ts';
+import type {ConnectionCostModel} from '../../../../zql/src/planner/planner-connection.ts';
+import {completeOrdering} from '../../../../zql/src/query/complete-ordering.ts';
+import {createSQLiteCostModel} from '../../../../zqlite/src/sqlite-cost-model.ts';
+import type {Database} from '../../../../zqlite/src/db.ts';
 import {
   resolveSimpleScalarSubqueries,
   type CompanionSubquery,
@@ -192,6 +197,14 @@ export class RustPipelineDriverV2 {
    */
   readonly #subquerySources = new Map<string, TableSource>();
   readonly #logConfig: LogConfig;
+  /**
+   * Mirror of TS `PipelineDriver.#costModels` (pipeline-driver.ts:159).
+   * WeakMap keyed by `Database` so a changed DB handle (post-reset)
+   * invalidates automatically. `undefined` when the planner is disabled,
+   * matching TS's `enablePlanner ? new WeakMap() : undefined` at
+   * pipeline-driver.ts:201.
+   */
+  readonly #costModels: WeakMap<Database, ConnectionCostModel> | undefined;
 
   #primaryKeys: Map<string, PrimaryKey> | null = null;
   #permissions: LoadedPermissions | null = null;
@@ -206,7 +219,7 @@ export class RustPipelineDriverV2 {
     clientGroupID: string,
     _inspectorDelegate: InspectorDelegate,
     yieldThresholdMs: () => number,
-    _enablePlanner?: boolean | undefined,
+    enablePlanner?: boolean | undefined,
     config?: ZeroConfig | undefined,
   ) {
     this.#lc = lc.withContext('clientGroupID', clientGroupID);
@@ -216,6 +229,15 @@ export class RustPipelineDriverV2 {
     this.#shardID = shardID;
     this.#storage = storage;
     this.#config = config;
+    // Mirror TS pipeline-driver.ts:201 — `enablePlanner ? new WeakMap() : undefined`.
+    // RS driver previously ignored this flag (prefix `_enablePlanner`);
+    // TS runs `planQuery` (builder.ts:139-141) which sets cost-based
+    // `flip` on correlatedSubquery conditions via `applyPlansToAST`
+    // (planner-builder.ts:357). Skipping it meant RS saw unflipped ASTs
+    // for any planner-decided flip (e.g. the `or(or(cmp,cmp), exists(...))`
+    // shape) — divergence against TS. Wire the cache here and run
+    // `planQuery` at addQuery time below.
+    this.#costModels = enablePlanner ? new WeakMap() : undefined;
     this.#native = loadShadowNative();
 
     const replicaPath = snapshotter.dbFile;
@@ -358,6 +380,27 @@ export class RustPipelineDriverV2 {
     return this.#snapshotter.current().version;
   }
 
+  /**
+   * Mirror of TS `PipelineDriver.#ensureCostModelExistsIfEnabled`
+   * (pipeline-driver.ts:337-348). Returns the cached cost model for the
+   * given DB handle, building and caching one on first access. Returns
+   * `undefined` when planner is disabled (`#costModels == null`), in
+   * which case `buildPipeline` / `planQuery` are short-circuited
+   * identically to TS.
+   */
+  #ensureCostModelExistsIfEnabled(db: Database): ConnectionCostModel | undefined {
+    const existing = this.#costModels?.get(db);
+    if (existing) {
+      return existing;
+    }
+    if (this.#costModels) {
+      const costModel = createSQLiteCostModel(db, this.#tableSpecs);
+      this.#costModels.set(db, costModel);
+      return costModel;
+    }
+    return undefined;
+  }
+
   currentPermissions(): LoadedPermissions | null {
     // Matches TS `PipelineDriver.currentPermissions` line-for-line.
     // `snapshotter.current().db` under RustSnapshotter is the TS-side
@@ -418,6 +461,31 @@ export class RustPipelineDriverV2 {
     // `ast_to_chain_spec` can fully consume.
     const {ast: resolvedAst, companionRows} =
       this.#resolveScalarSubqueries(query);
+
+    // Mirror TS `buildPipeline` (builder.ts:133-141) step-for-step:
+    //   1) `completeOrdering` — populates `orderBy` with primary-key
+    //      tail so every CSQ has a deterministic order. Cost model
+    //      relies on a non-empty `orderBy` (otherwise `buildSelectQuery`
+    //      emits `ORDER BY` with no columns → "incomplete input"). This
+    //      mirrors builder.ts:134-137 exactly.
+    //   2) `planQuery` — runs the cost-based planner (builder.ts:139-141)
+    //      which sets `flip: boolean` on each CSQ via `applyPlansToAST`
+    //      (planner-builder.ts:357). Rust's `ast_to_chain_spec` already
+    //      honours `flip` (see `ast_builder.rs`'s `ExistsSpec.flip`
+    //      threading), so no further RS-side change is needed.
+    //
+    // Ordering matches TS (pipeline-driver.ts:477-504): scalar-subquery
+    // resolution runs first (its companion ASTs are built *without*
+    // planning, matching TS's `buildPipeline('scalar-subquery')` call
+    // at pipeline-driver.ts:397 which passes no cost model), then the
+    // outer AST is ordered and planned.
+    const {db} = this.#snapshotter.current();
+    const costModel = this.#ensureCostModelExistsIfEnabled(db.db);
+    const orderedAst = completeOrdering(resolvedAst, tableName =>
+      mustGetPrimaryKeyForTable(this.#primaryKeys, tableName),
+    );
+    const plannedAst = costModel ? planQuery(orderedAst, costModel) : orderedAst;
+
     // Streaming hydration: Rust runs on a worker thread, chunks of up
     // to 100 rows arrive via next_chunk. Each chunk is yielded
     // row-by-row so ViewSyncer sees rows as soon as each batch lands,
@@ -426,7 +494,7 @@ export class RustPipelineDriverV2 {
       this.#handle,
       transformationHash,
       queryID,
-      resolvedAst as unknown,
+      plannedAst as unknown,
     );
 
     let rows = 0;
@@ -464,13 +532,15 @@ export class RustPipelineDriverV2 {
       }
       // Emit related[] tree rows for each parent — skipped when the AST
       // has no `related` array, so queries without hierarchical joins
-      // pay zero cost.
-      if (resolvedAst.related && resolvedAst.related.length > 0) {
+      // pay zero cost. Use the planned AST so any planner-decorated
+      // subquery shapes (e.g. flipped related EXISTS) propagate through
+      // the related walk identically to what Rust consumed.
+      if (plannedAst.related && plannedAst.related.length > 0) {
         for (const parentRow of parentRows) {
           for (const rc of this.#emitRelatedForRow(
             queryID,
             parentRow,
-            resolvedAst.related,
+            plannedAst.related,
           )) {
             rows++;
             yield rc;

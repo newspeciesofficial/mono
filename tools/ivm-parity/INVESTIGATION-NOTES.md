@@ -82,3 +82,46 @@ TS is generator-based throughout. RS:
 ## Batch-vs-isolation flake
 
 Several tests pass alone but fail in BATCH_SIZE=30 sweeps (observed: fuzz_00089, fuzz_00156, fuzz_00377). Root cause unknown. POKE_WAIT_MS=5000 doesn't help. Possibly related to the non-constrained `source.fetch` in push paths interacting with concurrent CVR diffs.
+
+## Planner-stats drift (stats-driven divergences)
+
+TS `PipelineDriver.addQuery` (pipeline-driver.ts:465-503) passes a `ConnectionCostModel`
+to `buildPipeline`, which triggers `planQuery` (builder.ts:139-141). The planner's
+cost-based decisions set `flip: boolean` on each CSQ via `applyPlansToAST`
+(planner-builder.ts:357). Until `rust-pipeline-driver-v2.ts` was updated to mirror
+this (imports `planQuery`, `completeOrdering`, `createSQLiteCostModel`; runs them
+in `addQuery` using the cached `#costModels` WeakMap), RS sent UNPLANNED ASTs to
+Rust while TS native ran planner-decided ASTs — direct divergence on
+`or(or(cmp,cmp), exists(...))` shapes.
+
+Once that architectural parity is in place, any remaining divergence comes from
+**stats drift** between the TS and RS replicas. `createSQLiteCostModel` reads
+`sqlite_stat1` / `sqlite_stat4` via `scanStatus`, which are populated only by
+`ANALYZE`. `migration-lite.ts:145` runs `ANALYZE main` once per migration; once
+the replica is at the current schema version, ANALYZE is NOT re-run as rows are
+inserted via replication. So if one replica's initial sync captured a subset of
+rows (e.g. TS synced before `seed-extras.sql`, RS synced after), the planner
+sees different estimated selectivities and may produce different flip decisions
+against the same logical data.
+
+Confirmed via `probe-flip-decision.ts` (deleted after use):
+```
+/tmp/xyne-lite-ts.db → flip: true  (3 users, 6 participants — stale)
+/tmp/xyne-lite-rs.db → flip: false (5 users, 9 participants — current)
+```
+
+**This is NOT an IVM bug.** Given identical planned ASTs both IVMs produce
+identical output. The 4 remaining hyd-divergences (fuzz_00389/00393/00604/00608,
+all `or(or(cmp,cmp), exists(channel))` against `participants`/`conversations`)
+reflect the different plans computed from different stats.
+
+**Resolutions** (pick one for a clean 1055/1055 sweep):
+- Drop both replication slots and restart both caches — forces fresh initial
+  sync against current PG, ANALYZE runs in migration, stats align.
+- Or set `ZERO_ENABLE_QUERY_PLANNER=false` on both `start-ts` and `start-rs`:
+  with no cost model, `planQuery` is short-circuited identically on both sides
+  (builder.ts:139 guard), flip decisions fall through to whatever the raw AST
+  sets (undefined for fuzz ASTs → not flipped on either side).
+
+Neither is a semantic parity fix — they're infra-level remediations for
+environment drift between two independent replicas.
