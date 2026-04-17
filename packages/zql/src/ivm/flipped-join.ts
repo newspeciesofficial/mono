@@ -114,6 +114,7 @@ export class FlippedJoin implements Input {
   // algorithm should be used:  For each child node, fetch all parent nodes
   // eagerly and then sort using quicksort.
   *fetch(req: FetchRequest): Stream<Node | 'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:flipped-join.ts:116:fetch constraint=${JSON.stringify(req.constraint ?? null)}]`);
     // Translate constraints for the parent on parts of the join key to
     // constraints for the child.
     const childConstraint: Record<string, Value> = {};
@@ -310,12 +311,15 @@ export class FlippedJoin implements Input {
   }
 
   *#pushChild(change: Change): Stream<'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:flipped-join.ts:312:push-child type=${change.type}]`);
     switch (change.type) {
       case 'add':
       case 'remove':
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:flipped-join.ts:315:push-child-add-or-remove type=${change.type}]`);
         yield* this.#pushChildChange(change);
         break;
       case 'edit': {
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:flipped-join.ts:318:push-child-edit]`);
         assert(
           rowEqualsForCompoundKey(
             change.oldNode.row,
@@ -328,12 +332,14 @@ export class FlippedJoin implements Input {
         break;
       }
       case 'child':
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:flipped-join.ts:330:push-child-child]`);
         yield* this.#pushChildChange(change, true);
         break;
     }
   }
 
   *#pushChildChange(change: Change, exists?: boolean): Stream<'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:flipped-join.ts:336:push-child-change type=${change.type} exists=${exists ?? 'undefined'}]`);
     this.#inprogressChildChange = {
       change,
       position: undefined,
@@ -381,6 +387,7 @@ export class FlippedJoin implements Input {
           }
         }
         if (exists) {
+          process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:flipped-join.ts:383:push-child-change-exists-emit-child]`);
           yield* this.#output.push(
             {
               type: 'child',
@@ -399,6 +406,7 @@ export class FlippedJoin implements Input {
             this,
           );
         } else {
+          process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:flipped-join.ts:401:push-child-change-no-exists-emit-change type=${change.type}]`);
           yield* this.#output.push(
             {
               ...change,
@@ -420,6 +428,7 @@ export class FlippedJoin implements Input {
   }
 
   *#pushParent(change: Change): Stream<'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:flipped-join.ts:422:push-parent type=${change.type}]`);
     const childNodeStream = (node: Node) => () => {
       const constraint = buildJoinConstraint(
         node.row,
@@ -449,6 +458,7 @@ export class FlippedJoin implements Input {
       }
     }
     if (!hasRelatedChild) {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:flipped-join.ts:451:push-parent-no-related-child-skip type=${change.type}]`);
       return;
     }
 
@@ -456,6 +466,7 @@ export class FlippedJoin implements Input {
       case 'add':
       case 'remove':
       case 'child': {
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:flipped-join.ts:455:push-parent-has-related-child type=${change.type}]`);
         yield* this.#output.push(
           {
             ...change,
@@ -466,6 +477,7 @@ export class FlippedJoin implements Input {
         break;
       }
       case 'edit': {
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:flipped-join.ts:468:push-parent-edit]`);
         assert(
           rowEqualsForCompoundKey(
             change.oldNode.row,

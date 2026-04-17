@@ -71,6 +71,7 @@ export class FanOut implements FilterOperator {
   }
 
   *push(change: Change) {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:fan-out.ts:73:push type=${change.type} outputs=${this.#outputs.length}]`);
     for (const out of this.#outputs) {
       yield* out.push(change, this);
     }

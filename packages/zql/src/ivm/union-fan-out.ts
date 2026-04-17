@@ -24,6 +24,7 @@ export class UnionFanOut implements Operator {
   }
 
   *push(change: Change): Stream<'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:union-fan-out.ts:26:push type=${change.type} outputs=${this.#outputs.length}]`);
     must(this.#unionFanIn).fanOutStartedPushing();
     for (const output of this.#outputs) {
       yield* output.push(change, this);

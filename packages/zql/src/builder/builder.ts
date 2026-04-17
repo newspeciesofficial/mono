@@ -364,12 +364,15 @@ function applyWhere(
   delegate: BuilderDelegate,
   name: string,
 ): Input {
+  process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:builder.ts:361:apply-where type=${condition.type} hasFlips=${conditionIncludesFlippedSubqueryAtAnyLevel(condition)}]`);
   if (!conditionIncludesFlippedSubqueryAtAnyLevel(condition)) {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:builder.ts:366:apply-where-no-flips]`);
     return buildFilterPipeline(input, delegate, filterInput =>
       applyFilter(filterInput, condition, delegate, name),
     );
   }
 
+  process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:builder.ts:373:apply-where-with-flips]`);
   return applyFilterWithFlips(input, condition, delegate, name);
 }
 
@@ -379,15 +382,18 @@ function applyFilterWithFlips(
   delegate: BuilderDelegate,
   name: string,
 ): Input {
+  process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:builder.ts:376:apply-filter-with-flips type=${condition.type}]`);
   let end = input;
   assert(condition.type !== 'simple', 'Simple conditions cannot have flips');
 
   switch (condition.type) {
     case 'and': {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:builder.ts:386:apply-filter-with-flips-and]`);
       const [withFlipped, withoutFlipped] = partitionBranches(
         condition.conditions,
         conditionIncludesFlippedSubqueryAtAnyLevel,
       );
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:builder.ts:390:apply-filter-with-flips-and-partition withFlipped=${withFlipped.length} withoutFlipped=${withoutFlipped.length}]`);
       if (withoutFlipped.length > 0) {
         end = buildFilterPipeline(input, delegate, filterInput =>
           applyAnd(
@@ -408,10 +414,12 @@ function applyFilterWithFlips(
       break;
     }
     case 'or': {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:builder.ts:413:apply-filter-with-flips-or]`);
       const [withFlipped, withoutFlipped] = partitionBranches(
         condition.conditions,
         conditionIncludesFlippedSubqueryAtAnyLevel,
       );
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:builder.ts:417:apply-filter-with-flips-or-partition withFlipped=${withFlipped.length} withoutFlipped=${withoutFlipped.length}]`);
       assert(withFlipped.length > 0, 'Impossible to have no flips here');
 
       const ufo = new UnionFanOut(end);
@@ -448,6 +456,7 @@ function applyFilterWithFlips(
       break;
     }
     case 'correlatedSubquery': {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:builder.ts:453:apply-filter-with-flips-correlated-subquery alias=${condition.related.subquery.alias ?? ''}]`);
       const sq = condition.related;
       const child = buildPipelineInternal(
         sq.subquery,
@@ -505,6 +514,7 @@ function applyAnd(
   delegate: BuilderDelegate,
   name: string,
 ): FilterInput {
+  process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:builder.ts:509:apply-and conditions=${condition.conditions.length}]`);
   for (const subCondition of condition.conditions) {
     input = applyFilter(input, subCondition, delegate, name);
   }
@@ -517,10 +527,13 @@ export function applyOr(
   delegate: BuilderDelegate,
   name: string,
 ): FilterInput {
+  process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:builder.ts:520:apply-or conditions=${condition.conditions.length}]`);
   const [subqueryConditions, otherConditions] =
     groupSubqueryConditions(condition);
+  process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:builder.ts:522:apply-or-partition subqueryConditions=${subqueryConditions.length} otherConditions=${otherConditions.length}]`);
   // if there are no subquery conditions, no fan-in / fan-out is needed
   if (subqueryConditions.length === 0) {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:builder.ts:526:apply-or-no-subquery-simple-filter]`);
     const filter = new Filter(
       input,
       createPredicate({
@@ -532,6 +545,7 @@ export function applyOr(
     return filter;
   }
 
+  process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:builder.ts:541:apply-or-with-subquery-fan-out-fan-in]`);
   const fanOut = new FanOut(input);
   delegate.addEdge(input, fanOut);
   const branches = subqueryConditions.map(subCondition =>
@@ -616,9 +630,11 @@ function applyCorrelatedSubQuery(
   name: string,
   fromCondition: boolean,
 ) {
+  process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:builder.ts:617:apply-correlated-subquery alias=${sq.subquery.alias ?? ''} fromCondition=${fromCondition} limit=${sq.subquery.limit ?? 'none'}]`);
   // TODO: we only omit the join if the CSQ if from a condition since
   // we want to create an empty array for `related` fields that are `limit(0)`
   if (sq.subquery.limit === 0 && fromCondition) {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:builder.ts:621:apply-correlated-subquery-limit0-skip alias=${sq.subquery.alias ?? ''}]`);
     return end;
   }
 

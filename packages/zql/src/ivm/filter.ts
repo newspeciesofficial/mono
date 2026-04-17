@@ -52,6 +52,7 @@ export class Filter implements FilterOperator {
   }
 
   *push(change: Change) {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:filter.ts:54:push type=${change.type}]`);
     yield* filterPush(change, this.#output, this, this.#predicate);
   }
 }

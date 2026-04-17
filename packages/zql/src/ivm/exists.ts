@@ -105,6 +105,7 @@ export class Exists implements FilterOperator {
   }
 
   *push(change: Change): Stream<'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:exists.ts:107:push type=${change.type} rel=${this.#relationshipName} not=${this.#not}]`);
     assert(!this.#inPush, 'Unexpected re-entrancy');
     this.#inPush = true;
     try {
@@ -114,6 +115,7 @@ export class Exists implements FilterOperator {
         case 'add':
         case 'edit':
         case 'remove': {
+          process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:exists.ts:114:push-non-child type=${change.type}]`);
           yield* this.#pushWithFilter(change);
           return;
         }
@@ -127,14 +129,17 @@ export class Exists implements FilterOperator {
             change.child.change.type === 'edit' ||
             change.child.change.type === 'child'
           ) {
+            process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:exists.ts:130:push-child-other-rel-or-edit-child rel=${change.child.relationshipName}]`);
             yield* this.#pushWithFilter(change);
             return;
           }
           switch (change.child.change.type) {
             case 'add': {
+              process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:exists.ts:135:push-child-add rel=${this.#relationshipName}]`);
               const size = yield* this.#fetchSize(change.node);
               if (size === 1) {
                 if (this.#not) {
+                  process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:exists.ts:138:push-child-add-size1-not-exists-emit-remove]`);
                   // Since the add child change currently being processed is not
                   // pushed to output, the added child needs to be excluded from
                   // the remove being pushed to output (since the child has
@@ -153,6 +158,7 @@ export class Exists implements FilterOperator {
                     this,
                   );
                 } else {
+                  process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:exists.ts:161:push-child-add-size1-exists-emit-add]`);
                   yield* this.#output.push(
                     {
                       type: 'add',
@@ -162,14 +168,17 @@ export class Exists implements FilterOperator {
                   );
                 }
               } else {
+                process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:exists.ts:170:push-child-add-size-gt1-push-with-filter size=${size}]`);
                 yield* this.#pushWithFilter(change, size > 0);
               }
               return;
             }
             case 'remove': {
+              process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:exists.ts:174:push-child-remove rel=${this.#relationshipName}]`);
               const size = yield* this.#fetchSize(change.node);
               if (size === 0) {
                 if (this.#not) {
+                  process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:exists.ts:177:push-child-remove-size0-not-exists-emit-add]`);
                   yield* this.#output.push(
                     {
                       type: 'add',
@@ -178,6 +187,7 @@ export class Exists implements FilterOperator {
                     this,
                   );
                 } else {
+                  process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:exists.ts:185:push-child-remove-size0-exists-emit-remove]`);
                   // Since the remove child change currently being processed is
                   // not pushed to output, the removed child needs to be added to
                   // the remove being pushed to output.
@@ -198,6 +208,7 @@ export class Exists implements FilterOperator {
                   );
                 }
               } else {
+                process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:exists.ts:205:push-child-remove-size-gt0-push-with-filter size=${size}]`);
                 yield* this.#pushWithFilter(change, size > 0);
               }
               return;
@@ -239,7 +250,10 @@ export class Exists implements FilterOperator {
    */
   *#pushWithFilter(change: Change, exists?: boolean): Stream<'yield'> {
     if (yield* this.#filter(change.node, exists)) {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:exists.ts:248:push-with-filter-pass type=${change.type}]`);
       yield* this.#output.push(change, this);
+    } else {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:exists.ts:251:push-with-filter-drop type=${change.type}]`);
     }
   }
 

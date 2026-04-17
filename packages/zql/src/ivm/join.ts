@@ -108,6 +108,7 @@ export class Join implements Input {
   }
 
   *fetch(req: FetchRequest): Stream<Node | 'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:join.ts:110:fetch constraint=${JSON.stringify(req.constraint ?? null)}]`);
     for (const parentNode of this.#parent.fetch(req)) {
       if (parentNode === 'yield') {
         yield parentNode;
@@ -118,8 +119,10 @@ export class Join implements Input {
   }
 
   *#pushParent(change: Change): Stream<'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:join.ts:120:push-parent type=${change.type}]`);
     switch (change.type) {
       case 'add':
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:join.ts:122:push-parent-add]`);
         yield* this.#output.push(
           {
             type: 'add',
@@ -132,6 +135,7 @@ export class Join implements Input {
         );
         break;
       case 'remove':
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:join.ts:135:push-parent-remove]`);
         yield* this.#output.push(
           {
             type: 'remove',
@@ -144,6 +148,7 @@ export class Join implements Input {
         );
         break;
       case 'child':
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:join.ts:148:push-parent-child]`);
         yield* this.#output.push(
           {
             type: 'child',
@@ -157,6 +162,7 @@ export class Join implements Input {
         );
         break;
       case 'edit': {
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:join.ts:160:push-parent-edit]`);
         // Assert the edit could not change the relationship.
         assert(
           rowEqualsForCompoundKey(
@@ -188,15 +194,19 @@ export class Join implements Input {
   }
 
   *#pushChild(change: Change): Stream<'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:join.ts:193:push-child type=${change.type}]`);
     switch (change.type) {
       case 'add':
       case 'remove':
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:join.ts:196:push-child-add-or-remove type=${change.type}]`);
         yield* this.#pushChildChange(change.node.row, change);
         break;
       case 'child':
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:join.ts:200:push-child-child]`);
         yield* this.#pushChildChange(change.node.row, change);
         break;
       case 'edit': {
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:join.ts:203:push-child-edit]`);
         const childRow = change.node.row;
         const oldChildRow = change.oldNode.row;
         // Assert the edit could not change the relationship.

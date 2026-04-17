@@ -85,6 +85,7 @@ export class Take implements Operator {
   }
 
   *fetch(req: FetchRequest): Stream<Node | 'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:87:fetch constraint=${JSON.stringify(req.constraint ?? null)} limit=${this.#limit}]`);
     if (
       !this.#partitionKey ||
       (req.constraint &&
@@ -238,7 +239,9 @@ export class Take implements Operator {
   }
 
   *push(change: Change): Stream<'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:240:push type=${change.type} limit=${this.#limit}]`);
     if (change.type === 'edit') {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:242:push-edit]`);
       yield* this.#pushEditChange(change);
       return;
     }
@@ -246,6 +249,7 @@ export class Take implements Operator {
     const {takeState, takeStateKey, maxBound, constraint} =
       this.#getStateAndConstraint(change.node.row);
     if (!takeState) {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:249:push-no-take-state-skip type=${change.type}]`);
       return;
     }
 
@@ -253,6 +257,7 @@ export class Take implements Operator {
 
     if (change.type === 'add') {
       if (takeState.size < this.#limit) {
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:255:push-add-under-limit size=${takeState.size}]`);
         this.#setTakeState(
           takeStateKey,
           takeState.size + 1,
@@ -270,9 +275,11 @@ export class Take implements Operator {
         takeState.bound === undefined ||
         compareRows(change.node.row, takeState.bound) >= 0
       ) {
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:274:push-add-at-limit-beyond-bound-skip]`);
         return;
       }
       // added row < bound
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:280:push-add-at-limit-before-bound-displace]`);
       let beforeBoundNode: Node | undefined;
       let boundNode: Node | undefined;
       if (this.#limit === 1) {
@@ -332,13 +339,16 @@ export class Take implements Operator {
       yield* this.#pushWithRowHiddenFromFetch(change.node.row, removeChange);
       yield* this.#output.push(change, this);
     } else if (change.type === 'remove') {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:342:push-remove]`);
       if (takeState.bound === undefined) {
         // change is after bound
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:344:push-remove-no-bound-skip]`);
         return;
       }
       const compToBound = compareRows(change.node.row, takeState.bound);
       if (compToBound > 0) {
         // change is after bound
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:350:push-remove-after-bound-skip]`);
         return;
       }
       let beforeBoundNode: Node | undefined;
@@ -390,6 +400,7 @@ export class Take implements Operator {
       }
 
       if (newBound?.push) {
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:401:push-remove-within-bound-new-entry-promoted]`);
         yield* this.#output.push(change, this);
         this.#setTakeState(
           takeStateKey,
@@ -406,6 +417,7 @@ export class Take implements Operator {
         );
         return;
       }
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:418:push-remove-within-bound-no-replacement]`);
       this.#setTakeState(
         takeStateKey,
         takeState.size - 1,
@@ -414,18 +426,23 @@ export class Take implements Operator {
       );
       yield* this.#output.push(change, this);
     } else if (change.type === 'child') {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:428:push-child]`);
       // A 'child' change should be pushed to output if its row
       // is <= bound.
       if (
         takeState.bound &&
         compareRows(change.node.row, takeState.bound) <= 0
       ) {
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:434:push-child-within-bound-emit]`);
         yield* this.#output.push(change, this);
+      } else {
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:437:push-child-beyond-bound-skip]`);
       }
     }
   }
 
   *#pushEditChange(change: EditChange): Stream<'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:444:push-edit-change]`);
     assert(
       !this.#partitionKeyComparator ||
         this.#partitionKeyComparator(change.oldNode.row, change.node.row) === 0,
@@ -435,6 +452,7 @@ export class Take implements Operator {
     const {takeState, takeStateKey, maxBound, constraint} =
       this.#getStateAndConstraint(change.oldNode.row);
     if (!takeState) {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:454:push-edit-no-take-state-skip]`);
       return;
     }
 
@@ -458,13 +476,16 @@ export class Take implements Operator {
     if (oldCmp === 0) {
       // The new row is the new bound.
       if (newCmp === 0) {
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:476:push-edit-old-at-bound-new-at-bound]`);
         // no need to update the state since we are keeping the bounds
         yield* this.#output.push(change, this);
         return;
       }
 
       if (newCmp < 0) {
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:482:push-edit-old-at-bound-new-before-bound]`);
         if (this.#limit === 1) {
+          process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:483:push-edit-old-at-bound-new-before-bound-limit1]`);
           yield* replaceBoundAndForwardChange();
           return;
         }
@@ -504,6 +525,7 @@ export class Take implements Operator {
         return;
       }
 
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:528:push-edit-old-at-bound-new-after-bound]`);
       assert(newCmp > 0, 'New comparison must be greater than 0');
       // Find the first item at the old bounds. This will be the new bounds.
       let newBoundNode: Node | undefined;
@@ -556,14 +578,17 @@ export class Take implements Operator {
     }
 
     if (oldCmp > 0) {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:581:push-edit-old-after-bound]`);
       assert(newCmp !== 0, 'Invalid state. Row has duplicate primary key');
 
       // Both old and new outside of bounds
       if (newCmp > 0) {
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:584:push-edit-both-after-bound-skip]`);
         return;
       }
 
       // old was outside, new is inside. Pushing out the old bounds
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:588:push-edit-old-after-bound-new-inside-displace]`);
       assert(newCmp < 0, 'New comparison must be less than 0');
 
       let oldBoundNode: Node | undefined;
@@ -619,16 +644,18 @@ export class Take implements Operator {
     }
 
     if (oldCmp < 0) {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:648:push-edit-old-inside-bound]`);
       assert(newCmp !== 0, 'Invalid state. Row has duplicate primary key');
 
       // Both old and new inside of bounds
       if (newCmp < 0) {
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:651:push-edit-both-inside-bound]`);
         yield* this.#output.push(change, this);
         return;
       }
 
       // old was inside, new is larger than old bound
-
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:take.ts:657:push-edit-old-inside-new-outside-bound]`);
       assert(newCmp > 0, 'New comparison must be greater than 0');
 
       // at this point we need to find the row after the bound and use that or

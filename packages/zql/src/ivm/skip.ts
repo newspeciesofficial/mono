@@ -41,8 +41,10 @@ export class Skip implements Operator {
   }
 
   *fetch(req: FetchRequest): Stream<Node | 'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:skip.ts:43:fetch reverse=${req.reverse ?? false}]`);
     const start = this.#getStart(req);
     if (start === 'empty') {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:skip.ts:46:fetch-empty]`);
       return;
     }
     const nodes = this.#input.fetch({...req, start});
@@ -76,8 +78,10 @@ export class Skip implements Operator {
   }
 
   *push(change: Change): Stream<'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:skip.ts:78:push type=${change.type}]`);
     const shouldBePresent = (row: Row) => this.#shouldBePresent(row);
     if (change.type === 'edit') {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:skip.ts:80:push-edit]`);
       yield* maybeSplitAndPushEditChange(
         change,
         shouldBePresent,
@@ -90,7 +94,10 @@ export class Skip implements Operator {
     change satisfies AddChange | RemoveChange | ChildChange;
 
     if (shouldBePresent(change.node.row)) {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:skip.ts:92:push-pass type=${change.type}]`);
       yield* this.#output.push(change, this);
+    } else {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:skip.ts:95:push-drop type=${change.type}]`);
     }
   }
 

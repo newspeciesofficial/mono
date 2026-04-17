@@ -68,11 +68,13 @@ export class FanIn implements FilterOperator {
   }
 
   push(change: Change) {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:fan-in.ts:70:push-accumulate type=${change.type} accumulated=${this.#accumulatedPushes.length}]`);
     this.#accumulatedPushes.push(change);
     return emptyArray;
   }
 
   *fanOutDonePushingToAllBranches(fanOutChangeType: Change['type']) {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:fan-in.ts:75:fan-out-done fanOutChangeType=${fanOutChangeType} accumulated=${this.#accumulatedPushes.length}]`);
     if (this.#inputs.length === 0) {
       assert(
         this.#accumulatedPushes.length === 0,

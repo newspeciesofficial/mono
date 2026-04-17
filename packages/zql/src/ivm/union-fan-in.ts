@@ -109,9 +109,12 @@ export class UnionFanIn implements Operator {
   }
 
   *push(change: Change, pusher: InputBase): Stream<'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:union-fan-in.ts:111:push type=${change.type} fanOutPushStarted=${this.#fanOutPushStarted}]`);
     if (!this.#fanOutPushStarted) {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:union-fan-in.ts:113:push-internal-change type=${change.type}]`);
       yield* this.#pushInternalChange(change, pusher);
     } else {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:union-fan-in.ts:116:push-accumulate type=${change.type} accumulated=${this.#accumulatedPushes.length}]`);
       this.#accumulatedPushes.push(change);
     }
   }
@@ -138,7 +141,9 @@ export class UnionFanIn implements Operator {
    *    An edit that would result in a remove or add will have been split into an add/remove pair rather than being an edit.
    */
   *#pushInternalChange(change: Change, pusher: InputBase): Stream<'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:union-fan-in.ts:140:push-internal-change type=${change.type}]`);
     if (change.type === 'child') {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:union-fan-in.ts:142:push-internal-child-emit]`);
       yield* this.#output.push(change, this);
       return;
     }
@@ -165,6 +170,7 @@ export class UnionFanIn implements Operator {
       });
 
       if (first(fetchResult) !== undefined) {
+        process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:union-fan-in.ts:167:push-internal-other-branch-has-row-skip type=${change.type}]`);
         // Another branch has the row, so the add/remove is not needed.
         return;
       }
@@ -172,6 +178,7 @@ export class UnionFanIn implements Operator {
 
     assert(hadMatch, 'Pusher was not one of the inputs to union-fan-in!');
 
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:union-fan-in.ts:176:push-internal-no-other-branch-emit type=${change.type}]`);
     // No other branches have the row, so we can push the change.
     yield* this.#output.push(change, this);
   }
@@ -185,16 +192,19 @@ export class UnionFanIn implements Operator {
   }
 
   *fanOutDonePushing(fanOutChangeType: Change['type']): Stream<'yield'> {
+    process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:union-fan-in.ts:190:fan-out-done fanOutChangeType=${fanOutChangeType} accumulated=${this.#accumulatedPushes.length}]`);
     assert(
       this.#fanOutPushStarted,
       'UnionFanIn: fanOutDonePushing called without fanOutStartedPushing',
     );
     this.#fanOutPushStarted = false;
     if (this.#inputs.length === 0) {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:union-fan-in.ts:196:fan-out-done-no-inputs]`);
       return;
     }
 
     if (this.#accumulatedPushes.length === 0) {
+      process.env.IVM_PARITY_TRACE && console.error(`[ivm:branch:union-fan-in.ts:200:fan-out-done-no-accumulated-pushes]`);
       // It is possible for no forks to pass along the push.
       // E.g., if no filters match in any fork.
       return;
