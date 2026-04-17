@@ -904,18 +904,47 @@ impl Chain {
             );
         }
 
-        // Call push_child on the target ExistsT. Capture the target's
+        // Call push_child on the target. Capture the target's
         // relationship_name up-front so we can later look up its
         // `(child_table, child_pk)` entry in `exists_child_tables` for
         // emitting `RowChange::Edit` on the child table — mirrors TS
         // `Streamer#streamChanges` 'child' case recursion into
         // `cc.child.change` with the child schema at
         // `packages/zero-cache/src/services/view-syncer/pipeline-driver.ts:986-993`.
+        // Target is EITHER a top-level ExistsT OR an OrBranchesT
+        // whose inner branch contains an ExistsT for this child
+        // table. In the OR case we look up the relationship name via
+        // `OrBranchesT::find_exists_for_child_table_mut` which
+        // returns the matching inner ExistsT. Without this branch,
+        // OR-of-EXISTS queries (fuzz_00369 etc.) dropped child-Edit
+        // emissions because rel_name_for_edit resolved to `None` and
+        // the Change::Child arm at the bottom of this function early-
+        // continued.
         let target = &mut self.transformers[target_idx];
-        let rel_name_for_edit: Option<String> = target
-            .as_any_mut()
-            .and_then(|a| a.downcast_mut::<crate::ivm_v2::exists_t::ExistsT>())
-            .map(|et| et.relationship_name().to_string());
+        let rel_name_for_edit: Option<String> = {
+            // Try ExistsT first (top-level EXISTS). If that fails,
+            // fall back to OrBranchesT and look up the inner ExistsT
+            // that owns this child_table. Must re-take the Any
+            // reference between downcasts because each `downcast_mut`
+            // moves the borrow.
+            let any = target.as_any_mut().expect("target exposes any");
+            if (any as &mut dyn std::any::Any)
+                .downcast_mut::<crate::ivm_v2::exists_t::ExistsT>()
+                .is_some()
+            {
+                let et = target
+                    .as_any_mut()
+                    .expect("target exposes any")
+                    .downcast_mut::<crate::ivm_v2::exists_t::ExistsT>()
+                    .expect("already verified above");
+                Some(et.relationship_name().to_string())
+            } else {
+                let any2 = target.as_any_mut().expect("target exposes any");
+                any2.downcast_mut::<crate::ivm_v2::or_exists_t::OrBranchesT>()
+                    .and_then(|or_t| or_t.find_exists_for_child_table_mut(child_table))
+                    .map(|ex| ex.relationship_name().to_string())
+            }
+        };
         let emissions: Vec<Change> = target
             .push_child(change, child_table, &parent_snapshot)
             .collect();
