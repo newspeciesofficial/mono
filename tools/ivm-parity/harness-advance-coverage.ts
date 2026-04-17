@@ -302,8 +302,14 @@ function summarizeRowsDiff(ts: RowsByTable, rs: RowsByTable): string {
   for (const t of [...tables].sort()) {
     const a = ts[t] ?? {};
     const b = rs[t] ?? {};
-    if (Object.keys(a).length !== Object.keys(b).length) {
+    const aKeys = new Set(Object.keys(a));
+    const bKeys = new Set(Object.keys(b));
+    const onlyTs = [...aKeys].filter(k => !bKeys.has(k));
+    const onlyRs = [...bKeys].filter(k => !aKeys.has(k));
+    if (onlyTs.length > 0 || onlyRs.length > 0) {
       lines.push(`  ${t}: ts=${Object.keys(a).length} rs=${Object.keys(b).length}`);
+      for (const k of onlyTs.slice(0, 5)) lines.push(`    ts only: ${k}`);
+      for (const k of onlyRs.slice(0, 5)) lines.push(`    rs only: ${k}`);
     }
   }
   return lines.join('\n');
