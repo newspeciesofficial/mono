@@ -201,6 +201,12 @@ pub struct ExistsSpec {
     /// the child input — mirror of the `if (!csqCondition.flip)` gate
     /// at `builder.ts:310`.
     pub flip: bool,
+    /// Mirror of `CorrelatedSubquery.system` on the AST. TS uses this at
+    /// `packages/zql/src/builder/builder.ts:316-319` to pick
+    /// `PERMISSIONS_EXISTS_LIMIT` (1) vs `EXISTS_LIMIT` (3) when
+    /// capping the upfront-Join child subquery. Populated by the AST
+    /// builder from `CorrelatedSubquery.system`.
+    pub system: Option<zero_cache_types::ast::System>,
 }
 
 /// Multiple EXISTS conditions to stack in chain order. Used by the AST

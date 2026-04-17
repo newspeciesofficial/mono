@@ -43,19 +43,21 @@ use super::row_change::RowChange;
 const EXISTS_LIMIT: u64 = 3;
 
 /// Mirror of TS `PERMISSIONS_EXISTS_LIMIT` at
-/// `packages/zql/src/builder/builder.ts:224`. TS uses this when the CSQ
-/// has `system === 'permissions'`. We keep the constant for symmetry
-/// even though the current RS corpus does not exercise it — applied
-/// identically if/when permissions system support lands.
-#[allow(dead_code)]
+/// `packages/zql/src/builder/builder.ts:224`. TS uses this at
+/// `builder.ts:316-319` to cap permissions CSQs to 1 child row instead
+/// of the default 3. Picked based on `CorrelatedSubquery.system ===
+/// 'permissions'`.
 const PERMISSIONS_EXISTS_LIMIT: u64 = 1;
 
-/// Clone `sub_ast` and override its `limit` with `EXISTS_LIMIT`, mirror
-/// of the TS spread at `packages/zql/src/builder/builder.ts:314-320`:
+/// Clone `sub_ast` and override its `limit` with the TS per-system cap,
+/// mirror of the TS spread at
+/// `packages/zql/src/builder/builder.ts:316-320`:
 /// ```ignore
 ///   subquery: {
 ///     ...csqCondition.related.subquery,
-///     limit: EXISTS_LIMIT,
+///     limit: csqCondition.related.system === 'permissions'
+///       ? PERMISSIONS_EXISTS_LIMIT
+///       : EXISTS_LIMIT,
 ///   }
 /// ```
 /// Applied to the sub-AST used to build the UPFRONT-JOIN child input
@@ -63,9 +65,14 @@ const PERMISSIONS_EXISTS_LIMIT: u64 = 1;
 /// (if any) is discarded — matches TS behavior.
 fn clone_sub_ast_with_exists_limit(
     sub_ast: &zero_cache_types::ast::AST,
+    system: Option<&zero_cache_types::ast::System>,
 ) -> zero_cache_types::ast::AST {
     let mut cloned = sub_ast.clone();
-    cloned.limit = Some(EXISTS_LIMIT);
+    let cap = match system {
+        Some(zero_cache_types::ast::System::Permissions) => PERMISSIONS_EXISTS_LIMIT,
+        _ => EXISTS_LIMIT,
+    };
+    cloned.limit = Some(cap);
     cloned
 }
 
@@ -288,7 +295,12 @@ impl PipelineV2 {
                 // matching TS row counts for non-flip EXISTS shapes.
                 let sub_ast_owned;
                 let sub_ast_ref: &zero_cache_types::ast::AST = if apply_exists_limit {
-                    sub_ast_owned = clone_sub_ast_with_exists_limit(sub_ast);
+                    // Pass the es.system so TS's per-system cap
+                    // (`PERMISSIONS_EXISTS_LIMIT` vs `EXISTS_LIMIT`) at
+                    // `packages/zql/src/builder/builder.ts:316-319` is
+                    // honoured faithfully.
+                    sub_ast_owned =
+                        clone_sub_ast_with_exists_limit(sub_ast, es.system.as_ref());
                     &sub_ast_owned
                 } else {
                     sub_ast
