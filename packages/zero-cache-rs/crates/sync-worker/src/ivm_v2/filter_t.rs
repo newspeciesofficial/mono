@@ -67,9 +67,10 @@ impl Transformer for FilterT {
     }
 
     fn push<'a>(&'a mut self, change: Change) -> Box<dyn Iterator<Item = Change> + 'a> {
+        // mirrors TS filter.ts:55
         if std::env::var("IVM_PARITY_TRACE").is_ok() {
             eprintln!(
-                "[ivm:rs:filter_t:push] op={}",
+                "[ivm:rs:filter.ts:54:push type={}]",
                 match &change {
                     Change::Add(_) => "Add",
                     Change::Remove(_) => "Remove",
@@ -80,25 +81,40 @@ impl Transformer for FilterT {
         }
         let out: Option<Change> = match change {
             Change::Add(AddChange { ref node }) => {
-                if (self.push_predicate)(&node.row) {
-                    Some(change)
-                } else {
-                    None
+                let pass = (self.push_predicate)(&node.row);
+                // mirrors TS filter-push.ts:15/23/26
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    if pass {
+                        eprintln!("[ivm:rs:filter-push.ts:21:filter-pass type=Add]");
+                    } else {
+                        eprintln!("[ivm:rs:filter-push.ts:24:filter-drop type=Add]");
+                    }
                 }
+                if pass { Some(change) } else { None }
             }
             Change::Remove(RemoveChange { ref node }) => {
-                if (self.push_predicate)(&node.row) {
-                    Some(change)
-                } else {
-                    None
+                let pass = (self.push_predicate)(&node.row);
+                // mirrors TS filter-push.ts:23/26
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    if pass {
+                        eprintln!("[ivm:rs:filter-push.ts:21:filter-pass type=Remove]");
+                    } else {
+                        eprintln!("[ivm:rs:filter-push.ts:24:filter-drop type=Remove]");
+                    }
                 }
+                if pass { Some(change) } else { None }
             }
             Change::Child(ref c) => {
-                if (self.push_predicate)(&c.node.row) {
-                    Some(change)
-                } else {
-                    None
+                let pass = (self.push_predicate)(&c.node.row);
+                // mirrors TS filter-push.ts:31/34
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    if pass {
+                        eprintln!("[ivm:rs:filter-push.ts:27:filter-pass type=child]");
+                    } else {
+                        eprintln!("[ivm:rs:filter-push.ts:30:filter-drop type=child]");
+                    }
                 }
+                if pass { Some(change) } else { None }
             }
             Change::Edit(edit) => maybe_split_edit(edit, &*self.push_predicate),
         };

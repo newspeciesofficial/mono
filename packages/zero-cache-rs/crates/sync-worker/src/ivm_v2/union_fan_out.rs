@@ -44,6 +44,14 @@ impl Input for UnionFanOut {
 }
 impl Operator for UnionFanOut {
     fn push<'a>(&'a mut self, change: Change) -> Box<dyn Iterator<Item = Change> + 'a> {
+        // mirrors TS union-fan-out.ts:27
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:union-fan-out.ts:26:push type={} outputs={}]",
+                match &change { Change::Add(_) => "Add", Change::Remove(_) => "Remove", Change::Child(_) => "Child", Change::Edit(_) => "Edit" },
+                self.branch_count
+            );
+        }
         Box::new(std::iter::once(change))
     }
 }

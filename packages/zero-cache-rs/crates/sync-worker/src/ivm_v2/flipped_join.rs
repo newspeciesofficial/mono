@@ -79,8 +79,35 @@ impl FlippedJoin {
         &'a mut self,
         change: Change,
     ) -> Box<dyn Iterator<Item = Change> + 'a> {
+        // mirrors TS flipped-join.ts:314
         if std::env::var("IVM_PARITY_TRACE").is_ok() {
-            eprintln!("[ivm:rs:flipped_join:push_child] op={}", change_name(&change));
+            eprintln!(
+                "[ivm:rs:flipped-join.ts:312:push-child type={}]",
+                change_name(&change)
+            );
+        }
+        match &change {
+            Change::Add(_) | Change::Remove(_) => {
+                // mirrors TS flipped-join.ts:318
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!(
+                        "[ivm:rs:flipped-join.ts:315:push-child-add-or-remove type={}]",
+                        change_name(&change)
+                    );
+                }
+            }
+            Change::Edit(_) => {
+                // mirrors TS flipped-join.ts:322
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!("[ivm:rs:flipped-join.ts:318:push-child-edit]");
+                }
+            }
+            Change::Child(_) => {
+                // mirrors TS flipped-join.ts:335
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!("[ivm:rs:flipped-join.ts:330:push-child-child]");
+                }
+            }
         }
         if let Change::Edit(ref edit) = change {
             assert!(
@@ -97,12 +124,18 @@ impl FlippedJoin {
         &'a mut self,
         change: Change,
     ) -> Box<dyn Iterator<Item = Change> + 'a> {
-        eprintln!(
-            "[TRACE ivm_v2] FlippedJoin::push_parent enter op={} rel={}",
-            change_name(&change),
-            self.relationship_name
-        );
+        // mirrors TS flipped-join.ts:431
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:flipped-join.ts:422:push-parent type={}]",
+                change_name(&change)
+            );
+        }
         if let Change::Edit(ref edit) = change {
+            // mirrors TS flipped-join.ts:480
+            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                eprintln!("[ivm:rs:flipped-join.ts:468:push-parent-edit]");
+            }
             assert!(
                 row_equals_for_compound_key(&edit.old_node.row, &edit.node.row, &self.parent_key),
                 "Parent edit must not change relationship."
@@ -117,6 +150,13 @@ impl FlippedJoin {
         let constraint_opt: Option<Constraint> =
             build_join_constraint(&parent_row, &self.parent_key, &self.child_key);
         let Some(constraint) = constraint_opt else {
+            // mirrors TS flipped-join.ts:461
+            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                eprintln!(
+                    "[ivm:rs:flipped-join.ts:451:push-parent-no-related-child-skip type={}]",
+                    change_name(&change)
+                );
+            }
             return Box::new(std::iter::empty());
         };
         let req = FetchRequest {
@@ -124,6 +164,23 @@ impl FlippedJoin {
             ..FetchRequest::default()
         };
         let child_nodes: Vec<Node> = self.child.fetch(req).collect();
+        if child_nodes.is_empty() {
+            // mirrors TS flipped-join.ts:461
+            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                eprintln!(
+                    "[ivm:rs:flipped-join.ts:451:push-parent-no-related-child-skip type={}]",
+                    change_name(&change)
+                );
+            }
+            return Box::new(std::iter::empty());
+        }
+        // mirrors TS flipped-join.ts:469
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:flipped-join.ts:455:push-parent-has-related-child type={}]",
+                change_name(&change)
+            );
+        }
         let rel_name = self.relationship_name.clone();
         let change_shared = change;
         let out: Vec<Change> = child_nodes
@@ -168,6 +225,13 @@ impl Input for FlippedJoin {
     /// hydration path already materialises chunks before handing them
     /// across the napi boundary.
     fn fetch<'a>(&'a mut self, req: FetchRequest) -> Box<dyn Iterator<Item = Node> + 'a> {
+        // mirrors TS flipped-join.ts:117
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:flipped-join.ts:116:fetch constraint={:?}]",
+                req.constraint
+            );
+        }
         // Translate constraints: callers pass a constraint keyed by the
         // parent's field name (e.g., `parent_key=[...]`). Map those to
         // the equivalent child_key entries so the child fetch narrows

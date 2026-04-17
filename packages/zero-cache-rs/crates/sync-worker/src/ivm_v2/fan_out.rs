@@ -64,8 +64,13 @@ impl Operator for FanOut {
         // Emit once; caller dispatches to each branch by cloning the
         // iterator result upstream. Since Change isn't Clone, the caller
         // is responsible for choosing how to replicate.
+        // mirrors TS fan-out.ts:74
         if std::env::var("IVM_PARITY_TRACE").is_ok() {
-            eprintln!("[ivm:rs:fan_out:push] branches={}", self.branch_count);
+            eprintln!(
+                "[ivm:rs:fan-out.ts:73:push type={} outputs={}]",
+                match &change { Change::Add(_) => "Add", Change::Remove(_) => "Remove", Change::Child(_) => "Child", Change::Edit(_) => "Edit" },
+                self.branch_count
+            );
         }
         Box::new(std::iter::once(change))
     }

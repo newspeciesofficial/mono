@@ -566,6 +566,13 @@ impl Transformer for ExistsT {
     ) -> Box<dyn Iterator<Item = Change> + 'a> {
         // Gate: only react if this ExistsT owns the mutated child table.
         if self.child_table.as_deref() != Some(child_table) {
+            // mirrors TS exists.ts:132
+            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                eprintln!(
+                    "[ivm:rs:exists.ts:130:push-child-other-rel-or-edit-child rel={}]",
+                    child_table
+                );
+            }
             return Box::new(std::iter::empty());
         }
         // Extract child row (the one whose presence/absence drives the flip).
@@ -612,6 +619,13 @@ impl Transformer for ExistsT {
                     child_row
                 );
             }
+            // mirrors TS exists.ts:138
+            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                eprintln!(
+                    "[ivm:rs:exists.ts:135:push-child-add rel={}]",
+                    self.relationship_name
+                );
+            }
             match &change {
                 Change::Add(_) => {
                     // TS implements this at packages/zql/src/ivm/exists.ts:136
@@ -642,13 +656,33 @@ impl Transformer for ExistsT {
                         };
                         let node = Node { row: parent_row, relationships };
                         if self.not {
+                            // mirrors TS exists.ts:142
+                            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                                eprintln!("[ivm:rs:exists.ts:138:push-child-add-size1-not-exists-emit-remove]");
+                            }
                             emissions.push(Change::Remove(RemoveChange { node }));
                         } else {
+                            // mirrors TS exists.ts:161
+                            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                                eprintln!("[ivm:rs:exists.ts:161:push-child-add-size1-exists-emit-add]");
+                            }
                             emissions.push(Change::Add(AddChange { node }));
+                        }
+                    } else {
+                        // mirrors TS exists.ts:171
+                        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                            eprintln!("[ivm:rs:exists.ts:170:push-child-add-size-gt1-push-with-filter size={}]", new_size);
                         }
                     }
                 }
                 Change::Remove(_) => {
+                    // mirrors TS exists.ts:177
+                    if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                        eprintln!(
+                            "[ivm:rs:exists.ts:174:push-child-remove rel={}]",
+                            self.relationship_name
+                        );
+                    }
                     // TS implements this at packages/zql/src/ivm/exists.ts:171
                     // as `if (size === 0)` — POST-mutation size is 0 (last
                     // child was just removed, flip 1→0). RS `child_size_for`
@@ -675,9 +709,22 @@ impl Transformer for ExistsT {
                         };
                         let node = Node { row: parent_row, relationships };
                         if self.not {
+                            // mirrors TS exists.ts:181
+                            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                                eprintln!("[ivm:rs:exists.ts:177:push-child-remove-size0-not-exists-emit-add]");
+                            }
                             emissions.push(Change::Add(AddChange { node }));
                         } else {
+                            // mirrors TS exists.ts:190
+                            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                                eprintln!("[ivm:rs:exists.ts:185:push-child-remove-size0-exists-emit-remove]");
+                            }
                             emissions.push(Change::Remove(RemoveChange { node }));
+                        }
+                    } else {
+                        // mirrors TS exists.ts:211
+                        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                            eprintln!("[ivm:rs:exists.ts:205:push-child-remove-size-gt0-push-with-filter size={}]", new_size);
                         }
                     }
                 }
@@ -784,10 +831,13 @@ impl Transformer for ExistsT {
     }
 
     fn push<'a>(&'a mut self, change: Change) -> Box<dyn Iterator<Item = Change> + 'a> {
+        // mirrors TS exists.ts:108
         if std::env::var("IVM_PARITY_TRACE").is_ok() {
             eprintln!(
-                "[ivm:rs:exists:push] enter rel={}",
-                self.relationship_name
+                "[ivm:rs:exists.ts:107:push type={} rel={} not={}]",
+                match &change { Change::Add(_) => "Add", Change::Remove(_) => "Remove", Change::Child(_) => "Child", Change::Edit(_) => "Edit" },
+                self.relationship_name,
+                self.not
             );
         }
         self.in_push = true;
@@ -811,21 +861,48 @@ impl Transformer for ExistsT {
         };
         let out = match change {
             Change::Add(AddChange { node }) => {
-                if self.should_forward(&node) {
+                let pass = self.should_forward(&node);
+                // mirrors TS exists.ts:253
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    if pass {
+                        eprintln!("[ivm:rs:exists.ts:248:push-with-filter-pass type=Add]");
+                    } else {
+                        eprintln!("[ivm:rs:exists.ts:251:push-with-filter-drop type=Add]");
+                    }
+                }
+                if pass {
                     Some(Change::Add(AddChange { node: decorate(node, self) }))
                 } else {
                     None
                 }
             }
             Change::Remove(RemoveChange { node }) => {
-                if self.should_forward(&node) {
+                let pass = self.should_forward(&node);
+                // mirrors TS exists.ts:253
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    if pass {
+                        eprintln!("[ivm:rs:exists.ts:248:push-with-filter-pass type=Remove]");
+                    } else {
+                        eprintln!("[ivm:rs:exists.ts:251:push-with-filter-drop type=Remove]");
+                    }
+                }
+                if pass {
                     Some(Change::Remove(RemoveChange { node: decorate(node, self) }))
                 } else {
                     None
                 }
             }
             Change::Child(c) => {
-                if self.should_forward(&c.node) {
+                let pass = self.should_forward(&c.node);
+                // mirrors TS exists.ts:253
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    if pass {
+                        eprintln!("[ivm:rs:exists.ts:248:push-with-filter-pass type=Child]");
+                    } else {
+                        eprintln!("[ivm:rs:exists.ts:251:push-with-filter-drop type=Child]");
+                    }
+                }
+                if pass {
                     let decorated_node = decorate(c.node, self);
                     Some(Change::Child(ChildChange {
                         node: decorated_node,
@@ -836,6 +913,10 @@ impl Transformer for ExistsT {
                 }
             }
             Change::Edit(edit) => {
+                // mirrors TS exists.ts:118
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!("[ivm:rs:exists.ts:114:push-non-child type=Edit]");
+                }
                 // Mirror of TS `Exists::*push` case 'edit' at
                 // `packages/zql/src/ivm/exists.ts:113-119` — Edit falls
                 // through to `#pushWithFilter(change)` which calls
@@ -851,7 +932,16 @@ impl Transformer for ExistsT {
                 // native `Exists::#fetchSize` iterating
                 // `node.relationships[name]()`) or the fail-open
                 // relationships-only path.
-                if self.should_forward(&edit.node) {
+                let pass = self.should_forward(&edit.node);
+                // mirrors TS exists.ts:253
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    if pass {
+                        eprintln!("[ivm:rs:exists.ts:248:push-with-filter-pass type=Edit]");
+                    } else {
+                        eprintln!("[ivm:rs:exists.ts:251:push-with-filter-drop type=Edit]");
+                    }
+                }
+                if pass {
                     Some(Change::Edit(edit))
                 } else {
                     None

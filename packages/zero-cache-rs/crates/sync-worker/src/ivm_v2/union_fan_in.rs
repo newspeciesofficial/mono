@@ -48,9 +48,38 @@ impl Operator for UnionFanIn {
         let key = dedup_key(&change);
         let c = self.dedup.entry(key).or_insert(0);
         *c += 1;
+        // mirrors TS union-fan-in.ts:112
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:union-fan-in.ts:111:push type={} fanOutPushStarted={}]",
+                match &change { Change::Add(_) => "Add", Change::Remove(_) => "Remove", Change::Child(_) => "Child", Change::Edit(_) => "Edit" },
+                *c > 1
+            );
+        }
         if *c == 1 {
+            // mirrors TS union-fan-in.ts:114
+            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                eprintln!(
+                    "[ivm:rs:union-fan-in.ts:113:push-internal-change type={}]",
+                    match &change { Change::Add(_) => "Add", Change::Remove(_) => "Remove", Change::Child(_) => "Child", Change::Edit(_) => "Edit" }
+                );
+            }
+            // mirrors TS union-fan-in.ts:181
+            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                eprintln!(
+                    "[ivm:rs:union-fan-in.ts:176:push-internal-no-other-branch-emit type={}]",
+                    match &change { Change::Add(_) => "Add", Change::Remove(_) => "Remove", Change::Child(_) => "Child", Change::Edit(_) => "Edit" }
+                );
+            }
             Box::new(std::iter::once(change))
         } else {
+            // mirrors TS union-fan-in.ts:173
+            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                eprintln!(
+                    "[ivm:rs:union-fan-in.ts:167:push-internal-other-branch-has-row-skip type={}]",
+                    match &change { Change::Add(_) => "Add", Change::Remove(_) => "Remove", Change::Child(_) => "Child", Change::Edit(_) => "Edit" }
+                );
+            }
             Box::new(std::iter::empty())
         }
     }

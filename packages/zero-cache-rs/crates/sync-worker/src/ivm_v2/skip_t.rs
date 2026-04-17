@@ -57,10 +57,18 @@ impl Transformer for SkipT {
     }
 
     fn push<'a>(&'a mut self, change: Change) -> Box<dyn Iterator<Item = Change> + 'a> {
+        // mirrors TS skip.ts:81
         if std::env::var("IVM_PARITY_TRACE").is_ok() {
-            eprintln!("[ivm:rs:skip_t:push] enter");
+            eprintln!(
+                "[ivm:rs:skip.ts:78:push type={}]",
+                match &change { Change::Add(_) => "Add", Change::Remove(_) => "Remove", Change::Child(_) => "Child", Change::Edit(_) => "Edit" }
+            );
         }
         if let Change::Edit(edit) = change {
+            // mirrors TS skip.ts:84
+            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                eprintln!("[ivm:rs:skip.ts:80:push-edit]");
+            }
             let comparator = Arc::clone(&self.comparator);
             let bound_row = self.bound.row.clone();
             let exclusive = self.bound.exclusive;
@@ -81,8 +89,22 @@ impl Transformer for SkipT {
             Change::Edit(_) => unreachable!(),
         };
         if self.should_be_present(row_ref) {
+            // mirrors TS skip.ts:97
+            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                eprintln!(
+                    "[ivm:rs:skip.ts:92:push-pass type={}]",
+                    match &change { Change::Add(_) => "Add", Change::Remove(_) => "Remove", Change::Child(_) => "Child", Change::Edit(_) => "Edit" }
+                );
+            }
             Box::new(std::iter::once(change))
         } else {
+            // mirrors TS skip.ts:100
+            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                eprintln!(
+                    "[ivm:rs:skip.ts:95:push-drop type={}]",
+                    match &change { Change::Add(_) => "Add", Change::Remove(_) => "Remove", Change::Child(_) => "Child", Change::Edit(_) => "Edit" }
+                );
+            }
             Box::new(std::iter::empty())
         }
     }

@@ -167,6 +167,7 @@ impl Transformer for TakeT {
     }
 
     fn push<'a>(&'a mut self, change: Change) -> Box<dyn Iterator<Item = Change> + 'a> {
+        // mirrors TS take.ts:242
         if std::env::var("IVM_PARITY_TRACE").is_ok() {
             let row = match &change {
                 Change::Add(c) => &c.node.row,
@@ -175,23 +176,38 @@ impl Transformer for TakeT {
                 Change::Child(c) => &c.node.row,
             };
             let key = take_state_key(self.partition_key.as_ref(), row);
-            let (size, has_bound) = self
+            let limit = self.limit;
+            let (size, _has_bound) = self
                 .states
                 .get(&key)
                 .map(|s| (s.size, s.bound.is_some()))
                 .unwrap_or((0, false));
             eprintln!(
-                "[ivm:rs:take_t:push] op={} partition={:?} size={} has_bound={}",
+                "[ivm:rs:take.ts:240:push type={} limit={}]",
                 match &change {
                     Change::Add(_) => "Add",
                     Change::Remove(_) => "Remove",
                     Change::Child(_) => "Child",
                     Change::Edit(_) => "Edit",
                 },
-                key,
-                size,
-                has_bound,
+                limit,
             );
+            // mirrors TS take.ts:252
+            if matches!(change, Change::Edit(_)) {
+                eprintln!("[ivm:rs:take.ts:242:push-edit]");
+            }
+            // mirrors TS take.ts:252 — push-no-take-state-skip
+            if size == 0 && !self.states.contains_key(&key) {
+                eprintln!(
+                    "[ivm:rs:take.ts:249:push-no-take-state-skip type={}]",
+                    match &change {
+                        Change::Add(_) => "Add",
+                        Change::Remove(_) => "Remove",
+                        Change::Child(_) => "Child",
+                        Change::Edit(_) => "Edit",
+                    }
+                );
+            }
         }
         let out = self.push_internal(change);
         Box::new(out.into_iter())
@@ -223,17 +239,11 @@ impl TakeT {
                     let s = self.states.entry(key.clone()).or_default();
                     (s.size, s.bound.clone())
                 };
-                if std::env::var("IVM_PARITY_TRACE").is_ok() {
-                    eprintln!(
-                        "[ivm:rs:take_t:internal_add] size={}/limit={} partition={:?} bound_id={:?} row_id={:?}",
-                        size,
-                        self.limit,
-                        key,
-                        bound_cloned.as_ref().and_then(|r| r.get("id").cloned()),
-                        node.row.get("id").cloned()
-                    );
-                }
                 if size < self.limit {
+                    // mirrors TS take.ts:260
+                    if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                        eprintln!("[ivm:rs:take.ts:255:push-add-under-limit size={}]", size);
+                    }
                     let s = self.states.entry(key).or_default();
                     s.size += 1;
                     let row = node.row.clone();
@@ -253,13 +263,11 @@ impl TakeT {
                         .map_or(false, |b| {
                             (self.compare_rows)(b, &node.row) == CmpOrdering::Greater
                         });
-                    if std::env::var("IVM_PARITY_TRACE").is_ok() {
-                        eprintln!(
-                            "[ivm:rs:take_t:internal_add] at_limit replaces={}",
-                            replaces
-                        );
-                    }
                     if replaces {
+                        // mirrors TS take.ts:282
+                        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                            eprintln!("[ivm:rs:take.ts:280:push-add-at-limit-before-bound-displace]");
+                        }
                         let old_bound = bound_cloned.clone().unwrap();
                         out.push(Change::Remove(RemoveChange {
                             node: Node {
@@ -281,11 +289,20 @@ impl TakeT {
                             }),
                             ..FetchRequest::default()
                         });
+                    } else {
+                        // mirrors TS take.ts:278
+                        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                            eprintln!("[ivm:rs:take.ts:274:push-add-at-limit-beyond-bound-skip]");
+                        }
                     }
                     // else: drop silently.
                 }
             }
             Change::Remove(RemoveChange { node }) => {
+                // mirrors TS take.ts:342
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!("[ivm:rs:take.ts:342:push-remove]");
+                }
                 // Mirror of TS `packages/zql/src/ivm/take.ts:334-343`:
                 // if bound is undefined (no window yet) OR
                 // `compareRows(change.row, bound) > 0` (row ranks AFTER
@@ -303,11 +320,27 @@ impl TakeT {
                 let key = take_state_key(self.partition_key.as_ref(), &node.row);
                 let (bound_opt, _size) = match self.states.get(&key) {
                     Some(s) => (s.bound.clone(), s.size),
-                    None => return out,
+                    None => {
+                        // mirrors TS take.ts:345
+                        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                            eprintln!("[ivm:rs:take.ts:344:push-remove-no-bound-skip]");
+                        }
+                        return out;
+                    }
                 };
-                let Some(bound) = bound_opt else { return out };
+                let Some(bound) = bound_opt else {
+                    // mirrors TS take.ts:345
+                    if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                        eprintln!("[ivm:rs:take.ts:344:push-remove-no-bound-skip]");
+                    }
+                    return out;
+                };
                 let cmp = (self.compare_rows)(&node.row, &bound);
                 if cmp == CmpOrdering::Greater {
+                    // mirrors TS take.ts:351
+                    if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                        eprintln!("[ivm:rs:take.ts:350:push-remove-after-bound-skip]");
+                    }
                     return out;
                 }
                 let was_bound = cmp == CmpOrdering::Equal;
@@ -316,6 +349,15 @@ impl TakeT {
                 if was_bound {
                     s.bound = None;
                     // Will be re-established by next fetch/refetch.
+                    // mirrors TS take.ts:420
+                    if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                        eprintln!("[ivm:rs:take.ts:418:push-remove-within-bound-no-replacement]");
+                    }
+                } else {
+                    // mirrors TS take.ts:403
+                    if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                        eprintln!("[ivm:rs:take.ts:401:push-remove-within-bound-new-entry-promoted]");
+                    }
                 }
                 out.push(Change::Remove(RemoveChange { node }));
             }
@@ -339,6 +381,10 @@ impl TakeT {
                 out.extend(self.push_internal(Change::Add(AddChange { node })));
             }
             Change::Child(child) => {
+                // mirrors TS take.ts:429
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!("[ivm:rs:take.ts:428:push-child]");
+                }
                 // ChildChange = "a relationship of `child.node` changed."
                 // Forward only if the parent row is currently in the
                 // partition's window — mirror of TS take.ts:416-425
@@ -355,7 +401,16 @@ impl TakeT {
                     None => false,
                 };
                 if in_window {
+                    // mirrors TS take.ts:436
+                    if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                        eprintln!("[ivm:rs:take.ts:434:push-child-within-bound-emit]");
+                    }
                     out.push(Change::Child(child));
+                } else {
+                    // mirrors TS take.ts:439
+                    if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                        eprintln!("[ivm:rs:take.ts:437:push-child-beyond-bound-skip]");
+                    }
                 }
             }
         }

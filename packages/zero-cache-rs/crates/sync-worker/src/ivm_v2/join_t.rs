@@ -97,6 +97,39 @@ impl JoinT {
     /// Parent-side push: emit the change with parent keys unchanged.
     /// Asserts that Edit doesn't touch the join key.
     pub fn push_parent(&self, change: Change) -> Option<Change> {
+        // mirrors TS join.ts:122
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:join.ts:120:push-parent type={}]",
+                match &change { Change::Add(_) => "Add", Change::Remove(_) => "Remove", Change::Child(_) => "Child", Change::Edit(_) => "Edit" }
+            );
+        }
+        match &change {
+            Change::Add(_) => {
+                // mirrors TS join.ts:125
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!("[ivm:rs:join.ts:122:push-parent-add]");
+                }
+            }
+            Change::Remove(_) => {
+                // mirrors TS join.ts:138
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!("[ivm:rs:join.ts:135:push-parent-remove]");
+                }
+            }
+            Change::Child(_) => {
+                // mirrors TS join.ts:151
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!("[ivm:rs:join.ts:148:push-parent-child]");
+                }
+            }
+            Change::Edit(_) => {
+                // mirrors TS join.ts:165
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!("[ivm:rs:join.ts:160:push-parent-edit]");
+                }
+            }
+        }
         if let Change::Edit(ref edit) = change {
             assert!(
                 row_equals_for_compound_key(&edit.old_node.row, &edit.node.row, &self.parent_key),
@@ -114,6 +147,36 @@ impl JoinT {
         change: Change,
         parent_snapshot: &[Node],
     ) -> Vec<Change> {
+        // mirrors TS join.ts:197
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:join.ts:193:push-child type={}]",
+                match &change { Change::Add(_) => "Add", Change::Remove(_) => "Remove", Change::Child(_) => "Child", Change::Edit(_) => "Edit" }
+            );
+        }
+        match &change {
+            Change::Add(_) | Change::Remove(_) => {
+                // mirrors TS join.ts:201
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!(
+                        "[ivm:rs:join.ts:196:push-child-add-or-remove type={}]",
+                        match &change { Change::Add(_) => "Add", _ => "Remove" }
+                    );
+                }
+            }
+            Change::Child(_) => {
+                // mirrors TS join.ts:205
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!("[ivm:rs:join.ts:200:push-child-child]");
+                }
+            }
+            Change::Edit(_) => {
+                // mirrors TS join.ts:209
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!("[ivm:rs:join.ts:203:push-child-edit]");
+                }
+            }
+        }
         if let Change::Edit(ref edit) = change {
             assert!(
                 row_equals_for_compound_key(&edit.old_node.row, &edit.node.row, &self.child_key),
@@ -167,8 +230,16 @@ impl BinaryTransformer for JoinT {
         &'a mut self,
         parent_upstream: Box<dyn Iterator<Item = Node> + 'a>,
         child_snapshot: Arc<Vec<Node>>,
-        _req: FetchRequest,
+        req: FetchRequest,
     ) -> Box<dyn Iterator<Item = Node> + 'a> {
+        // mirrors TS join.ts:111
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:join.ts:110:fetch constraint={:?}]",
+                req.constraint
+            );
+        }
+        let _ = req; // req consumed by logging; not used in iteration logic
         let parent_key = self.parent_key.clone();
         let child_key = self.child_key.clone();
         let relationship_name = self.relationship_name.clone();

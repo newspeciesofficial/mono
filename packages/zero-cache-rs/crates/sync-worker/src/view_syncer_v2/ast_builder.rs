@@ -100,9 +100,42 @@ pub fn ast_to_chain_spec(
             }
         }
     }
+    // mirrors TS builder.ts:367
+    let has_flips = ast
+        .where_clause
+        .as_deref()
+        .map(|c| condition_has_flips(c))
+        .unwrap_or(false);
+    if std::env::var("IVM_PARITY_TRACE").is_ok() {
+        let cond_type = ast
+            .where_clause
+            .as_deref()
+            .map(|c| condition_type_name(c))
+            .unwrap_or("none");
+        eprintln!(
+            "[ivm:rs:builder.ts:361:apply-where type={} hasFlips={}]",
+            cond_type,
+            has_flips
+        );
+    }
     let or_branches: Vec<super::pipeline::OrBranchSpec> =
         match ast.where_clause.as_deref().map(peel_singleton_and) {
             Some(Condition::Or { conditions }) => {
+                // mirrors TS builder.ts:375
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!("[ivm:rs:builder.ts:373:apply-where-with-flips]");
+                }
+                // mirrors TS builder.ts:385
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!(
+                        "[ivm:rs:builder.ts:376:apply-filter-with-flips type=Or]"
+                    );
+                    eprintln!(
+                        "[ivm:rs:builder.ts:417:apply-filter-with-flips-or-partition withFlipped={} withoutFlipped={}]",
+                        conditions.iter().filter(|c| condition_has_flips(c)).count(),
+                        conditions.iter().filter(|c| !condition_has_flips(c)).count()
+                    );
+                }
                 // For each branch, recursively split into scalar part
                 // + EXISTS list. Mirror of TS
                 // `applyFilterWithFlips(end, cond, ...)` recursed per
@@ -110,6 +143,17 @@ pub fn ast_to_chain_spec(
                 let mut branches = Vec::with_capacity(conditions.len());
                 let mut bail = false;
                 for cond in conditions {
+                    // mirrors TS builder.ts:459
+                    if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                        if let Condition::CorrelatedSubquery { related, .. } = cond {
+                            let alias = related.subquery.alias.clone()
+                                .unwrap_or_else(|| related.subquery.table.clone());
+                            eprintln!(
+                                "[ivm:rs:builder.ts:453:apply-filter-with-flips-correlated-subquery alias={}]",
+                                alias
+                            );
+                        }
+                    }
                     match split_branch(cond) {
                         Ok(b) => branches.push(b),
                         Err(()) => {
@@ -130,7 +174,25 @@ pub fn ast_to_chain_spec(
                     branches
                 }
             }
-            _ => Vec::new(),
+            Some(Condition::And { conditions }) => {
+                // mirrors TS builder.ts:391
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!("[ivm:rs:builder.ts:386:apply-filter-with-flips-and]");
+                    eprintln!(
+                        "[ivm:rs:builder.ts:390:apply-filter-with-flips-and-partition withFlipped={} withoutFlipped={}]",
+                        conditions.iter().filter(|c| condition_has_flips(c)).count(),
+                        conditions.iter().filter(|c| !condition_has_flips(c)).count()
+                    );
+                }
+                Vec::new()
+            }
+            _ => {
+                // mirrors TS builder.ts:369
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!("[ivm:rs:builder.ts:366:apply-where-no-flips]");
+                }
+                Vec::new()
+            }
         };
     let (exists, all_exists) = if or_branches.is_empty() {
         let mut all_exists = collect_all_exists(ast);
@@ -437,6 +499,29 @@ fn build_push_predicate(cond: &Condition) -> Result<Predicate, AstBuildError> {
     Ok(Arc::new(move |row: &Row| tree.eval(row, /*push_mode=*/true)))
 }
 
+/// Check if a condition tree contains any flipped CorrelatedSubquery.
+/// Used only for IVM_PARITY_TRACE logs — zero overhead when env var unset
+/// since the caller gates with `is_ok()` before calling this.
+fn condition_has_flips(cond: &Condition) -> bool {
+    match cond {
+        Condition::CorrelatedSubquery { flip, .. } => flip.unwrap_or(false),
+        Condition::And { conditions } | Condition::Or { conditions } => {
+            conditions.iter().any(condition_has_flips)
+        }
+        Condition::Simple { .. } => false,
+    }
+}
+
+/// Return a short type label for a condition, for trace logs.
+fn condition_type_name(cond: &Condition) -> &'static str {
+    match cond {
+        Condition::Simple { .. } => "Simple",
+        Condition::And { .. } => "And",
+        Condition::Or { .. } => "Or",
+        Condition::CorrelatedSubquery { .. } => "CorrelatedSubquery",
+    }
+}
+
 fn build_predicate_tree(cond: &Condition) -> Result<PredicateNode, AstBuildError> {
     match cond {
         Condition::Simple { op, left, right } => {
@@ -478,16 +563,64 @@ fn build_predicate_tree(cond: &Condition) -> Result<PredicateNode, AstBuildError
             }
         }
         Condition::And { conditions } => {
+            // mirrors TS builder.ts:517
+            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                eprintln!(
+                    "[ivm:rs:builder.ts:509:apply-and conditions={}]",
+                    conditions.len()
+                );
+            }
             let children: Result<Vec<PredicateNode>, _> =
                 conditions.iter().map(build_predicate_tree).collect();
             Ok(PredicateNode::And(children?))
         }
         Condition::Or { conditions } => {
+            // mirrors TS builder.ts:530
+            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                let subquery_count = conditions
+                    .iter()
+                    .filter(|c| matches!(c, Condition::CorrelatedSubquery { .. }))
+                    .count();
+                let other_count = conditions.len() - subquery_count;
+                eprintln!(
+                    "[ivm:rs:builder.ts:520:apply-or conditions={}]",
+                    conditions.len()
+                );
+                eprintln!(
+                    "[ivm:rs:builder.ts:522:apply-or-partition subqueryConditions={} otherConditions={}]",
+                    subquery_count,
+                    other_count
+                );
+                if subquery_count == 0 {
+                    eprintln!("[ivm:rs:builder.ts:526:apply-or-no-subquery-simple-filter]");
+                } else {
+                    eprintln!("[ivm:rs:builder.ts:541:apply-or-with-subquery-fan-out-fan-in]");
+                }
+            }
             let children: Result<Vec<PredicateNode>, _> =
                 conditions.iter().map(build_predicate_tree).collect();
             Ok(PredicateNode::Or(children?))
         }
-        Condition::CorrelatedSubquery { .. } => {
+        Condition::CorrelatedSubquery { related, .. } => {
+            // mirrors TS builder.ts:633
+            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                let alias = related
+                    .subquery
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| related.subquery.table.clone());
+                eprintln!(
+                    "[ivm:rs:builder.ts:617:apply-correlated-subquery alias={} fromCondition=CorrelatedSubquery limit={:?}]",
+                    alias,
+                    related.subquery.limit
+                );
+                if related.subquery.limit == Some(0) {
+                    eprintln!(
+                        "[ivm:rs:builder.ts:621:apply-correlated-subquery-limit0-skip alias={}]",
+                        alias
+                    );
+                }
+            }
             // EXISTS/NOT EXISTS are handled via ExistsSpec at the chain
             // level — they don't appear as runtime predicates here. Treat
             // as "always true" in the predicate context.

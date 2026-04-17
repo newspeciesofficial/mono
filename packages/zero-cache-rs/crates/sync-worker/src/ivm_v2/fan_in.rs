@@ -66,7 +66,23 @@ impl Operator for FanIn {
         let key = change_key(&change);
         let count = self.dedup.entry(key).or_insert(0);
         *count += 1;
+        // mirrors TS fan-in.ts:71
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:fan-in.ts:70:push-accumulate type={} accumulated={}]",
+                match &change { Change::Add(_) => "Add", Change::Remove(_) => "Remove", Change::Child(_) => "Child", Change::Edit(_) => "Edit" },
+                *count
+            );
+        }
         if *count == 1 {
+            // mirrors TS fan-in.ts:77
+            if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                eprintln!(
+                    "[ivm:rs:fan-in.ts:75:fan-out-done fanOutChangeType={} accumulated={}]",
+                    match &change { Change::Add(_) => "Add", Change::Remove(_) => "Remove", Change::Child(_) => "Child", Change::Edit(_) => "Edit" },
+                    *count
+                );
+            }
             Box::new(std::iter::once(change))
         } else {
             Box::new(std::iter::empty())
