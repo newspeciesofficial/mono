@@ -5,13 +5,28 @@
   "type": "module",
   "scripts": {
     "deploy-schema": "npx zero-deploy-permissions -p zero-schema.ts --output-file schema.json",
-    "start-ts": "ZERO_USE_RUST_IVM_V2=0 ZERO_PORT=4858 ZERO_UPSTREAM_DB=postgresql://user:password@127.0.0.1:6434/postgres ZERO_REPLICA_FILE=/tmp/ivm-parity-ts.db ZERO_SCHEMA_FILE=./schema.json ZERO_APP_ID=parity_ts zero-cache",
-    "start-rs": "ZERO_USE_RUST_IVM_V2=1 ZERO_PORT=4868 ZERO_UPSTREAM_DB=postgresql://user:password@127.0.0.1:6434/postgres ZERO_REPLICA_FILE=/tmp/ivm-parity-rs.db ZERO_SCHEMA_FILE=./schema.json ZERO_APP_ID=parity_rs zero-cache",
-    "harness": "tsx harness.ts"
+
+    "db-create": "PGPASSWORD=password psql -h 127.0.0.1 -p 6434 -U user -d postgres -c 'CREATE DATABASE parity' || echo 'already exists'",
+    "db-migrate": "PGPASSWORD=password psql -h 127.0.0.1 -p 6434 -U user -d parity -f schema.sql && PGPASSWORD=password psql -h 127.0.0.1 -p 6434 -U user -d parity -f seed.sql && PGPASSWORD=password psql -h 127.0.0.1 -p 6434 -U user -d parity -f seed-extras.sql",
+
+    "start-ts": "ZERO_USE_RUST_IVM_V2=0 ZERO_PORT=4858 ZERO_UPSTREAM_DB=postgresql://user:password@127.0.0.1:6434/parity ZERO_REPLICA_FILE=/tmp/ivm-parity-ts.db ZERO_SCHEMA_FILE=./schema.json ZERO_APP_ID=parity_ts ZERO_NUM_SYNC_WORKERS=2 ZERO_ADMIN_PASSWORD=devdev ZERO_AUTH_SECRET=devsecret npx zero-cache",
+    "start-rs": "ZERO_USE_RUST_IVM_V2=1 ZERO_PORT=4868 ZERO_UPSTREAM_DB=postgresql://user:password@127.0.0.1:6434/parity ZERO_REPLICA_FILE=/tmp/ivm-parity-rs.db ZERO_SCHEMA_FILE=./schema.json ZERO_APP_ID=parity_rs ZERO_NUM_SYNC_WORKERS=2 ZERO_ADMIN_PASSWORD=devdev ZERO_AUTH_SECRET=devsecret npx zero-cache",
+
+    "fuzz": "tsx ast-fuzz.ts",
+    "seed-corpus": "tsx seed-extractor.ts",
+    "sweep:hydrate": "tsx harness-coverage.ts",
+    "sweep:advance": "tsx harness-advance-coverage.ts",
+    "report": "tsx parity-report.ts",
+
+    "test-rs": "cargo test --manifest-path ../../packages/zero-cache-rs/crates/sync-worker/Cargo.toml",
+    "test": "npm run fuzz && npm run seed-corpus && npm run sweep:hydrate && npm run sweep:advance && npm run report && cat parity_report.md | head -30",
+
+    "harness-legacy": "tsx harness.ts"
   },
   "dependencies": {
     "@rocicorp/zero": "file:../../packages/zero",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "postgres": "^3.4.5"
   },
   "devDependencies": {
     "tsx": "^4.19.0"
