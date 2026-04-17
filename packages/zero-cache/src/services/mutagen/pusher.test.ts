@@ -6,9 +6,9 @@ import {ErrorOrigin} from '../../../../zero-protocol/src/error-origin.ts';
 import {ErrorReason} from '../../../../zero-protocol/src/error-reason.ts';
 import type {PushFailedBody} from '../../../../zero-protocol/src/error.ts';
 import type {
-  APIMutateResponse,
   Mutation,
   PushBody,
+  PushResponse,
 } from '../../../../zero-protocol/src/push.ts';
 import {ProtocolErrorWithLevel} from '../../types/error-with-level.ts';
 import {
@@ -666,12 +666,7 @@ describe('pusher service', () => {
     const fetch = (global.fetch = vi.fn());
     fetch.mockResolvedValue({
       ok: true,
-      json: () =>
-        Promise.resolve({
-          kind: 'MutateResponse',
-          userID: 'user-123',
-          mutations: [],
-        }),
+      json: () => Promise.resolve({mutations: []}),
     });
 
     const pusher = newPusherService({
@@ -806,12 +801,7 @@ describe('pusher service', () => {
     const fetch = (global.fetch = vi.fn());
     fetch.mockResolvedValue({
       ok: true,
-      json: () =>
-        Promise.resolve({
-          kind: 'MutateResponse',
-          userID: null,
-          mutations: [],
-        }),
+      json: () => Promise.resolve({mutations: []}),
     });
 
     const pusher = newPusherService({
@@ -896,12 +886,7 @@ describe('pusher service', () => {
     const fetch = (global.fetch = vi.fn());
     fetch.mockResolvedValue({
       ok: true,
-      json: () =>
-        Promise.resolve({
-          kind: 'MutateResponse',
-          userID: null,
-          mutations: [],
-        }),
+      json: () => Promise.resolve({mutations: []}),
     });
 
     const pusher = newPusherService({
@@ -945,12 +930,7 @@ describe('pusher service', () => {
     const fetch = (global.fetch = vi.fn());
     fetch.mockResolvedValue({
       ok: true,
-      json: () =>
-        Promise.resolve({
-          kind: 'MutateResponse',
-          userID: null,
-          mutations: [],
-        }),
+      json: () => Promise.resolve({mutations: []}),
     });
 
     const pusher = newPusherService({
@@ -993,12 +973,7 @@ describe('pusher service', () => {
     const fetch = (global.fetch = vi.fn());
     fetch.mockResolvedValue({
       ok: true,
-      json: () =>
-        Promise.resolve({
-          kind: 'MutateResponse',
-          userID: null,
-          mutations: [],
-        }),
+      json: () => Promise.resolve({mutations: []}),
     });
 
     const pusher = newPusherService({
@@ -1100,12 +1075,7 @@ describe('pusher service', () => {
     const fetch = (global.fetch = vi.fn());
     fetch.mockResolvedValue({
       ok: true,
-      json: () =>
-        Promise.resolve({
-          kind: 'MutateResponse',
-          userID: 'user-123',
-          mutations: [],
-        }),
+      json: () => Promise.resolve({mutations: []}),
     });
 
     const pusher = newPusherService({
@@ -1197,12 +1167,7 @@ describe('initConnection', () => {
     const fetch = (global.fetch = vi.fn());
     fetch.mockResolvedValue({
       ok: true,
-      json: () =>
-        Promise.resolve({
-          kind: 'MutateResponse',
-          userID: null,
-          mutations: [],
-        }),
+      json: () => Promise.resolve({mutations: []}),
     });
 
     const pusher = newPusherService({
@@ -1233,12 +1198,7 @@ describe('initConnection', () => {
     const fetch = (global.fetch = vi.fn());
     fetch.mockResolvedValue({
       ok: true,
-      json: () =>
-        Promise.resolve({
-          kind: 'MutateResponse',
-          userID: null,
-          mutations: [],
-        }),
+      json: () => Promise.resolve({mutations: []}),
     });
 
     const pusher = newPusherService({
@@ -1268,12 +1228,7 @@ describe('initConnection', () => {
     const fetch = (global.fetch = vi.fn());
     fetch.mockResolvedValue({
       ok: true,
-      json: () =>
-        Promise.resolve({
-          kind: 'MutateResponse',
-          userID: null,
-          mutations: [],
-        }),
+      json: () => Promise.resolve({mutations: []}),
     });
 
     const pusher = newPusherService({
@@ -1404,7 +1359,7 @@ describe('pusher streaming', () => {
 
 describe('pusher errors', () => {
   async function expectPushErrorResponse(
-    errorResponse: APIMutateResponse,
+    errorResponse: PushResponse,
     expectedError: PushFailedBody,
   ) {
     const fetch = (global.fetch = vi.fn());
@@ -1439,8 +1394,6 @@ describe('pusher errors', () => {
   test('emits error message on ooo mutations', async () => {
     await expectPushErrorResponse(
       {
-        kind: 'MutateResponse',
-        userID: null,
         mutations: [
           {id: {clientID, id: 3}, result: {}},
           {id: {clientID, id: 1}, result: {error: 'oooMutation'}},
@@ -1592,9 +1545,7 @@ describe('pusher errors', () => {
 
   test('handles ooo mutation with subsequent mutations', async () => {
     const fetch = (global.fetch = vi.fn());
-    const oooResponse: APIMutateResponse = {
-      kind: 'MutateResponse',
-      userID: null,
+    const oooResponse: PushResponse = {
       mutations: [
         {
           id: {clientID, id: 1},

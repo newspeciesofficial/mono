@@ -9,7 +9,6 @@ import {
 } from 'vitest';
 import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
 import type {
-  QueryResponse,
   TransformResponseBody,
   TransformResponseMessage,
 } from '../../../zero-protocol/src/custom-queries.ts';
@@ -179,17 +178,6 @@ describe('CustomQueryTransformer', () => {
     return ['transformed', body];
   }
 
-  function queryResponseMessage(
-    body: TransformResponseBody,
-    userID: string | null = null,
-  ): QueryResponse {
-    return {
-      kind: 'QueryResponse',
-      userID,
-      queries: body,
-    };
-  }
-
   function transformFailedMessage(
     body: TransformFailedBody,
   ): TransformResponseMessage {
@@ -304,9 +292,8 @@ describe('CustomQueryTransformer', () => {
     actual: TransformAttempt,
     expected: TransformAttempt['result'],
     cached = false,
-    userID?: string | null,
   ) {
-    expect(actual).toEqual({result: expected, cached, userID});
+    expect(actual).toEqual({result: expected, cached});
   }
 
   beforeEach(() => {
@@ -321,7 +308,7 @@ describe('CustomQueryTransformer', () => {
 
   test('should transform queries successfully and return TransformedAndHashed array', async () => {
     mockFetchFromAPIServer.mockResolvedValue(
-      queryResponseMessage(mockQueryResponses, 'user-123'),
+      transformedMessage(mockQueryResponses),
     );
 
     const transformer = makeTransformer();
@@ -335,23 +322,17 @@ describe('CustomQueryTransformer', () => {
     expectLastTransformFetch(mockQueries);
 
     // Verify the result
-    expectTransformAttempt(result, transformResults, false, 'user-123');
+    expectTransformAttempt(result, transformResults);
   });
 
   test('validate should hit the API with an empty transform request', async () => {
-    mockFetchFromAPIServer.mockResolvedValue(
-      queryResponseMessage([], 'user-123'),
-    );
+    mockFetchFromAPIServer.mockResolvedValue(transformedMessage([]));
 
     const transformer = makeTransformer();
     const result = await transformer.validate(headerOptions, undefined);
 
     expectLastTransformFetch([]);
-    expect(result).toEqual({
-      kind: 'QueryResponse',
-      userID: 'user-123',
-      queries: [],
-    });
+    expect(result).toBeUndefined();
   });
 
   test('validate should pass through transformFailed responses', async () => {
