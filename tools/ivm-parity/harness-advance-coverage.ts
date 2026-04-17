@@ -111,6 +111,38 @@ const MUTATIONS: Step[] = [
     // body revert to match `seed.sql`'s value for m-1.
     undo: `UPDATE messages SET body = 'hi team' WHERE id = 'm-1'`,
   },
+  // Phase 7 coverage extension: mutations targeting open behavioral
+  // divergences from PARITY-DIVERGENCES.md. Each is additive; each has
+  // an explicit undo that restores the seed state so subsequent batches
+  // are deterministic.
+  //
+  // BEH-5 (Take Remove missing refetch): delete m-2, which is at
+  // position 1 in `messages.orderBy('createdAt')`. For
+  // `.orderBy('createdAt').limit(2)` the window is {m-1, m-2}; on
+  // delete TS emits Remove(m-2) + Add(m-10, the new bound). RS
+  // emits only Remove — window stays at {m-1}.
+  {
+    label: 'delete m-2 (Take Remove refetch coverage)',
+    run: `DELETE FROM messages WHERE id = 'm-2'`,
+    undo: `INSERT INTO messages (id, "conversationId", "authorId", body, "createdAt", "visibleTo") VALUES ('m-2', 'co-1', 'u2', 'great', 1200, NULL)`,
+  },
+  // BEH-18 (ExistsT Remove child-reinsert): in earlier steps we
+  // inserted channel ch-test-1 with exactly one participant (u1). Now
+  // delete that participant. For `channels.whereExists('participants')`
+  // TS emits Remove(ch-test-1) with `relationships.participants =
+  // [u1-participant]` so the Streamer can del the participant row
+  // client-side. RS emits Remove(ch-test-1) with empty relationships —
+  // child tombstone lost.
+  //
+  // NB: the earlier `add u1 as participant of ch-test-1` step must run
+  // BEFORE this. It does (ordering preserved). The ch-test-1 channel is
+  // torn down in reverse-cleanup after the batch, so no persistent
+  // state leak.
+  {
+    label: 'delete u1 participant of ch-test-1 (ExistsT Remove child tombstone)',
+    run: `DELETE FROM participants WHERE "userId" = 'u1' AND "channelId" = 'ch-test-1'`,
+    undo: ``,
+  },
 ];
 
 // ---------------------------------------------------------------------------

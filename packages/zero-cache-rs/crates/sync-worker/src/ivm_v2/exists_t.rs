@@ -692,20 +692,44 @@ impl Transformer for ExistsT {
                         // Mirror of TS exists.ts:171-199 (EXISTS remove-flip):
                         // For NotExists → emit Add of parent (with empty
                         // relationships — subquery rows aren't emitted).
-                        // For Exists → emit Remove of parent; TS puts the
-                        // removed child back in the relationship at
-                        // line 191-193 so Streamer emits a `del` for it,
-                        // but in our xyne-lite test neither p18 nor p23
-                        // exercises this exact case (the cleanup path
-                        // deletes both parent and child, so the parent
-                        // Remove emitted by its own source push handles
-                        // both tombstones). Keeping empty relationships
-                        // is safe for current divergences; refine if a
-                        // future pattern needs per-child del emission.
+                        // For Exists → emit Remove of parent. TS at
+                        // exists.ts:189-208 puts the REMOVED child back
+                        // in the relationship factory so the Streamer
+                        // downstream can emit a `del` for it. Without
+                        // this, the ch-test-1 / u1-participant delete
+                        // sequence loses the participant tombstone —
+                        // p7_exists_remove_child_reinsert surfaces as
+                        // rs=1 add (the prior insert) with the remove
+                        // never cancelling it.
                         let relationships = if self.not {
                             self.build_parent_relationships(&parent_row)
                         } else {
-                            indexmap::IndexMap::new()
+                            use crate::ivm::data::{NodeOrYield, RelationshipFactory};
+                            use std::sync::Mutex;
+                            // Extract the removed child node from the
+                            // change. This is safe because we're inside
+                            // the `Change::Remove` arm of the outer
+                            // match at line 678.
+                            let removed_child: Option<Node> = match &change {
+                                Change::Remove(RemoveChange { node }) => Some(node.clone()),
+                                _ => None,
+                            };
+                            let mut rel: indexmap::IndexMap<String, RelationshipFactory> =
+                                indexmap::IndexMap::new();
+                            if let Some(child_node) = removed_child {
+                                let rel_name = self.relationship_name.clone();
+                                let cell = std::sync::Arc::new(Mutex::new(Some(vec![child_node])));
+                                let factory: RelationshipFactory = Box::new(move || {
+                                    let taken = cell
+                                        .lock()
+                                        .ok()
+                                        .and_then(|mut g| g.take())
+                                        .unwrap_or_default();
+                                    Box::new(taken.into_iter().map(NodeOrYield::Node))
+                                });
+                                rel.insert(rel_name, factory);
+                            }
+                            rel
                         };
                         let node = Node { row: parent_row, relationships };
                         if self.not {
@@ -722,9 +746,40 @@ impl Transformer for ExistsT {
                             emissions.push(Change::Remove(RemoveChange { node }));
                         }
                     } else {
-                        // mirrors TS exists.ts:211
+                        // mirrors TS exists.ts:211-213:
+                        //   yield* this.#pushWithFilter(change, size > 0);
+                        // The `change` is the Change::Child wrapper where
+                        // `change.child.change` is the inner Remove. TS's
+                        // Streamer then recurses into the child-change to
+                        // emit `RowChange::Remove` for the removed child
+                        // row on the child table. Without this, when a
+                        // whereExists parent still has ≥1 matching child
+                        // after a child is removed (so parent stays in
+                        // the output), the tombstone for the removed
+                        // child is dropped.
                         if std::env::var("IVM_PARITY_TRACE").is_ok() {
                             eprintln!("[ivm:rs:exists.ts:205:push-child-remove-size-gt0-push-with-filter size={}]", new_size);
+                        }
+                        if !self.not {
+                            let wrap_node = Node {
+                                row: parent_row,
+                                relationships: indexmap::IndexMap::new(),
+                            };
+                            let removed_child: Option<Node> = match &change {
+                                Change::Remove(RemoveChange { node }) => Some(node.clone()),
+                                _ => None,
+                            };
+                            if let Some(child_node) = removed_child {
+                                emissions.push(Change::Child(ChildChange {
+                                    node: wrap_node,
+                                    child: ChildSpec {
+                                        relationship_name: self.relationship_name.clone(),
+                                        change: Box::new(Change::Remove(RemoveChange {
+                                            node: child_node,
+                                        })),
+                                    },
+                                }));
+                            }
                         }
                     }
                 }

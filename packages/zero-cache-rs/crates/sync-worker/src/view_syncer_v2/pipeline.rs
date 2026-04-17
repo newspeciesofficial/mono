@@ -1056,10 +1056,24 @@ impl Chain {
                         table: table.clone(),
                         row_key: build_row_key(&pk, &r.node.row),
                     }));
-                    // TS `Streamer#streamNodes` also recurses on remove
-                    // (same for-loop over relationships). We leave the
-                    // Remove path with empty relationships here — see
-                    // comments in `ExistsT::push_child`.
+                    // Mirror TS `Streamer#streamNodes` which walks
+                    // `node.relationships` identically for Add and
+                    // Remove. For EXISTS-type Remove(parent) emitted by
+                    // `ExistsT::push_child` on flip 1→0, TS exists.ts:189-208
+                    // re-inserts the removed child into the relationship
+                    // factory so the Streamer emits a `del` on the child
+                    // table. RS `ExistsT::push_child` now populates the
+                    // same factory; `emit_node_subtree_as_remove` drains
+                    // it into RowChange::Remove tombstones for the child
+                    // table — closing p7_exists_remove_child_reinsert.
+                    let mut total = 0usize;
+                    emit_node_subtree_as_remove(
+                        &r.node,
+                        exists_tables,
+                        &query_id,
+                        &mut out,
+                        &mut total,
+                    );
                 }
                 Change::Child(cc) => {
                     // Mirror of TS `Streamer#streamChanges` 'child'
@@ -1092,12 +1106,31 @@ impl Chain {
                                 row: e.node.row,
                             }));
                         }
-                        // Add/Remove inside Change::Child would also be
-                        // streamer-recursed in TS, but ExistsT::push_child
-                        // currently emits those as top-level Add/Remove
-                        // on the parent (the flip cases at exists.ts:134-204).
-                        // Only the Edit case arrives here — skip others.
-                        _ => {}
+                        // Mirror TS `Streamer#streamChanges` 'child' case
+                        // (pipeline-driver.ts:986-993) — recurse into
+                        // `cc.child.change` and emit a RowChange on the
+                        // child table. When `ExistsT::push_child` emits
+                        // `Change::Child(parent, Remove(child))` because
+                        // a child was removed but the parent still has
+                        // ≥1 match (size > 0 path at exists.ts:211-213),
+                        // the tombstone must reach the client through
+                        // this branch. Similarly for Add when size > 1.
+                        Change::Add(a) => {
+                            out.push(RowChange::Add(RowAdd {
+                                query_id: query_id.clone(),
+                                table: child_tbl.clone(),
+                                row_key: build_row_key(child_pk, &a.node.row),
+                                row: a.node.row,
+                            }));
+                        }
+                        Change::Remove(r) => {
+                            out.push(RowChange::Remove(RowRemove {
+                                query_id: query_id.clone(),
+                                table: child_tbl.clone(),
+                                row_key: build_row_key(child_pk, &r.node.row),
+                            }));
+                        }
+                        Change::Child(_) => {}
                     }
                 }
                 _ => {}
@@ -1601,7 +1634,17 @@ impl Chain {
                         table: table.clone(),
                         row_key: build_row_key(&pk, &node.row),
                     }));
-                    emit_node_subtree(
+                    // Mirror TS `Streamer#streamNodes` Remove path —
+                    // when a parent is removed, emit del tombstones
+                    // for the decorated child rows so the client
+                    // cleans up both the parent and every related row
+                    // it had. Previously called `emit_node_subtree`
+                    // which emits `RowChange::Add` — wrong direction;
+                    // child rows re-appeared in the client's mirror
+                    // after the parent was deleted. Using the
+                    // `_as_remove` variant correctly walks the same
+                    // relationships and emits Remove tombstones.
+                    emit_node_subtree_as_remove(
                         &node,
                         &emission_tables,
                         &query_id,
@@ -1809,6 +1852,31 @@ fn emit_node_subtree(
     cur: &mut Vec<RowChange>,
     total: &mut usize,
 ) {
+    emit_node_subtree_inner(node, tables, query_id, cur, total, /*as_remove=*/false);
+}
+
+/// Mirror of TS `Streamer#streamNodes` Remove path — walks
+/// `node.relationships` emitting `RowChange::Remove` for each child
+/// found. Used when an EXISTS Remove flips 1→0 and the removed child
+/// is attached to the relationship factory per exists.ts:189-208.
+fn emit_node_subtree_as_remove(
+    node: &Node,
+    tables: &ExistsChildTables,
+    query_id: &str,
+    cur: &mut Vec<RowChange>,
+    total: &mut usize,
+) {
+    emit_node_subtree_inner(node, tables, query_id, cur, total, /*as_remove=*/true);
+}
+
+fn emit_node_subtree_inner(
+    node: &Node,
+    tables: &ExistsChildTables,
+    query_id: &str,
+    cur: &mut Vec<RowChange>,
+    total: &mut usize,
+    as_remove: bool,
+) {
     for (rel_name, factory) in node.relationships.iter() {
         let Some((child_table, child_pk, nested)) = tables.get(rel_name.as_str()) else {
             continue;
@@ -1819,17 +1887,25 @@ fn emit_node_subtree(
                 continue;
             };
             let child_row_key = build_row_key(child_pk, &child_node.row);
-            cur.push(RowChange::Add(RowAdd {
-                query_id: query_id.to_string(),
-                table: child_table.clone(),
-                row_key: child_row_key,
-                row: child_node.row.clone(),
-            }));
+            if as_remove {
+                cur.push(RowChange::Remove(RowRemove {
+                    query_id: query_id.to_string(),
+                    table: child_table.clone(),
+                    row_key: child_row_key,
+                }));
+            } else {
+                cur.push(RowChange::Add(RowAdd {
+                    query_id: query_id.to_string(),
+                    table: child_table.clone(),
+                    row_key: child_row_key,
+                    row: child_node.row.clone(),
+                }));
+            }
             *total += 1;
             // Recurse into grandchildren using the child's own
             // exists_child_tables — matches TS recursing through
             // `schema.relationships[name]` at each level.
-            emit_node_subtree(&child_node, nested, query_id, cur, total);
+            emit_node_subtree_inner(&child_node, nested, query_id, cur, total, as_remove);
         }
     }
 }
