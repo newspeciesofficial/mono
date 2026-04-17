@@ -920,13 +920,13 @@ impl Chain {
         // emissions because rel_name_for_edit resolved to `None` and
         // the Change::Child arm at the bottom of this function early-
         // continued.
-        let target = &mut self.transformers[target_idx];
         let rel_name_for_edit: Option<String> = {
             // Try ExistsT first (top-level EXISTS). If that fails,
             // fall back to OrBranchesT and look up the inner ExistsT
             // that owns this child_table. Must re-take the Any
             // reference between downcasts because each `downcast_mut`
             // moves the borrow.
+            let target = &mut self.transformers[target_idx];
             let any = target.as_any_mut().expect("target exposes any");
             if (any as &mut dyn std::any::Any)
                 .downcast_mut::<crate::ivm_v2::exists_t::ExistsT>()
@@ -945,9 +945,35 @@ impl Chain {
                     .map(|ex| ex.relationship_name().to_string())
             }
         };
-        let emissions: Vec<Change> = target
-            .push_child(change, child_table, &parent_snapshot)
-            .collect();
+        let raw_emissions: Vec<Change> = {
+            let target = &mut self.transformers[target_idx];
+            target
+                .push_child(change, child_table, &parent_snapshot)
+                .collect()
+        };
+        // Pass emissions through transformers FOLLOWING the target
+        // (e.g. a TakeT that appears after ExistsT) before converting
+        // to RowChange. Without this, a parent that exists in the
+        // snapshot but falls outside an outer Take window would leak
+        // into the output. Mirror of TS's pipeline order at
+        // `packages/zql/src/builder/builder.ts:331-345`: where() is
+        // applied before limit(), so Take sees Change::Child after
+        // Exists — Take drops the change if the parent is not in its
+        // window. Without this, RS emits parents like m-test-1 for
+        // `messages.whereExists('conversation').limit(5)` when a new
+        // conversation is added (fuzz_00846 canary: m-test-1 > the
+        // current TakeT bound, so Take should drop the forwarded
+        // Change::Child/Add — but it never saw it because emissions
+        // went straight from push_child to RowChange conversion).
+        let mut emissions: Vec<Change> = raw_emissions;
+        for i in (target_idx + 1)..self.transformers.len() {
+            let mut next: Vec<Change> = Vec::new();
+            let t = &mut self.transformers[i];
+            for c in emissions.drain(..) {
+                next.extend(t.push(c));
+            }
+            emissions = next;
+        }
 
         let query_id = self.query_id.clone();
         let table = self.table.clone();
