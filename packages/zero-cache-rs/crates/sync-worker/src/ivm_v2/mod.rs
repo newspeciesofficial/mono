@@ -26,6 +26,7 @@ pub mod batching;
 pub mod change;
 pub mod exists;
 pub mod exists_t;
+pub mod or_exists_t;
 pub mod fan_in;
 pub mod fan_out;
 pub mod filter;

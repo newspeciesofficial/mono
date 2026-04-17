@@ -208,10 +208,6 @@ impl PipelineV2 {
         // Build chain on the main thread — Chain construction touches
         // source_factory which isn't Send.
         let source = (self.source_factory)(&table);
-        let child_source = spec
-            .join
-            .as_ref()
-            .map(|js| (self.source_factory)(&js.child_table));
         // TS native `buildPipelineInternal` recursively builds a
         // full `Input` for each EXISTS subquery (source + filter +
         // nested Exists/Join/Take etc). Our RS equivalent: for each
@@ -283,11 +279,85 @@ impl PipelineV2 {
         for es in spec.exists_chain.iter_mut() {
             exists_child_inputs.push(build_child_input(es, &self.source_factory));
         }
-        let chain = Chain::build_with_join_and_exists(
+
+        // Recursively build a sub-Chain for every `spec.joins[i]` —
+        // mirror of TS `applyCorrelatedSubQuery` at
+        // `packages/zql/src/builder/builder.ts:626` which does
+        // `buildPipelineInternal(sq.subquery, ...)`. The returned
+        // Input is handed to the parent Join as its child source,
+        // so nested `.related().related()...` works to arbitrary
+        // depth matching TS semantics.
+        fn build_join_child_input(
+            js: &mut crate::view_syncer_v2::pipeline::JoinSpec,
+            source_factory: &SourceFactory,
+        ) -> Option<Box<dyn crate::ivm_v2::operator::Input>> {
+            let tbl = js.child_table.clone();
+            let sub_source = (source_factory)(&tbl);
+            let sub_pk = sub_source.get_schema().primary_key.clone();
+            js.child_primary_key = Some(sub_pk.clone());
+            if let Some(sub_ast) = js.child_subquery.as_deref() {
+                use crate::view_syncer_v2::ast_builder::ast_to_chain_spec;
+                let mut sub_spec =
+                    ast_to_chain_spec(sub_ast, format!("join-sub:{}", tbl), sub_pk.clone())
+                        .ok()?;
+                // Recurse for each nested EXISTS.
+                let mut sub_exists_inputs: Vec<
+                    Option<Box<dyn crate::ivm_v2::operator::Input>>,
+                > = Vec::new();
+                if let Some(sub_es) = sub_spec.exists.as_mut() {
+                    sub_exists_inputs.push(build_child_input(sub_es, source_factory));
+                }
+                for sub_es in sub_spec.exists_chain.iter_mut() {
+                    sub_exists_inputs.push(build_child_input(sub_es, source_factory));
+                }
+                // Recurse for each nested JOIN.
+                let mut sub_join_inputs: Vec<
+                    Option<Box<dyn crate::ivm_v2::operator::Input>>,
+                > = Vec::new();
+                for sub_js in sub_spec.joins.iter_mut() {
+                    sub_join_inputs.push(build_join_child_input(sub_js, source_factory));
+                }
+                let sub_chain =
+                    crate::view_syncer_v2::pipeline::Chain::build_with_joins_vec(
+                        sub_spec,
+                        sub_source,
+                        sub_join_inputs,
+                        sub_exists_inputs,
+                    );
+                Some(Box::new(sub_chain) as Box<dyn crate::ivm_v2::operator::Input>)
+            } else {
+                // Legacy / test path — plain source.
+                Some(sub_source)
+            }
+        }
+        let mut join_child_inputs: Vec<Option<Box<dyn crate::ivm_v2::operator::Input>>> =
+            Vec::with_capacity(spec.joins.len());
+        for js in spec.joins.iter_mut() {
+            join_child_inputs.push(build_join_child_input(js, &self.source_factory));
+        }
+
+        // Top-level OR branches — each `OrBranchSpec` carries its
+        // own scalar predicate + Vec<ExistsSpec>. For each branch,
+        // build recursive sub-Chains for its EXISTS entries
+        // (identical to the exists/exists_chain child-input path).
+        let mut or_branch_inputs: Vec<
+            Vec<Option<Box<dyn crate::ivm_v2::operator::Input>>>,
+        > = Vec::with_capacity(spec.or_branches.len());
+        for branch in spec.or_branches.iter_mut() {
+            let mut per_branch: Vec<Option<Box<dyn crate::ivm_v2::operator::Input>>> =
+                Vec::with_capacity(branch.exists.len());
+            for es in branch.exists.iter_mut() {
+                per_branch.push(build_child_input(es, &self.source_factory));
+            }
+            or_branch_inputs.push(per_branch);
+        }
+
+        let chain = Chain::build_full(
             spec,
             source,
-            child_source,
+            join_child_inputs,
             exists_child_inputs,
+            or_branch_inputs,
         );
 
         // 4-deep chunk pipeline is enough to keep the worker busy while
@@ -421,7 +491,11 @@ impl PipelineV2 {
 
     /// Route `change` to every chain whose table matches `table`. If
     /// the chain is a join and `table` matches its child table,
-    /// route through `advance_child` instead.
+    /// route through `advance_child` instead. If the chain has an
+    /// EXISTS transformer whose correlated child table matches,
+    /// route through `advance_child_for_exists` so subquery mutations
+    /// flip parent inclusion (mirrors TS `Exists::*push` child branch
+    /// at `packages/zql/src/ivm/exists.ts:120-206`).
     pub fn advance(
         &mut self,
         table: &str,
@@ -431,13 +505,28 @@ impl PipelineV2 {
         for (qid, chain) in self.chains.iter_mut() {
             let Some(_info) = self.infos.get(qid) else { continue };
             let parent_matches = chain.table() == table;
-            let child_matches = chain.child_table() == Some(table);
+            // Recursive check: any child-table reachable through the
+            // nested join tree. Mirrors TS where every Join subscribes
+            // to its own child source regardless of nesting depth.
+            let join_tables = chain.join_tables_recursive();
+            let child_matches = join_tables.iter().any(|t| t == table);
             if parent_matches {
                 let c = shallow_clone_change(&change);
                 out.extend(chain.advance(c));
             } else if child_matches {
                 let c = shallow_clone_change(&change);
-                out.extend(chain.advance_child(c));
+                out.extend(chain.advance_child_recursive(table, c));
+            }
+            // EXISTS subquery routing — a chain may have ExistsT(s)
+            // correlated with one or more child tables, and those
+            // subqueries may themselves nest further EXISTS. Use the
+            // recursive helper so grandchild-table mutations
+            // (e.g. channels update in p19) cascade top-down through
+            // every sub-Chain exactly once.
+            let exists_child_tables = chain.exists_child_tables_flat_recursive();
+            if exists_child_tables.iter().any(|t| t == table) {
+                let c = shallow_clone_change(&change);
+                out.extend(chain.advance_child_for_exists_recursive(table, c));
             }
         }
         out

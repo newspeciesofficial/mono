@@ -43,9 +43,29 @@ pub struct ChainSpec {
     /// Additional EXISTS conditions beyond the first. Applied after the
     /// `exists` entry, in declaration order.
     pub exists_chain: Vec<ExistsSpec>,
-    /// Optional Join (hierarchical related). First cut: single join
-    /// applied AFTER all other transformers on the hydration path.
-    pub join: Option<JoinSpec>,
+    /// All `ast.related[]` entries lowered to Joins, in declaration
+    /// order. Mirrors TS `buildPipelineInternal` at
+    /// `packages/zql/src/builder/builder.ts:347-355` which iterates
+    /// every `csq` in `ast.related` and wraps the current Input with
+    /// a `new Join({parent: end, child, ...})` via
+    /// `applyCorrelatedSubQuery` (builder.ts:611-647). Each entry may
+    /// carry its own sub-AST so the driver can recursively build a
+    /// sub-Chain — matching the recursive `buildPipelineInternal`
+    /// call on `sq.subquery` at builder.ts:626.
+    pub joins: Vec<JoinSpec>,
+    /// Top-level OR branches — TS mirror:
+    /// `packages/zql/src/builder/builder.ts:376-442` `applyFilterWithFlips`
+    /// OR path wraps each branch in its own recursive filter pipeline
+    /// (`applyFilterWithFlips` recursed on the branch condition) and
+    /// unions them via `UnionFanOut + UnionFanIn`. Each `OrBranchSpec`
+    /// captures a branch's scalar predicate + list of EXISTS conditions
+    /// AND'd together within the branch. When this is populated,
+    /// `exists`/`exists_chain` are empty and the Chain builds a single
+    /// `OrBranchesT` transformer that emits rows passing ANY branch,
+    /// with the first passing branch's decoration (matches TS
+    /// `UnionFanIn.fetch` → `mergeFetches` first-wins-on-duplicate-PK
+    /// at union-fan-in.ts:208).
+    pub or_branches: Vec<OrBranchSpec>,
     /// Query-level `ORDER BY` (from `AST.order_by`). When set, overrides
     /// the table-level default sort at Chain-build time so SqliteSource
     /// emits rows in this order — critical for `Take` slicing and
@@ -58,6 +78,64 @@ pub struct JoinSpec {
     pub child_key: CompoundKey,
     pub relationship_name: String,
     pub child_table: String,
+    /// Full child subquery AST — mirrors what TS hands to
+    /// `buildPipelineInternal(sq.subquery, ...)` at
+    /// `packages/zql/src/builder/builder.ts:626`. The driver reads
+    /// this to build a recursive sub-Chain per join, preserving
+    /// nested `related[]` / `whereExists` / `where` semantics
+    /// exactly like TS's recursive pipeline construction. `None`
+    /// means "use a plain source for the child table" — used by
+    /// legacy tests that construct a JoinSpec manually.
+    pub child_subquery: Option<Box<zero_cache_types::ast::AST>>,
+    /// Child-side primary key — filled by the driver after looking
+    /// it up in the replica's table registry. Needed by
+    /// `advance_child` when emitting child `RowChange`s so the
+    /// row_key matches the child table's actual PK.
+    pub child_primary_key: Option<PrimaryKey>,
+}
+
+/// Single branch of a top-level OR filter. TS mirror:
+/// `packages/zql/src/builder/builder.ts:439` — each OR branch is
+/// recursively passed to `applyFilterWithFlips(end, cond, ...)` which
+/// produces a full sub-pipeline. In RS scope, a branch is represented
+/// as a scalar predicate (all non-EXISTS conditions AND'd together)
+/// PLUS a list of EXISTS conditions AND'd within the branch.
+///
+/// At fetch time, a row passes a branch iff
+///   predicate(row) && every exists in `exists` matches.
+/// If the row passes, the first-matching branch's EXISTS decorations
+/// are attached to the emitted node (TS `mergeFetches`
+/// first-wins-on-duplicate-PK at union-fan-in.ts:208).
+pub struct OrBranchSpec {
+    /// Scalar predicate compiled from the non-EXISTS sub-conditions of
+    /// this branch (AND'd). `None` means "no scalar gate — branch is
+    /// satisfied purely by its EXISTS list".
+    pub predicate: Option<crate::ivm_v2::filter_t::Predicate>,
+    /// EXISTS conditions to AND within this branch. May be empty if
+    /// the branch is pure scalar.
+    pub exists: Vec<ExistsSpec>,
+    /// When true, this branch was produced by the TS planner's
+    /// "flip" path — `applyFilterWithFlips` at
+    /// `packages/zql/src/builder/builder.ts:410-448`. In that path,
+    /// TS wraps the branch's inner CSQ in a `FlippedJoin` and unions
+    /// branches with a `UnionFanIn` whose `fetch` calls `mergeFetches`
+    /// at `packages/zql/src/ivm/union-fan-in.ts:218-300`. `mergeFetches`
+    /// merge-sorts each branch's ordered row stream and skips rows
+    /// whose PK duplicates the previously-yielded row (L260-265) —
+    /// yielding each PK at most once (FIRST-WINS on duplicate PK).
+    ///
+    /// The non-flip TS path, by contrast, uses `applyOr` at
+    /// `builder.ts:514-557` which stacks filters and emits a row if
+    /// ANY branch's filter passes; that's the current union-all
+    /// behavior here. `flip_mode` toggles between them: `true` =
+    /// dedup-by-PK (mirrors mergeFetches), `false` = union-all (the
+    /// existing non-flip path).
+    ///
+    /// The AST-builder sets this per-branch from the TS planner flag
+    /// (`flip: true` on every CSQ in every branch of this OR). At
+    /// runtime, all branches share the same `flip_mode` — it's a
+    /// query-level decision; we store it per-branch for locality.
+    pub flip_mode: bool,
 }
 
 pub struct ExistsSpec {
@@ -111,9 +189,15 @@ pub struct Chain {
     source: Box<dyn Input>,
     /// Applied in order during fetch and push.
     transformers: Vec<Box<dyn Transformer>>,
-    /// Optional hierarchical join: if set, the child source + binary
-    /// transformer are held here and engaged during hydrate.
-    join: Option<JoinStage>,
+    /// Hierarchical joins — one per `ast.related[]` entry, in
+    /// declaration order. Mirrors TS `buildPipelineInternal` wrapping
+    /// the current Input with a `new Join(...)` for each CSQ (see
+    /// `packages/zql/src/builder/builder.ts:347-355`). Each
+    /// `JoinStage.child_source` may itself be a Chain (built
+    /// recursively by the driver) — that's what lets deeper nested
+    /// `.related().related().related()` work, mirroring TS's
+    /// `buildPipelineInternal(sq.subquery, ...)` recursion.
+    joins: Vec<JoinStage>,
     /// Recursive map from `ExistsT` relationship name → child meta.
     /// Each entry stores the child table, child primary key, **and**
     /// the child's own exists_child_tables map so `hydrate_stream`
@@ -153,6 +237,13 @@ struct JoinStage {
     transformer: Box<dyn BinaryTransformer>,
     child_source: Box<dyn Input>,
     child_table: String,
+    /// Child-side primary key — populated from the driver so
+    /// `advance_child` can emit `RowChange`s keyed by the correct
+    /// column set. Previously the Chain relied on
+    /// `child_source.get_schema().primary_key` which is correct for
+    /// the immediate child but not for grandchildren when the
+    /// child_source is itself a Chain that wraps a further Chain.
+    child_primary_key: PrimaryKey,
 }
 
 impl Chain {
@@ -161,13 +252,9 @@ impl Chain {
         Self::build_with_join(spec, source, None)
     }
 
-    /// Build with an optional child source for the Join. The caller
-    /// supplies the child source factory-output because Chain doesn't
-    /// know how to materialize a second table's source.
-    ///
-    /// Back-compat shim — tests and older call sites go through this.
-    /// Forwards to [`Self::build_with_join_and_exists`] with empty
-    /// EXISTS child inputs (legacy fail-open path).
+    /// Back-compat shim for tests that hand-roll a single-level Join
+    /// — forwards to the new multi-join variant with a single-entry
+    /// (or empty) Vec.
     pub fn build_with_join(
         spec: ChainSpec,
         source: Box<dyn Input>,
@@ -182,17 +269,69 @@ impl Chain {
     /// builder decided the subquery was simple enough to pre-compile
     /// into a child pipeline; otherwise `None` → ExistsT falls back
     /// to `node.relationships[name]`.
+    ///
+    /// `child_source` is legacy single-join back-compat: if set AND
+    /// `spec.joins.len() >= 1`, it's paired with `spec.joins[0]`.
+    /// For the multi-join + recursive case (driver-built sub-Chains),
+    /// use `build_with_joins_vec` which takes a parallel `Vec` of
+    /// child inputs.
     pub fn build_with_join_and_exists(
-        mut spec: ChainSpec,
-        mut source: Box<dyn Input>,
-        child_source: Option<Box<dyn Input>>,
+        spec: ChainSpec,
+        source: Box<dyn Input>,
+        mut child_source: Option<Box<dyn Input>>,
         exists_child_inputs: Vec<Option<Box<dyn Input>>>,
     ) -> Self {
-        let join_spec = spec.join.take();
+        // Pair the single legacy `child_source` with spec.joins[0]
+        // (if both are present); subsequent joins get `None`.
+        let mut join_child_inputs: Vec<Option<Box<dyn Input>>> =
+            Vec::with_capacity(spec.joins.len());
+        for i in 0..spec.joins.len() {
+            join_child_inputs.push(if i == 0 { child_source.take() } else { None });
+        }
+        Self::build_with_joins_vec(
+            spec,
+            source,
+            join_child_inputs,
+            exists_child_inputs,
+        )
+    }
+
+    /// Multi-join builder entry point. `join_child_inputs[i]` feeds
+    /// `spec.joins[i]`. Each child input may itself be a Chain
+    /// (recursively built by the driver) — that's what lets nested
+    /// `.related().related()` work, mirroring TS's
+    /// `buildPipelineInternal(sq.subquery, ...)` recursion.
+    /// Shim for call sites that don't build OR-of-EXISTS branches.
+    /// Forwards with an empty `or_branch_child_inputs` vec.
+    pub fn build_with_joins_vec(
+        spec: ChainSpec,
+        source: Box<dyn Input>,
+        join_child_inputs: Vec<Option<Box<dyn Input>>>,
+        exists_child_inputs: Vec<Option<Box<dyn Input>>>,
+    ) -> Self {
+        Self::build_full(
+            spec,
+            source,
+            join_child_inputs,
+            exists_child_inputs,
+            Vec::new(),
+        )
+    }
+
+    /// Full builder — accepts one `Option<Box<dyn Input>>` per entry
+    /// in `spec.joins` (position i → joins[i]), `spec.exists` + each
+    /// `spec.exists_chain` entry (position 0 is exists, 1.. are
+    /// chain), and a nested `Vec<Vec<...>>` for OR branches (outer
+    /// index = branch, inner = per-branch `ExistsSpec` position).
+    pub fn build_full(
+        mut spec: ChainSpec,
+        mut source: Box<dyn Input>,
+        mut join_child_inputs: Vec<Option<Box<dyn Input>>>,
+        exists_child_inputs: Vec<Option<Box<dyn Input>>>,
+        or_branch_child_inputs: Vec<Vec<Option<Box<dyn Input>>>>,
+    ) -> Self {
+        let joins_spec = std::mem::take(&mut spec.joins);
         let order_by = spec.order_by.take();
-        // Downcast to SqliteSource to override the sort when the AST
-        // carries its own `orderBy`. Any other Input impl (test doubles,
-        // etc.) just uses its constructor-time default sort.
         if let Some(order_by) = order_by {
             if let Some(sqlite) = source
                 .as_any_mut()
@@ -201,8 +340,23 @@ impl Chain {
                 sqlite.set_sort(order_by);
             }
         }
-        let join_stage = match (join_spec, child_source) {
-            (Some(js), Some(child)) => Some(JoinStage {
+        let mut join_stages: Vec<JoinStage> = Vec::with_capacity(joins_spec.len());
+        // Parallel-iter joins spec + child inputs (padded with None).
+        join_child_inputs.resize_with(joins_spec.len(), || None);
+        for (js, maybe_child) in joins_spec.into_iter().zip(join_child_inputs.into_iter()) {
+            let Some(child) = maybe_child else {
+                // Join spec without a child input means the driver
+                // couldn't build one (e.g. table missing). Skip — the
+                // hydration/advance paths check `joins` lazily.
+                continue;
+            };
+            // Resolve child_primary_key: spec-provided (driver looked it
+            // up) wins; fall back to the child source's own schema.
+            let child_pk = js
+                .child_primary_key
+                .clone()
+                .unwrap_or_else(|| child.get_schema().primary_key.clone());
+            join_stages.push(JoinStage {
                 transformer: Box::new(JoinT::new(
                     js.parent_key,
                     js.child_key,
@@ -210,18 +364,32 @@ impl Chain {
                 )),
                 child_source: child,
                 child_table: js.child_table,
-            }),
-            _ => None,
-        };
-        let mut chain = Self::build_inner(spec, source, exists_child_inputs);
-        chain.join = join_stage;
+                child_primary_key: child_pk,
+            });
+        }
+        let mut chain = Self::build_inner_full(
+            spec,
+            source,
+            exists_child_inputs,
+            or_branch_child_inputs,
+        );
+        chain.joins = join_stages;
         chain
     }
 
     fn build_inner(
         spec: ChainSpec,
         source: Box<dyn Input>,
+        exists_child_inputs: Vec<Option<Box<dyn Input>>>,
+    ) -> Self {
+        Self::build_inner_full(spec, source, exists_child_inputs, Vec::new())
+    }
+
+    fn build_inner_full(
+        spec: ChainSpec,
+        source: Box<dyn Input>,
         mut exists_child_inputs: Vec<Option<Box<dyn Input>>>,
+        mut or_branch_child_inputs: Vec<Vec<Option<Box<dyn Input>>>>,
     ) -> Self {
         let mut transformers: Vec<Box<dyn Transformer>> = Vec::new();
         let comparator = std::sync::Arc::clone(&source.get_schema().compare_rows);
@@ -281,9 +449,105 @@ impl Chain {
             );
             if let Some(child_input) = maybe_child {
                 t = t.with_child_input(child_input, es.child_key);
+                // Tag the ExistsT with its child table so
+                // Chain::advance_child_for_exists can route child-source
+                // mutations to the correct transformer. Required by the
+                // push_child wiring that mirrors TS `Exists::*push` child
+                // branch (`packages/zql/src/ivm/exists.ts:120-206`).
+                if let Some(ref tbl) = es.child_table {
+                    t = t.with_child_table(tbl.clone());
+                }
             }
             transformers.push(Box::new(t));
         }
+
+        // Top-level OR branches — TS mirror: `applyFilterWithFlips`
+        // OR path at builder.ts:376-442 recursively builds a full
+        // sub-pipeline per branch and unions via `UnionFanOut +
+        // UnionFanIn`. Each `OrBranchSpec` carries the branch's
+        // scalar predicate + its Vec<ExistsSpec> (AND'd within the
+        // branch). We build one `OrBranch` per spec and wrap into a
+        // single `OrBranchesT` that emits rows passing ANY branch
+        // with the first-passing branch's decoration (matches
+        // `mergeFetches` first-wins at union-fan-in.ts:208).
+        if !spec.or_branches.is_empty() {
+            or_branch_child_inputs.resize_with(spec.or_branches.len(), Vec::new);
+            // Flip-mode is a query-level toggle: if ANY branch was
+            // flagged flip-mode by the AST builder (which in turn
+            // mirrors the TS planner's `flip: true` decision at
+            // `packages/zql/src/planner/planner-builder.ts:251-254`
+            // applied via `applyPlansToAST` at :322-355), the whole
+            // `UnionFanIn` runs in mergeFetches mode. TS's
+            // `applyFilterWithFlips` OR path at
+            // `packages/zql/src/builder/builder.ts:410-448`
+            // constructs a single `UnionFanIn(ufo, branches)` per OR,
+            // so the mode applies to the union as a whole. The AST
+            // builder sets `flip_mode` identically on every branch
+            // when the flip criterion holds (every branch is a leaf
+            // EXISTS), so we just read branch[0].
+            let flip_mode = spec.or_branches.iter().any(|b| b.flip_mode);
+            let mut branches: Vec<crate::ivm_v2::or_exists_t::OrBranch> = Vec::new();
+            for (branch_spec, mut branch_child_inputs) in spec
+                .or_branches
+                .into_iter()
+                .zip(or_branch_child_inputs.into_iter())
+            {
+                branch_child_inputs
+                    .resize_with(branch_spec.exists.len(), || None);
+                let mut branch_exists: Vec<crate::ivm_v2::exists_t::ExistsT> = Vec::new();
+                for (es, maybe_child) in branch_spec
+                    .exists
+                    .into_iter()
+                    .zip(branch_child_inputs.into_iter())
+                {
+                    if let (Some(tbl), Some(pk)) =
+                        (es.child_table.clone(), es.child_primary_key.clone())
+                    {
+                        let nested = es
+                            .child_exists_child_tables
+                            .clone()
+                            .unwrap_or_default();
+                        exists_child_tables
+                            .0
+                            .entry(es.relationship_name.clone())
+                            .or_insert((tbl, pk, Box::new(nested)));
+                    }
+                    let mut t = crate::ivm_v2::exists_t::ExistsT::new(
+                        es.relationship_name,
+                        es.parent_join_key,
+                        es.exists_type,
+                        &pk_cols,
+                    );
+                    if let Some(child_input) = maybe_child {
+                        t = t.with_child_input(child_input, es.child_key);
+                        if let Some(ref tbl) = es.child_table {
+                            t = t.with_child_table(tbl.clone());
+                        }
+                    }
+                    branch_exists.push(t);
+                }
+                branches.push(crate::ivm_v2::or_exists_t::OrBranch {
+                    predicate: branch_spec.predicate,
+                    exists: branch_exists,
+                });
+            }
+            // Build the OrBranchesT transformer. In flip-mode, wire
+            // the PK cols so the fetch iterator can dedup rows by
+            // primary key (mirrors TS `mergeFetches` skipping rows
+            // whose PK equals the previously-yielded row's PK at
+            // `packages/zql/src/ivm/union-fan-in.ts:260-265`). In
+            // non-flip mode the transformer keeps its current
+            // union-all behaviour (mirrors TS `applyOr` at
+            // `packages/zql/src/builder/builder.ts:514-557`).
+            let or_t = if flip_mode {
+                crate::ivm_v2::or_exists_t::OrBranchesT::new(branches)
+                    .with_flip_mode(pk_cols.clone())
+            } else {
+                crate::ivm_v2::or_exists_t::OrBranchesT::new(branches)
+            };
+            transformers.push(Box::new(or_t));
+        }
+
         if let Some(limit) = spec.limit {
             transformers.push(Box::new(TakeT::new(limit, std::sync::Arc::clone(&comparator))));
         }
@@ -293,7 +557,7 @@ impl Chain {
             primary_key: spec.primary_key,
             source,
             transformers,
-            join: None,
+            joins: Vec::new(),
             exists_child_tables,
         }
     }
@@ -302,18 +566,86 @@ impl Chain {
         &self.table
     }
 
-    pub fn child_table(&self) -> Option<&str> {
-        self.join.as_ref().map(|j| j.child_table.as_str())
+    /// First-level child tables wired as `Join`s from `ast.related[]`.
+    /// A mutation on any of these routes through `advance_child`.
+    pub fn child_tables(&self) -> Vec<&str> {
+        self.joins.iter().map(|j| j.child_table.as_str()).collect()
     }
 
-    /// Advance child-side. A change to the child table flows through
-    /// `push_child`, emitting a `ChildChange` per matching parent in
-    /// the current parent snapshot. The parent snapshot is materialized
-    /// fresh at each call — no cached parent list for now.
-    pub fn advance_child(&mut self, change: Change) -> Vec<RowChange> {
-        let Some(join) = self.join.as_mut() else {
+    /// Back-compat single-child accessor — returns the first join's
+    /// child table. Kept so existing callers compile; new code should
+    /// use `child_tables()` for multi-join queries.
+    pub fn child_table(&self) -> Option<&str> {
+        self.joins.first().map(|j| j.child_table.as_str())
+    }
+
+    /// Recursive list of every child-table reachable through nested
+    /// joins (any depth). Driver uses this to route grandchild-table
+    /// mutations into the owning top-level chain. Mirrors how TS
+    /// `buildPipelineInternal` ends up with a tree of Join operators
+    /// each watching its own child source — any mutation on one of
+    /// those child tables propagates up to the top-level Streamer.
+    pub fn join_tables_recursive(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        for js in self.joins.iter_mut() {
+            out.push(js.child_table.clone());
+            if let Some(sub) = js
+                .child_source
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<Chain>())
+            {
+                out.extend(sub.join_tables_recursive());
+            }
+        }
+        out
+    }
+
+    /// Recursive `advance_child` — mirrors TS `Join::#pushChild` at
+    /// `packages/zql/src/ivm/join.ts:190-251` propagating up through
+    /// every nested Join until the root. Algorithm:
+    ///   1. If any of THIS chain's `joins[*].child_table == table`,
+    ///      delegate to `advance_child(table, change)` (existing
+    ///      single-level path) — that emits the new leaf row.
+    ///   2. Otherwise, for each `joins[i]` whose child_source is a
+    ///      Chain, recurse. Any RowChanges the sub-chain produces
+    ///      are propagated up unchanged — the new leaf's table is
+    ///      preserved, same as TS `Streamer#streamChanges` recursing
+    ///      into `cc.child.change` with the child schema.
+    pub fn advance_child_recursive(
+        &mut self,
+        table: &str,
+        change: Change,
+    ) -> Vec<RowChange> {
+        if self.joins.iter().any(|j| j.child_table == table) {
+            return self.advance_child(table, change);
+        }
+        let mut out = Vec::new();
+        for js in self.joins.iter_mut() {
+            let Some(sub) = js
+                .child_source
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<Chain>())
+            else {
+                continue;
+            };
+            out.extend(sub.advance_child_recursive(table, change.clone()));
+        }
+        out
+    }
+
+    /// Advance child-side. A change to a child table flows through
+    /// the matching `JoinT::push_child`, emitting a `ChildChange`
+    /// per matching parent in the current parent snapshot. Mirrors
+    /// TS `Streamer#streamChanges` 'child' case in
+    /// `packages/zero-cache/src/services/view-syncer/pipeline-driver.ts:964-972`:
+    /// we recurse into `cc.child.change` with the child schema and
+    /// emit the new child row as a RowChange.
+    pub fn advance_child(&mut self, table: &str, change: Change) -> Vec<RowChange> {
+        // Locate the JoinStage whose child_table matches.
+        let Some(idx) = self.joins.iter().position(|j| j.child_table == table) else {
             return Vec::new();
         };
+        let join = &mut self.joins[idx];
         // Materialize the parent snapshot from source → transformers.
         // Collect eagerly so the join.transformer.push_child call has a
         // stable borrow.
@@ -329,25 +661,452 @@ impl Chain {
             .transformer
             .push_child(change, &parent_snapshot)
             .collect();
-        let query_id = &self.query_id;
-        let table = &self.table;
-        let pk = &self.primary_key;
-        emissions
-            .into_iter()
-            .filter_map(|c| match c {
-                Change::Child(cc) => {
-                    // Emit the ChildChange as an Edit on the parent row
-                    // (because the parent's children list has changed).
-                    Some(RowChange::Edit(super::row_change::RowEdit {
+        let query_id = self.query_id.clone();
+        let child_table = join.child_table.clone();
+        let child_pk = join.child_primary_key.clone();
+        let mut out: Vec<RowChange> = Vec::new();
+        for c in emissions {
+            // TS mirror: `Streamer#streamChanges` case 'child' at
+            // `pipeline-driver.ts:964-972` — on `Change::Child`, recurse
+            // into `cc.child.change` with the CHILD schema. For an Add
+            // nested change, that emits the new child row as a
+            // RowChange with the child's table name. We do the same
+            // here — the parent's row_key isn't needed since the
+            // client's `rowsPatch` is flat (server emits per-row ops
+            // keyed by table+pk; client applies them into its row map).
+            let Change::Child(cc) = c else { continue };
+            match *cc.child.change {
+                Change::Add(a) => {
+                    out.push(RowChange::Add(RowAdd {
+                        query_id: query_id.clone(),
+                        table: child_table.clone(),
+                        row_key: build_row_key(&child_pk, &a.node.row),
+                        row: a.node.row,
+                    }));
+                }
+                Change::Remove(r) => {
+                    out.push(RowChange::Remove(RowRemove {
+                        query_id: query_id.clone(),
+                        table: child_table.clone(),
+                        row_key: build_row_key(&child_pk, &r.node.row),
+                    }));
+                }
+                Change::Edit(e) => {
+                    out.push(RowChange::Edit(super::row_change::RowEdit {
+                        query_id: query_id.clone(),
+                        table: child_table.clone(),
+                        row_key: build_row_key(&child_pk, &e.node.row),
+                        row: e.node.row,
+                    }));
+                }
+                // Nested Change::Child (grandchild mutation arriving
+                // at a 2-level related). Requires recursive streamer
+                // over nested schemas. Current single-JoinSpec Chain
+                // only models one level of related(), so this branch
+                // is unreachable for now.
+                Change::Child(_) => {}
+            }
+        }
+        out
+    }
+
+    /// Advance child-side of an EXISTS subquery.
+    ///
+    /// When an upstream child table (i.e. a subquery table referenced
+    /// by an `whereExists(…)`) mutates, the parent chain's set of
+    /// matching rows may flip. Mirrors TS `Exists::*push` child branch
+    /// (`packages/zql/src/ivm/exists.ts:120-206`) — we materialise the
+    /// current parent snapshot, then delegate to every transformer's
+    /// `push_child` (default no-op; `ExistsT` overrides). The ExistsT
+    /// whose `child_table` matches detects size-flip on each
+    /// correlated parent and emits `Add(parent)` / `Remove(parent)`
+    /// which we translate to `RowChange::Add` / `RowChange::Remove`.
+    ///
+    /// Parent snapshot is built from `source → transformers` with the
+    /// target ExistsT excluded, so the snapshot represents parents
+    /// that would pass every other filter. Including the target
+    /// ExistsT itself would filter out exactly the parents whose
+    /// inclusion we're trying to decide — we need the pre-ExistsT set.
+    pub fn advance_child_for_exists(
+        &mut self,
+        child_table: &str,
+        change: Change,
+    ) -> Vec<RowChange> {
+        // Find the index of the Transformer owning this child_table —
+        // either a top-level ExistsT (standard case) or an OrBranchesT
+        // whose internal ExistsT references the table (p32/p36 case).
+        let mut target_idx: Option<usize> = None;
+        for (i, t) in self.transformers.iter_mut().enumerate() {
+            let Some(any) = t.as_any_mut() else { continue };
+            if let Some(et) = any.downcast_mut::<crate::ivm_v2::exists_t::ExistsT>() {
+                if et.child_table() == Some(child_table) {
+                    target_idx = Some(i);
+                    break;
+                }
+            } else if let Some(or_t) =
+                any.downcast_mut::<crate::ivm_v2::or_exists_t::OrBranchesT>()
+            {
+                if or_t
+                    .child_tables()
+                    .into_iter()
+                    .any(|c| c == child_table)
+                {
+                    target_idx = Some(i);
+                    break;
+                }
+            }
+        }
+        let Some(target_idx) = target_idx else {
+            return Vec::new();
+        };
+
+        // Parent snapshot = source → [transformers[0..target_idx]]
+        // (i.e. the stream as it appears immediately before the target
+        // ExistsT). Omitting the target ExistsT is essential: its own
+        // filter would hide exactly the parents we want to re-evaluate.
+        let parent_snapshot: Vec<Node> = {
+            let mut stream: Box<dyn Iterator<Item = Node>> =
+                self.source.fetch(FetchRequest::default());
+            for (i, t) in self.transformers.iter_mut().enumerate() {
+                if i >= target_idx {
+                    break;
+                }
+                stream = t.fetch_through(stream, FetchRequest::default());
+            }
+            stream.collect()
+        };
+
+        // Call push_child on the target ExistsT. Capture the target's
+        // relationship_name up-front so we can later look up its
+        // `(child_table, child_pk)` entry in `exists_child_tables` for
+        // emitting `RowChange::Edit` on the child table — mirrors TS
+        // `Streamer#streamChanges` 'child' case recursion into
+        // `cc.child.change` with the child schema at
+        // `packages/zero-cache/src/services/view-syncer/pipeline-driver.ts:986-993`.
+        let target = &mut self.transformers[target_idx];
+        let rel_name_for_edit: Option<String> = target
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<crate::ivm_v2::exists_t::ExistsT>())
+            .map(|et| et.relationship_name().to_string());
+        let emissions: Vec<Change> = target
+            .push_child(change, child_table, &parent_snapshot)
+            .collect();
+
+        let query_id = self.query_id.clone();
+        let table = self.table.clone();
+        let pk = self.primary_key.clone();
+        // Walk any populated relationships on the emitted parent node
+        // to emit subquery rows — mirrors TS `Streamer#streamNodes`
+        // recursion in `pipeline-driver.ts:1027-1030` which yields a
+        // RowChange for every row in `node.relationships[*]`, then
+        // recurses into each child's own relationships. Our
+        // `emit_node_subtree` below implements the same recursion.
+        let exists_tables = &self.exists_child_tables;
+        let mut out: Vec<RowChange> = Vec::new();
+        for c in emissions {
+            match c {
+                Change::Add(a) => {
+                    out.push(RowChange::Add(RowAdd {
                         query_id: query_id.clone(),
                         table: table.clone(),
-                        row_key: build_row_key(pk, &cc.node.row),
-                        row: cc.node.row,
-                    }))
+                        row_key: build_row_key(&pk, &a.node.row),
+                        row: a.node.row.clone(),
+                    }));
+                    let mut total = 0usize;
+                    emit_node_subtree(&a.node, exists_tables, &query_id, &mut out, &mut total);
                 }
-                _ => None,
-            })
-            .collect()
+                Change::Remove(r) => {
+                    out.push(RowChange::Remove(RowRemove {
+                        query_id: query_id.clone(),
+                        table: table.clone(),
+                        row_key: build_row_key(&pk, &r.node.row),
+                    }));
+                    // TS `Streamer#streamNodes` also recurses on remove
+                    // (same for-loop over relationships). We leave the
+                    // Remove path with empty relationships here — see
+                    // comments in `ExistsT::push_child`.
+                }
+                Change::Child(cc) => {
+                    // Mirror of TS `Streamer#streamChanges` 'child'
+                    // case at `packages/zero-cache/src/services/view-syncer/pipeline-driver.ts:986-993`:
+                    // on `Change::Child`, recurse into `cc.child.change`
+                    // with the CHILD schema and emit a RowChange for
+                    // the child table. Populated by `ExistsT::push_child`
+                    // when a child-Edit doesn't flip parent inclusion —
+                    // TS mirror `exists.ts:127-131` which forwards
+                    // child-Edit via `#pushWithFilter(change)`
+                    // (wraps outer change unchanged so Streamer's
+                    // recursion emits the inner Edit on the child
+                    // table). Requires the child table+pk which
+                    // `exists_child_tables` provides keyed by the
+                    // target ExistsT's `relationship_name`.
+                    let Some(ref rel_name) = rel_name_for_edit else {
+                        continue;
+                    };
+                    let Some((child_tbl, child_pk, _nested)) =
+                        exists_tables.get(rel_name.as_str())
+                    else {
+                        continue;
+                    };
+                    match *cc.child.change {
+                        Change::Edit(e) => {
+                            out.push(RowChange::Edit(RowEdit {
+                                query_id: query_id.clone(),
+                                table: child_tbl.clone(),
+                                row_key: build_row_key(child_pk, &e.node.row),
+                                row: e.node.row,
+                            }));
+                        }
+                        // Add/Remove inside Change::Child would also be
+                        // streamer-recursed in TS, but ExistsT::push_child
+                        // currently emits those as top-level Add/Remove
+                        // on the parent (the flip cases at exists.ts:134-204).
+                        // Only the Edit case arrives here — skip others.
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// List of child tables this Chain subscribes to for EXISTS push
+    /// propagation. Driver uses this to route child-source mutations
+    /// to the right Chain(s). Includes top-level ExistsT child tables
+    /// AND child tables inside any OrBranchesT — otherwise mutations
+    /// on relationships referenced only by OR-branch EXISTS (p32, p36)
+    /// never reach the ExistsT and the parent's OR evaluation doesn't
+    /// flip on child add/remove.
+    pub fn exists_child_tables_flat(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        for t in self.transformers.iter_mut() {
+            let Some(any) = t.as_any_mut() else { continue };
+            if let Some(et) = any.downcast_mut::<crate::ivm_v2::exists_t::ExistsT>() {
+                if let Some(ct) = et.child_table() {
+                    out.push(ct.to_string());
+                }
+            } else if let Some(or_t) =
+                any.downcast_mut::<crate::ivm_v2::or_exists_t::OrBranchesT>()
+            {
+                for ct in or_t.child_tables() {
+                    out.push(ct.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Recursive advance-child entry point mirroring the top-down
+    /// push TS's `buildPipelineInternal` sets up: a grandchild-table
+    /// mutation (e.g. `channels` update in p19) routes into THIS
+    /// chain's sub-Chain, whose own filters/ExistsT re-evaluate and
+    /// emit RowChanges representing the sub-query's now-changed set;
+    /// each of those RowChanges is converted back into a `Change` on
+    /// the sub-query's top-level table and fed into THIS chain's
+    /// direct `advance_child_for_exists`, which then propagates the
+    /// parent-set flip up. Repeats for 3+ level nesting.
+    pub fn advance_child_for_exists_recursive(
+        &mut self,
+        table: &str,
+        change: Change,
+    ) -> Vec<RowChange> {
+        // Case 1 — direct match: one of our ExistsT owns this child
+        // table. Use the existing single-level path which drives
+        // `ExistsT::push_child` directly and matches TS
+        // `Exists::*push` child-branch flip / forward logic at
+        // `packages/zql/src/ivm/exists.ts:134-204` (Add/Remove flip)
+        // and `exists.ts:127-131` (Edit forwarded as Change::Child).
+        let direct_hit = self
+            .exists_child_tables_flat()
+            .iter()
+            .any(|t| t == table);
+        if direct_hit {
+            return self.advance_child_for_exists(table, change);
+        }
+
+        // Case 2 — recursive: hand the mutation to each child-input
+        // Chain that is interested. Collect triples (outer_child_table,
+        // sub_chain_top_table, sub_rowchanges) first to avoid nested
+        // mutable borrows of `self`.
+        struct PendingCascade {
+            sub_chain_table: String,
+            sub_rowchanges: Vec<RowChange>,
+        }
+        let mut pending: Vec<PendingCascade> = Vec::new();
+        for t in self.transformers.iter_mut() {
+            let Some(et) = t
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<crate::ivm_v2::exists_t::ExistsT>())
+            else {
+                continue;
+            };
+            let Some(child) = et.child_input_mut() else { continue };
+            let Some(sub_chain) = child
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<Chain>())
+            else {
+                continue;
+            };
+            let sub_table = sub_chain.table().to_string();
+            let sub_rowchanges: Vec<RowChange> = if sub_table == table {
+                // Innermost: mutation is on the sub-chain's own source
+                // table. Drive sub-chain's `advance` — its filter /
+                // Take etc. decide whether the row's presence in the
+                // sub-query's output changes.
+                sub_chain.advance(change.clone())
+            } else {
+                // Grandchild further down — recurse.
+                sub_chain.advance_child_for_exists_recursive(table, change.clone())
+            };
+            if sub_rowchanges.is_empty() {
+                continue;
+            }
+            pending.push(PendingCascade {
+                sub_chain_table: sub_table,
+                sub_rowchanges,
+            });
+        }
+
+        // Cascade: convert each sub-chain RowChange → Change on its
+        // own top-level table, then run it through this chain's
+        // direct push_child path. Matches TS `Exists::*push`
+        // re-evaluating when its child input emits add/remove.
+        //
+        // Split by RowChange.table: RowChanges whose table matches the
+        // sub-chain's top table (e.g. sub conv chain emits
+        // RowChange::Remove(conversations)) need to feed outer push_child
+        // so the outer Exists re-evaluates. RowChanges on a different
+        // table (e.g. sub conv chain emits RowChange::Edit(channels)
+        // via the push_child Edit forward at `exists.ts:127-131`)
+        // describe a grandchild-table mutation that the outer Exists
+        // doesn't need to re-evaluate for — the Streamer would emit it
+        // directly. Mirror of TS `Streamer#streamChanges` at
+        // `packages/zero-cache/src/services/view-syncer/pipeline-driver.ts:986-993`
+        // recursing through each nested Change::Child with the
+        // appropriate child schema — the innermost Change::Add/Remove/Edit
+        // emits on its own table regardless of outer depth.
+        let mut out: Vec<RowChange> = Vec::new();
+        for p in pending {
+            for rc in p.sub_rowchanges {
+                if rc.table() != p.sub_chain_table {
+                    // Grandchild RowChange — pass through as the outer
+                    // Streamer would. No re-feed needed.
+                    out.push(rc);
+                    continue;
+                }
+                let ch = match rc {
+                    RowChange::Add(a) => Change::Add(super::super::ivm::change::AddChange {
+                        node: Node {
+                            row: a.row,
+                            relationships: indexmap::IndexMap::new(),
+                        },
+                    }),
+                    RowChange::Remove(r) => Change::Remove(
+                        super::super::ivm::change::RemoveChange {
+                            node: Node {
+                                // RowChange::Remove carries only the
+                                // row_key — for ExistsT::push_child
+                                // we only need fields matching the
+                                // outer ExistsT's `child_key`. The
+                                // child_key is always the sub-chain's
+                                // top-level PK (same field set as
+                                // row_key here), so this is sufficient.
+                                row: r.row_key,
+                                relationships: indexmap::IndexMap::new(),
+                            },
+                        },
+                    ),
+                    // Mirror of TS `Exists::*push` case 'child' at
+                    // `packages/zql/src/ivm/exists.ts:127-131` where
+                    // child-edits fall through `#pushWithFilter(change)`
+                    // — the outer Change::Child (wrapping the Edit) is
+                    // forwarded if the parent passes the exists
+                    // predicate. `RowChange::Edit` from the sub-chain
+                    // lacks a prior row, so we synthesize an EditChange
+                    // with `old_node == node` (safe: correlation-key
+                    // columns are preserved across Edits per Join's
+                    // `rowEqualsForCompoundKey` assertion at
+                    // `join.ts:162-167`; `push_child` reads only the
+                    // correlation-key columns from `node.row`).
+                    RowChange::Edit(e) => Change::Edit(
+                        super::super::ivm::change::EditChange {
+                            node: Node {
+                                row: e.row.clone(),
+                                relationships: indexmap::IndexMap::new(),
+                            },
+                            old_node: Node {
+                                row: e.row,
+                                relationships: indexmap::IndexMap::new(),
+                            },
+                        },
+                    ),
+                };
+                out.extend(self.advance_child_for_exists(&p.sub_chain_table, ch));
+            }
+        }
+        out
+    }
+
+    /// Like `exists_child_tables_flat` but walks nested sub-Chains
+    /// recursively. Used to route grandchild-table mutations
+    /// (e.g. p19 — top-level messages → exists(conversation) →
+    /// exists(channel); a `channels` mutation must reach this chain
+    /// so the cascade runs top-down).
+    ///
+    /// Also includes each nested chain's OWN top-level table, because
+    /// a mutation on that table is what triggers the innermost
+    /// re-evaluation (filters that previously passed may now fail).
+    pub fn exists_child_tables_flat_recursive(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        for t in self.transformers.iter_mut() {
+            let Some(any) = t.as_any_mut() else { continue };
+            // Two kinds of transformers can own child tables:
+            //   a) A top-level `ExistsT` (standard nested WHERE EXISTS).
+            //   b) An `OrBranchesT` whose inner branches hold ExistsTs
+            //      (top-level OR-of-EXISTS — p32/p36 shapes). Without
+            //      descending into OR branches here, child-table
+            //      mutations on relationships referenced only by an OR
+            //      branch never reach the ExistsT.
+            if let Some(or_t) =
+                any.downcast_mut::<crate::ivm_v2::or_exists_t::OrBranchesT>()
+            {
+                for ct in or_t.child_tables() {
+                    out.push(ct.to_string());
+                }
+                for ex in or_t.iter_all_exists_mut() {
+                    let Some(child) = ex.child_input_mut() else { continue };
+                    if let Some(sub_chain) = child
+                        .as_any_mut()
+                        .and_then(|a| a.downcast_mut::<Chain>())
+                    {
+                        out.push(sub_chain.table().to_string());
+                        out.extend(sub_chain.exists_child_tables_flat_recursive());
+                    }
+                }
+                continue;
+            }
+            let Some(et) = any.downcast_mut::<crate::ivm_v2::exists_t::ExistsT>() else {
+                continue;
+            };
+            if let Some(ct) = et.child_table() {
+                out.push(ct.to_string());
+            }
+            // Recurse into the sub-Chain's own tables.
+            let Some(child) = et.child_input_mut() else { continue };
+            if let Some(sub_chain) = child
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<Chain>())
+            {
+                // Sub-chain's own top-level table — a mutation on it
+                // is what triggers the innermost re-evaluation.
+                out.push(sub_chain.table().to_string());
+                // And anything the sub-chain itself subscribes to
+                // recursively (for 3+ level nesting).
+                out.extend(sub_chain.exists_child_tables_flat_recursive());
+            }
+        }
+        out
     }
 
     /// Streaming hydration. Drives source → transformers → optional join
@@ -369,14 +1128,18 @@ impl Chain {
         let chunk_size = emit_chunk_size();
         let req = FetchRequest::default();
 
-        // Pull the child once before we take long-lived borrows of the
-        // other fields — the child borrow ends before the parent stream
-        // starts, freeing `self.join` for the join.transformer borrow.
-        let child_arc: Option<StdArc<Vec<Node>>> = if let Some(js) = self.join.as_mut() {
-            Some(StdArc::new(js.child_source.fetch(req.clone()).collect()))
-        } else {
-            None
-        };
+        // Pull every join's child rows into `Arc<Vec<Node>>` BEFORE
+        // taking the long-lived parent borrow. Mirror of TS
+        // `buildPipelineInternal` evaluating each Join's child input
+        // eagerly (Join.fetch takes a stream from its child). Each
+        // child fetch needs `&mut js.child_source`, which is disjoint
+        // from `&mut self.source` / `&mut self.transformers`, but
+        // capturing all the child Arcs up front releases those borrows
+        // before we start iterating the parent chain.
+        let mut child_arcs: Vec<StdArc<Vec<Node>>> = Vec::with_capacity(self.joins.len());
+        for js in self.joins.iter_mut() {
+            child_arcs.push(StdArc::new(js.child_source.fetch(req.clone()).collect()));
+        }
 
         let query_id = self.query_id.clone();
         let table = self.table.clone();
@@ -391,17 +1154,16 @@ impl Chain {
             s
         };
 
-        // Apply join decoration if configured. `&mut self.join` is
-        // disjoint from `&mut self.source` and `&mut self.transformers`,
-        // so the borrow checker is happy even though parent_stream is
-        // still live.
-        let final_stream: Box<dyn Iterator<Item = Node> + '_> =
-            if let Some(js) = self.join.as_mut() {
-                let child = child_arc.expect("child_arc built when join is Some");
-                js.transformer.fetch_through(parent_stream, child, req)
-            } else {
-                parent_stream
-            };
+        // Apply EACH join's decoration in declaration order.
+        // Mirrors TS `buildPipelineInternal` iterating `ast.related[]`
+        // and folding `end = applyCorrelatedSubQuery(csq, ..., end, ...)`
+        // at `packages/zql/src/builder/builder.ts:353-355`.
+        let mut final_stream: Box<dyn Iterator<Item = Node> + '_> = parent_stream;
+        for (js, child_arc) in self.joins.iter_mut().zip(child_arcs.into_iter()) {
+            final_stream = js
+                .transformer
+                .fetch_through(final_stream, child_arc, req.clone());
+        }
 
         // Deferred-flush: `pending` holds the most recently filled chunk.
         // When the next chunk fills, we flush `pending` with is_final=false
@@ -501,9 +1263,11 @@ impl Chain {
             }
             buf = next;
         }
-        // Parent-side join: forward through push_parent. Returns the
-        // decorated change; it's already shaped as a parent Change.
-        if let Some(join) = self.join.as_mut() {
+        // Parent-side join: forward through each join's push_parent.
+        // Mirrors TS `buildPipelineInternal` chaining joins in order
+        // (builder.ts:353-355); each downstream join wraps the prior
+        // decorated parent node.
+        for join in self.joins.iter_mut() {
             let mut next: Vec<Change> = Vec::new();
             for c in buf.drain(..) {
                 for emit in join.transformer.push_parent(c) {
@@ -594,6 +1358,14 @@ impl crate::ivm_v2::operator::InputBase for Chain {
             t.destroy();
         }
         self.source.destroy();
+    }
+    /// Downcast hook so a parent Chain can recurse into its own
+    /// ExistsT's `child_input` (which is a `Box<dyn Input>`) and
+    /// route grandchild-table mutations through the sub-Chain's
+    /// `advance_child_for_exists_recursive`. Without this, nested
+    /// WHERE EXISTS (e.g. p19) never sees grandchild changes.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 }
 

@@ -117,6 +117,37 @@ pub trait Transformer: Send {
     /// Default: drop the rows (no-op for transformers that never request).
     fn ingest_refetch(&mut self, _rows: Vec<crate::ivm::data::Node>) {}
 
+    /// Child-side push, mirroring TS `Exists`/`Join` `#pushChild` flow
+    /// (`packages/zql/src/ivm/exists.ts:120` / `join.ts:190`).
+    ///
+    /// Called by the Chain when the upstream SQLite source for one of
+    /// this transformer's correlated child tables emits a change (a
+    /// mutation on the subquery's table). `child_table` identifies
+    /// which child table mutated — transformers that don't recognise
+    /// it return empty. `parent_snapshot` is materialised by the
+    /// Chain from its current source → preceding-transformers chain so
+    /// every Transformer gets the same view of parents at call time.
+    ///
+    /// Default: no-op. Operators that own a correlated child input
+    /// (currently only `ExistsT`) override this.
+    fn push_child<'a>(
+        &'a mut self,
+        _change: Change,
+        _child_table: &str,
+        _parent_snapshot: &[crate::ivm::data::Node],
+    ) -> Box<dyn Iterator<Item = Change> + 'a> {
+        Box::new(std::iter::empty())
+    }
+
+    /// Downcast escape hatch, mirroring `InputBase::as_any_mut`. Used
+    /// by `Chain::advance_child_for_exists` to locate the specific
+    /// `ExistsT` owning a given child table. Default `None` — only
+    /// operators that need to be identified at runtime (currently
+    /// `ExistsT`) override this.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
+
     fn destroy(&mut self) {}
 }
 

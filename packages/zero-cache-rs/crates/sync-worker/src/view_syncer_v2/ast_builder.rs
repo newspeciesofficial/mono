@@ -33,7 +33,7 @@ use crate::ivm_v2::exists_t::ExistsType;
 use crate::ivm_v2::filter_t::Predicate;
 use crate::ivm_v2::skip_t::Bound;
 
-use super::pipeline::{ChainSpec, ExistsSpec};
+use super::pipeline::{ChainSpec, ExistsSpec, JoinSpec};
 
 /// Build a `ChainSpec` from an AST. Caller supplies the query_id (from
 /// the transformation hash) and the primary key (looked up from the
@@ -43,17 +43,97 @@ pub fn ast_to_chain_spec(
     query_id: String,
     primary_key: PrimaryKey,
 ) -> Result<ChainSpec, AstBuildError> {
+    // Apply the TS planner's `flip: true` decision on CSQs inside OR
+    // branches before any chain lowering happens. Mirror of TS
+    // `applyPlansToAST` at
+    // `packages/zql/src/planner/planner-builder.ts:322-355` which
+    // rewrites the AST in-place with per-CSQ `flip` flags derived
+    // from the planner's cost model. We don't run the cost model —
+    // instead we apply a narrow, conservative criterion (see
+    // `apply_planner_flips` / `is_leaf_exists_or`) that matches the
+    // specific shape where `applyFilterWithFlips` takes the flipped
+    // path at `packages/zql/src/builder/builder.ts:410-448`. The
+    // mutation is internal (we clone the AST first) so callers
+    // upstream don't see the rewrite.
+    let mut ast_owned: AST = ast.clone();
+    apply_planner_flips(&mut ast_owned);
+    let ast = &ast_owned;
     let predicate = match ast.where_clause.as_deref() {
         None => None,
         Some(cond) => Some(build_predicate(cond)?),
     };
 
     let skip_bound = ast.start.as_ref().map(ast_bound_to_v2);
-    let mut all_exists = collect_all_exists(ast);
-    let exists = if all_exists.is_empty() {
-        None
+
+    // Detect top-level OR-of-EXISTS at the WHERE root. Mirror of TS
+    // `applyFilterWithFlips` at `packages/zql/src/builder/builder.ts:376-442`
+    // OR path: each branch is its own recursive filter pipeline and the
+    // results union via `UnionFanOut + UnionFanIn`. We capture the
+    // sub-case where every OR branch is a single `CorrelatedSubquery`
+    // (`or(exists(A), exists(B), ...)`) and route it to an
+    // `OrOfExistsT` transformer. Other OR shapes (branches that mix
+    // EXISTS with plain cmp, or contain AND-of-EXISTS) still fall back
+    // to the legacy sequential `exists_chain` path.
+    // TS wraps WHERE bodies in a singleton `And` (see
+    // `zql/src/query/query-impl.ts` where-builder) before sending,
+    // so `or(...)` often arrives as `and([or(...)])`. Walk through
+    // any chain of singleton `And` nodes to find the effective
+    // top-level condition before checking for OR-of-EXISTS.
+    fn peel_singleton_and(cond: &Condition) -> &Condition {
+        let mut cur = cond;
+        loop {
+            match cur {
+                Condition::And { conditions } if conditions.len() == 1 => {
+                    cur = &conditions[0];
+                }
+                _ => return cur,
+            }
+        }
+    }
+    let or_branches: Vec<super::pipeline::OrBranchSpec> =
+        match ast.where_clause.as_deref().map(peel_singleton_and) {
+            Some(Condition::Or { conditions }) => {
+                // For each branch, recursively split into scalar part
+                // + EXISTS list. Mirror of TS
+                // `applyFilterWithFlips(end, cond, ...)` recursed per
+                // branch (builder.ts:439).
+                let mut branches = Vec::with_capacity(conditions.len());
+                let mut bail = false;
+                for cond in conditions {
+                    match split_branch(cond) {
+                        Ok(b) => branches.push(b),
+                        Err(()) => {
+                            // Branch contains a nested shape (OR
+                            // inside, spreads, etc.) we don't yet
+                            // lower. Fall back to the legacy
+                            // exists_chain path (AND semantics) —
+                            // may produce divergent result but
+                            // at least compiles and runs.
+                            bail = true;
+                            break;
+                        }
+                    }
+                }
+                if bail {
+                    Vec::new()
+                } else {
+                    branches
+                }
+            }
+            _ => Vec::new(),
+        };
+    let (exists, all_exists) = if or_branches.is_empty() {
+        let mut all_exists = collect_all_exists(ast);
+        let exists = if all_exists.is_empty() {
+            None
+        } else {
+            Some(all_exists.remove(0))
+        };
+        (exists, all_exists)
     } else {
-        Some(all_exists.remove(0))
+        // OR branches own the EXISTS conditions; don't double-apply
+        // them via exists/exists_chain.
+        (None, Vec::new())
     };
 
     // Pass AST's `orderBy` through so the source picks up the query's
@@ -64,6 +144,35 @@ pub fn ast_to_chain_spec(
     // sort into `Source.connect`.
     let order_by = ast.order_by.clone();
 
+    // Map every `ast.related[]` entry to a JoinSpec. Mirrors TS
+    // `buildPipelineInternal` at
+    // `packages/zql/src/builder/builder.ts:347-355` which iterates
+    // each `csq` in `ast.related` and wraps the current Input with
+    // a Join via `applyCorrelatedSubQuery` (builder.ts:611-647).
+    // Each subquery AST is preserved so the driver can recursively
+    // build a sub-Chain — same recursion TS performs at
+    // `buildPipelineInternal(sq.subquery, ...)` (builder.ts:626).
+    let joins: Vec<JoinSpec> = ast
+        .related
+        .as_ref()
+        .map(|rels| {
+            rels.iter()
+                .map(|r| JoinSpec {
+                    parent_key: r.correlation.parent_field.clone(),
+                    child_key: r.correlation.child_field.clone(),
+                    relationship_name: r
+                        .subquery
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| r.subquery.table.clone()),
+                    child_table: r.subquery.table.clone(),
+                    child_subquery: Some(Box::new(r.subquery.as_ref().clone())),
+                    child_primary_key: None, // driver fills in from schema
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(ChainSpec {
         query_id,
         table: ast.table.clone(),
@@ -73,9 +182,171 @@ pub fn ast_to_chain_spec(
         limit: ast.limit.map(|l| l as usize),
         exists,
         exists_chain: all_exists,
-        join: None,
+        joins,
+        or_branches,
         order_by,
     })
+}
+
+/// Port of the TS planner's `flip: true` decision, narrowed to the
+/// specific shape RS currently supports.
+///
+/// TS background:
+/// - `packages/zql/src/planner/planner-builder.ts:311-320` (`planQuery`)
+///   runs `buildPlanGraph` + `planRecursively` over the AST and calls
+///   `applyPlansToAST` (:357-382), which writes `flip: bool` onto
+///   every `CorrelatedSubquery` condition based on the graph's
+///   `PlannerJoin.type === 'flipped'` decisions.
+/// - `packages/zql/src/builder/builder.ts:410-448`
+///   (`applyFilterWithFlips` OR case) consumes that flag: an OR whose
+///   branches contain a flipped CSQ is lowered to
+///   `UnionFanOut + FlippedJoin-per-branch + UnionFanIn`, and
+///   `UnionFanIn.fetch` → `mergeFetches`
+///   (`packages/zql/src/ivm/union-fan-in.ts:218-300`) emits each PK
+///   at most once (first-wins on duplicate PK, L260-265).
+/// - The non-flipped path (same OR shape, `flip != true`) goes through
+///   `applyOr` (`builder.ts:514-557`), a classic `FanOut + per-branch
+///   Filter + FanIn` that emits rows as union-all.
+///
+/// Criterion (explicitly per the task spec, conservative narrow):
+/// > Parent is in an OR whose EVERY branch is a single leaf EXISTS
+/// > (no nested AND/OR, no scalar cmp).
+///
+/// When that holds for an `Or { conditions }`, we flip every CSQ in
+/// that OR by setting `flip = Some(true)`. When any branch is scalar
+/// or contains nested AND/OR / nested CSQs, we leave the OR alone —
+/// the builder then takes the non-flip `applyOr` path
+/// (`builder.ts:514-557`), matching RS's existing union-all behavior.
+///
+/// The pass recurses into:
+///   - Every AND/OR's children
+///   - Every CSQ's `related.subquery.where` (sub-ASTs that have their
+///     own WHERE, since TS's `planRecursively` at
+///     `planner-builder.ts:300-309` walks every sub-plan)
+///   - Every `AST.related[].subquery` (same reason)
+///
+/// We deliberately do NOT port the cost model — the narrow criterion
+/// is a syntactic pattern match the task explicitly bounded the port
+/// to. Any OR shape outside this criterion keeps its current non-flip
+/// behavior.
+pub(super) fn apply_planner_flips(ast: &mut AST) {
+    if let Some(where_clause) = ast.where_clause.as_deref_mut() {
+        flip_condition_if_leaf_exists_or(where_clause);
+    }
+    // Recurse into every related subquery AST. TS `planRecursively`
+    // at `packages/zql/src/planner/planner-builder.ts:300-309`
+    // invokes `plans.plan.plan()` for every `subPlans[alias]`
+    // before the parent — each sub-plan's AST gets its own
+    // `applyPlansToAST` rewrite.
+    if let Some(related) = ast.related.as_mut() {
+        for csq in related.iter_mut() {
+            apply_planner_flips(&mut csq.subquery);
+        }
+    }
+}
+
+/// Walk `cond` in-place. At every `Or` node, apply the leaf-EXISTS
+/// criterion; if met, mark every CSQ in the OR as `flip = Some(true)`.
+/// Also recurse into all children (AND/OR bodies, and into each CSQ's
+/// own subquery WHERE + related).
+fn flip_condition_if_leaf_exists_or(cond: &mut Condition) {
+    match cond {
+        Condition::Or { conditions } => {
+            // Check if EVERY branch is a single leaf EXISTS.
+            let all_leaf_exists = !conditions.is_empty()
+                && conditions.iter().all(is_leaf_exists_csq);
+            if all_leaf_exists {
+                for branch in conditions.iter_mut() {
+                    if let Condition::CorrelatedSubquery { flip, .. } = branch {
+                        // TS `applyPlansToAST` sets `flip = shouldFlip`
+                        // unconditionally (overwrites whatever the
+                        // caller had set) — see
+                        // `packages/zql/src/planner/planner-builder.ts:336-338`.
+                        // We mirror that: unconditional write.
+                        *flip = Some(true);
+                    }
+                }
+            }
+            // Recurse into every branch so nested OR-of-leaf-EXISTS
+            // (even if this outer OR didn't qualify) still gets
+            // flipped. Matches TS walking every sub-condition in
+            // `applyToCondition` (`planner-builder.ts:322-355`).
+            for branch in conditions.iter_mut() {
+                flip_condition_if_leaf_exists_or(branch);
+            }
+        }
+        Condition::And { conditions } => {
+            for c in conditions.iter_mut() {
+                flip_condition_if_leaf_exists_or(c);
+            }
+        }
+        Condition::CorrelatedSubquery { related, .. } => {
+            // Recurse into the subquery's own WHERE and its related[],
+            // mirroring TS `applyToCondition` recursion through
+            // `condition.related.subquery.where` at
+            // `packages/zql/src/planner/planner-builder.ts:341-348`.
+            apply_planner_flips(&mut related.subquery);
+        }
+        Condition::Simple { .. } => {}
+    }
+}
+
+/// True iff `cond` is a plain `CorrelatedSubquery` leaf — NOT wrapped
+/// in AND/OR, NOT containing scalar conditions. This is the strict
+/// definition used by the task spec:
+/// > every OR branch is a single leaf EXISTS (no nested AND/OR,
+/// > no scalar cmp).
+///
+/// Accepts both `EXISTS` and `NOT EXISTS` operators — TS
+/// `applyFilterWithFlips` at
+/// `packages/zql/src/builder/builder.ts:450-478` handles both as
+/// CSQ leafs; the planner's per-CSQ flip decision at
+/// `planner-builder.ts:241-263` disables flipping for `NOT EXISTS`
+/// (`flippable = false; initialType = 'semi';`), so a NOT EXISTS leaf
+/// in the OR would keep `flip` unset by the planner and the OR
+/// overall wouldn't qualify as "all flipped". To stay faithful to
+/// TS, we therefore require every leaf to be `EXISTS` (not NOT EXISTS).
+///
+/// Additionally excludes CSQs whose OWN subquery tree contains
+/// nested correlatedSubquery conditions. TS mirror: the planner's
+/// cost model (`packages/zql/src/planner/planner-graph.ts`) only
+/// favors flipping when the flipped-child cardinality × parent
+/// fanout is cheaper than parent-first. A subquery carrying its
+/// own nested EXISTS contributes a sub-plan whose cost pushes the
+/// flipped side above the semi-join cost, so TS planner leaves
+/// such CSQs unflipped. Without this check RS would flip
+/// p42-style queries (`or(exists(c.whereExists('m')), exists(p))`)
+/// that TS keeps on the upfront-Join path, losing branch-B's
+/// decoration via mergeFetches first-wins.
+fn is_leaf_exists_csq(cond: &Condition) -> bool {
+    match cond {
+        Condition::CorrelatedSubquery {
+            op: CorrelatedSubqueryOp::EXISTS,
+            related,
+            ..
+        } => !subquery_has_nested_csq(related.subquery.as_ref()),
+        _ => false,
+    }
+}
+
+/// True iff the subquery's WHERE tree contains any
+/// `CorrelatedSubquery` at any depth. Used by `is_leaf_exists_csq`
+/// to exclude CSQs whose subplan is too heavy for TS planner to
+/// have flipped. Checks the subquery's own `where` and recurses
+/// into AND/OR; does NOT walk `related[]` (planner operates on
+/// `where`-tree CSQs only, per
+/// `packages/zql/src/planner/planner-builder.ts` `planQuery`).
+fn subquery_has_nested_csq(ast: &AST) -> bool {
+    fn walk(cond: &Condition) -> bool {
+        match cond {
+            Condition::CorrelatedSubquery { .. } => true,
+            Condition::And { conditions } | Condition::Or { conditions } => {
+                conditions.iter().any(walk)
+            }
+            _ => false,
+        }
+    }
+    ast.where_clause.as_deref().map_or(false, walk)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -182,9 +453,11 @@ fn eval_constant_simple(
     use SimpleOperator as Op;
     let lhs_is_null = lhs.is_null();
     if lhs_is_null {
+        // mirrors TS: zqlite/src/query-builder.ts:125-134 (SQLite json_each semantics)
         return match op {
             Op::IsNot => !rhs.is_null(),
             Op::IS => rhs.is_null(),
+            Op::NotIn => matches!(rhs, serde_json::Value::Array(xs) if xs.is_empty()),
             _ => false,
         };
     }
@@ -233,10 +506,21 @@ impl SimpleClause {
         let lhs = match row.get(&self.column) {
             Some(Some(v)) => v,
             _ => {
-                // NULL handling: IS/IsNot compare against NULL; else false.
+                // NULL lhs handling — mirrors SQLite semantics as used by TS's
+                // zqlite/src/query-builder.ts:125-134 (IN/NOT IN → json_each).
+                //
+                // SQLite: `NULL NOT IN (SELECT value FROM json_each('[]'))` → 1 (true)
+                //         `NULL NOT IN (SELECT value FROM json_each('[...]'))` → 0 (false)
+                //         `NULL IN (anything)` → 0 (false)
+                //
+                // For IS/IS NOT, compare against NULL directly.
+                // For NOT IN, return true iff the rhs array is empty.
+                // Everything else → false.
                 return match self.op {
                     SimpleOperator::IsNot => !self.rhs.is_null(),
                     SimpleOperator::IS => self.rhs.is_null(),
+                    // mirrors TS: zqlite/src/query-builder.ts:125-134
+                    SimpleOperator::NotIn => matches!(&self.rhs, serde_json::Value::Array(xs) if xs.is_empty()),
                     _ => false,
                 };
             }
@@ -344,6 +628,118 @@ fn literal_to_json(lit: &LiteralValue) -> serde_json::Value {
                 .collect();
             serde_json::Value::Array(inner)
         }
+    }
+}
+
+/// Lower one OR branch's `Condition` to an `OrBranchSpec`.
+/// Mirror of TS per-branch recursion at
+/// `packages/zql/src/builder/builder.ts:439`
+/// (`branches.push(applyFilterWithFlips(end, cond, ...))`).
+///
+/// Splits the branch into:
+///   - A scalar predicate compiled from every non-EXISTS condition
+///     in the branch, AND'd together (matches `Filter` application
+///     after sub-pipelines in `buildPipelineInternal`).
+///   - The list of EXISTS/NOT-EXISTS correlated subqueries in the
+///     branch, AND'd together (matches sequential ExistsT application
+///     after scalar Filter within a branch).
+///
+/// Supported branch shapes:
+///   - `Simple`  → predicate only, no EXISTS
+///   - `CorrelatedSubquery` → no predicate, single EXISTS
+///   - `And { [..] }` → collect scalars into predicate, collect
+///     CorrelatedSubquery into EXISTS list
+///   - `Or`/nested `And(And)` → returns `Err(())` for the caller to
+///     fall back to the legacy path (matches documented scope limit).
+fn split_branch(cond: &Condition) -> Result<super::pipeline::OrBranchSpec, ()> {
+    let mut scalar_nodes: Vec<Condition> = Vec::new();
+    let mut exists_list: Vec<ExistsSpec> = Vec::new();
+    collect_branch_parts(cond, &mut scalar_nodes, &mut exists_list)?;
+    let predicate = if scalar_nodes.is_empty() {
+        None
+    } else {
+        // AND the scalar conditions together — mirror of TS
+        // `applyWhere` sequential Filter application.
+        let combined = if scalar_nodes.len() == 1 {
+            scalar_nodes.into_iter().next().unwrap()
+        } else {
+            Condition::And {
+                conditions: scalar_nodes,
+            }
+        };
+        match build_predicate(&combined) {
+            Ok(p) => Some(p),
+            Err(_) => return Err(()),
+        }
+    };
+    // TS-planner flip decision for this branch. The `apply_planner_flips`
+    // pass sets `flip: true` on every CSQ in every branch when the OR
+    // matches the leaf-EXISTS criterion (mirrors TS
+    // `applyFilterWithFlips` at
+    // `packages/zql/src/builder/builder.ts:410-448`). A branch is in
+    // flip-mode iff every CSQ within it is flipped; once set, the
+    // containing `OrBranchesT` runs in `mergeFetches` first-wins-on-PK
+    // mode (TS `packages/zql/src/ivm/union-fan-in.ts:218-300`).
+    // Branches without any CSQ (pure scalar branches) can't be flipped,
+    // so leave `flip_mode = false`.
+    let flip_mode = branch_all_csqs_flipped(cond);
+    Ok(super::pipeline::OrBranchSpec {
+        predicate,
+        exists: exists_list,
+        flip_mode,
+    })
+}
+
+/// True iff every `Condition::CorrelatedSubquery` reachable under
+/// `cond` has `flip == Some(true)` and at least one CSQ exists.
+/// Matches TS `applyPlansToAST` semantics at
+/// `packages/zql/src/planner/planner-builder.ts:322-355`: the
+/// planner tags every flipped CSQ with `flip = true`, so a branch
+/// is "in the flipped path" iff all of its CSQs carry that flag.
+fn branch_all_csqs_flipped(cond: &Condition) -> bool {
+    fn walk(cond: &Condition, saw_csq: &mut bool) -> bool {
+        match cond {
+            Condition::CorrelatedSubquery { flip, .. } => {
+                *saw_csq = true;
+                flip.unwrap_or(false)
+            }
+            Condition::And { conditions } | Condition::Or { conditions } => {
+                conditions.iter().all(|c| walk(c, saw_csq))
+            }
+            Condition::Simple { .. } => true,
+        }
+    }
+    let mut saw_csq = false;
+    let all_flipped = walk(cond, &mut saw_csq);
+    all_flipped && saw_csq
+}
+
+fn collect_branch_parts(
+    cond: &Condition,
+    scalars: &mut Vec<Condition>,
+    exists_list: &mut Vec<ExistsSpec>,
+) -> Result<(), ()> {
+    match cond {
+        Condition::Simple { .. } => {
+            scalars.push(cond.clone());
+            Ok(())
+        }
+        Condition::CorrelatedSubquery { .. } => {
+            walk_exists(cond, exists_list);
+            Ok(())
+        }
+        Condition::And { conditions } => {
+            // Flatten AND chains into the branch's scalar+EXISTS
+            // buckets. Matches TS `applyWhere` which lowers
+            // And-of-mixed into a linear Filter + ExistsT sequence.
+            for c in conditions {
+                collect_branch_parts(c, scalars, exists_list)?;
+            }
+            Ok(())
+        }
+        // Nested OR inside an OR branch would require another layer
+        // of UnionFanOut/FanIn — scope limit; caller falls back.
+        Condition::Or { .. } => Err(()),
     }
 }
 
@@ -586,6 +982,84 @@ mod tests {
         assert!(!p(&not_matching));
     }
 
+    /// Regression test for fuzz_00633: `NOT IN []` on a nullable column.
+    ///
+    /// TS ground truth (zqlite/src/query-builder.ts:125-134): the query is
+    /// compiled to SQLite as `visibleTo NOT IN (SELECT value FROM json_each('[]'))`.
+    /// SQLite semantics: `NULL NOT IN (empty subquery)` → 1 (true), so rows
+    /// with a NULL column pass the filter. RS must match.
+    #[test]
+    fn not_in_empty_array_passes_null_column() {
+        let ast = AST {
+            schema: None,
+            table: "messages".into(),
+            alias: None,
+            where_clause: Some(Box::new(mk_simple(
+                "visibleTo",
+                SimpleOperator::NotIn,
+                LiteralValue::Array(vec![]), // empty array
+            ))),
+            related: None,
+            start: None,
+            limit: None,
+            order_by: None,
+        };
+        let spec =
+            ast_to_chain_spec(&ast, "q1".into(), PrimaryKey::new(vec!["id".into()])).unwrap();
+        let p = spec.predicate.unwrap();
+
+        // Row with NULL visibleTo — must pass (mirrors SQLite: NULL NOT IN () → true).
+        let mut null_row = Row::new();
+        null_row.insert("visibleTo".into(), None); // NULL
+        assert!(p(&null_row), "NULL NOT IN [] must be true (mirrors TS SQLite semantics)");
+
+        // Row with a non-null visibleTo — also passes (empty set, nothing to exclude).
+        let mut non_null_row = Row::new();
+        non_null_row.insert("visibleTo".into(), Some(json!("u1")));
+        assert!(p(&non_null_row), "non-null NOT IN [] must be true");
+
+        // Column missing entirely (also treated as NULL by Row::get returning None).
+        let empty_row = Row::new();
+        assert!(p(&empty_row), "missing column (NULL) NOT IN [] must be true");
+    }
+
+    /// Complement: `NOT IN [non-empty]` with NULL column must be false.
+    /// Mirrors SQLite: `NULL NOT IN ('u1')` → NULL (falsy).
+    #[test]
+    fn not_in_nonempty_array_rejects_null_column() {
+        let ast = AST {
+            schema: None,
+            table: "messages".into(),
+            alias: None,
+            where_clause: Some(Box::new(mk_simple(
+                "visibleTo",
+                SimpleOperator::NotIn,
+                LiteralValue::Array(vec![ScalarLiteral::String("u1".into())]),
+            ))),
+            related: None,
+            start: None,
+            limit: None,
+            order_by: None,
+        };
+        let spec =
+            ast_to_chain_spec(&ast, "q1".into(), PrimaryKey::new(vec!["id".into()])).unwrap();
+        let p = spec.predicate.unwrap();
+
+        let mut null_row = Row::new();
+        null_row.insert("visibleTo".into(), None); // NULL
+        assert!(!p(&null_row), "NULL NOT IN [non-empty] must be false (SQL NULL semantics)");
+
+        // Non-null value not in the list — passes.
+        let mut non_null_row = Row::new();
+        non_null_row.insert("visibleTo".into(), Some(json!("u2")));
+        assert!(p(&non_null_row), "u2 NOT IN [u1] must be true");
+
+        // Non-null value that IS in the list — must be false.
+        let mut in_list_row = Row::new();
+        in_list_row.insert("visibleTo".into(), Some(json!("u1")));
+        assert!(!p(&in_list_row), "u1 NOT IN [u1] must be false");
+    }
+
     #[test]
     fn like_operator_matches_pattern() {
         let ast = AST {
@@ -677,5 +1151,288 @@ mod tests {
         r_closed.insert("open".into(), Some(json!(false)));
         r_closed.insert("visibility".into(), Some(json!("public")));
         assert!(!p(&r_closed));
+    }
+
+    // ---- Planner-flip pass tests ---------------------------------
+    //
+    // These tests verify the narrow port of TS `applyPlansToAST` at
+    // `packages/zql/src/planner/planner-builder.ts:322-355`. They
+    // exercise the exact criterion given in the task: an OR whose
+    // EVERY branch is a single leaf EXISTS gets `flip = Some(true)`
+    // on every CSQ; any other OR shape (scalar branch, nested
+    // AND/OR, NOT EXISTS, etc.) leaves `flip` unchanged.
+
+    fn mk_csq_exists(rel_alias: &str, child_table: &str, parent_field: &str) -> Condition {
+        use zero_cache_types::ast::{Correlation, CorrelatedSubquery, AST as CsqAst};
+        Condition::CorrelatedSubquery {
+            related: Box::new(CorrelatedSubquery {
+                correlation: Correlation {
+                    parent_field: vec![parent_field.into()],
+                    child_field: vec!["id".into()],
+                },
+                subquery: Box::new(CsqAst {
+                    schema: None,
+                    table: child_table.into(),
+                    alias: Some(rel_alias.into()),
+                    where_clause: None,
+                    related: None,
+                    start: None,
+                    limit: None,
+                    order_by: None,
+                }),
+                system: None,
+                hidden: None,
+            }),
+            op: CorrelatedSubqueryOp::EXISTS,
+            flip: None,
+            scalar: None,
+        }
+    }
+
+    fn mk_csq_not_exists(rel_alias: &str, child_table: &str, parent_field: &str) -> Condition {
+        let mut c = mk_csq_exists(rel_alias, child_table, parent_field);
+        if let Condition::CorrelatedSubquery { op, .. } = &mut c {
+            *op = CorrelatedSubqueryOp::NotExists;
+        }
+        c
+    }
+
+    fn flip_of(cond: &Condition) -> Option<bool> {
+        match cond {
+            Condition::CorrelatedSubquery { flip, .. } => *flip,
+            _ => panic!("expected CorrelatedSubquery"),
+        }
+    }
+
+    #[test]
+    fn planner_flip_sets_flip_on_or_of_two_leaf_exists() {
+        // TS mirror: `applyFilterWithFlips` OR case at
+        // `packages/zql/src/builder/builder.ts:410-448` takes the
+        // flipped path when all branches carry `flip = true`.
+        let mut ast = AST {
+            schema: None,
+            table: "conv".into(),
+            alias: None,
+            where_clause: Some(Box::new(Condition::Or {
+                conditions: vec![
+                    mk_csq_exists("A", "t_a", "id"),
+                    mk_csq_exists("B", "t_b", "id"),
+                ],
+            })),
+            related: None,
+            start: None,
+            limit: None,
+            order_by: None,
+        };
+        apply_planner_flips(&mut ast);
+        let Condition::Or { conditions } = ast.where_clause.as_deref().unwrap() else {
+            panic!("expected Or");
+        };
+        assert_eq!(flip_of(&conditions[0]), Some(true));
+        assert_eq!(flip_of(&conditions[1]), Some(true));
+    }
+
+    #[test]
+    fn planner_flip_skips_or_when_branch_has_scalar_cmp() {
+        // TS `applyFilterWithFlips` at `builder.ts:410-448` — with a
+        // scalar branch the planner's cost model may not produce an
+        // all-flipped plan; the narrow criterion we port says: skip
+        // if any branch is scalar.
+        let mut ast = AST {
+            schema: None,
+            table: "conv".into(),
+            alias: None,
+            where_clause: Some(Box::new(Condition::Or {
+                conditions: vec![
+                    mk_csq_exists("A", "t_a", "id"),
+                    mk_simple("name", SimpleOperator::Eq, LiteralValue::String("x".into())),
+                ],
+            })),
+            related: None,
+            start: None,
+            limit: None,
+            order_by: None,
+        };
+        apply_planner_flips(&mut ast);
+        let Condition::Or { conditions } = ast.where_clause.as_deref().unwrap() else {
+            panic!("expected Or");
+        };
+        assert_eq!(flip_of(&conditions[0]), None);
+    }
+
+    #[test]
+    fn planner_flip_skips_or_when_branch_has_nested_and() {
+        // Task spec: "no nested AND/OR" — branch wrapping CSQ inside
+        // an AND disqualifies the OR from being flipped.
+        let mut ast = AST {
+            schema: None,
+            table: "conv".into(),
+            alias: None,
+            where_clause: Some(Box::new(Condition::Or {
+                conditions: vec![
+                    mk_csq_exists("A", "t_a", "id"),
+                    Condition::And {
+                        conditions: vec![mk_csq_exists("B", "t_b", "id")],
+                    },
+                ],
+            })),
+            related: None,
+            start: None,
+            limit: None,
+            order_by: None,
+        };
+        apply_planner_flips(&mut ast);
+        let Condition::Or { conditions } = ast.where_clause.as_deref().unwrap() else {
+            panic!("expected Or");
+        };
+        assert_eq!(flip_of(&conditions[0]), None);
+    }
+
+    #[test]
+    fn planner_flip_skips_or_with_not_exists_leaf() {
+        // NOT EXISTS can't be flipped in TS — planner sets
+        // `flippable = false` at `planner-builder.ts:247-250`, so
+        // the OR doesn't qualify. We mirror that by rejecting any
+        // NOT EXISTS leaf in `is_leaf_exists_csq`.
+        let mut ast = AST {
+            schema: None,
+            table: "conv".into(),
+            alias: None,
+            where_clause: Some(Box::new(Condition::Or {
+                conditions: vec![
+                    mk_csq_exists("A", "t_a", "id"),
+                    mk_csq_not_exists("B", "t_b", "id"),
+                ],
+            })),
+            related: None,
+            start: None,
+            limit: None,
+            order_by: None,
+        };
+        apply_planner_flips(&mut ast);
+        let Condition::Or { conditions } = ast.where_clause.as_deref().unwrap() else {
+            panic!("expected Or");
+        };
+        assert_eq!(flip_of(&conditions[0]), None);
+        assert_eq!(flip_of(&conditions[1]), None);
+    }
+
+    #[test]
+    fn planner_flip_recurses_into_csq_subquery_where() {
+        // TS `applyToCondition` at `planner-builder.ts:322-355`
+        // recurses into `condition.related.subquery.where` with the
+        // same `flippedIds`. Our port should do the same — the
+        // subquery's own OR-of-leaf-EXISTS should get flipped.
+        use zero_cache_types::ast::{Correlation, CorrelatedSubquery, AST as CsqAst};
+        let sub_where = Box::new(Condition::Or {
+            conditions: vec![
+                mk_csq_exists("X", "t_x", "id"),
+                mk_csq_exists("Y", "t_y", "id"),
+            ],
+        });
+        let outer_csq = Condition::CorrelatedSubquery {
+            related: Box::new(CorrelatedSubquery {
+                correlation: Correlation {
+                    parent_field: vec!["id".into()],
+                    child_field: vec!["id".into()],
+                },
+                subquery: Box::new(CsqAst {
+                    schema: None,
+                    table: "inner".into(),
+                    alias: Some("I".into()),
+                    where_clause: Some(sub_where),
+                    related: None,
+                    start: None,
+                    limit: None,
+                    order_by: None,
+                }),
+                system: None,
+                hidden: None,
+            }),
+            op: CorrelatedSubqueryOp::EXISTS,
+            flip: None,
+            scalar: None,
+        };
+        let mut ast = AST {
+            schema: None,
+            table: "outer".into(),
+            alias: None,
+            where_clause: Some(Box::new(outer_csq)),
+            related: None,
+            start: None,
+            limit: None,
+            order_by: None,
+        };
+        apply_planner_flips(&mut ast);
+        // Inspect the inner subquery's WHERE — the OR children
+        // should now have flip=Some(true).
+        let Condition::CorrelatedSubquery { related, .. } =
+            ast.where_clause.as_deref().unwrap()
+        else {
+            panic!("expected outer CSQ");
+        };
+        let Condition::Or { conditions } =
+            related.subquery.where_clause.as_deref().unwrap()
+        else {
+            panic!("expected inner Or");
+        };
+        assert_eq!(flip_of(&conditions[0]), Some(true));
+        assert_eq!(flip_of(&conditions[1]), Some(true));
+    }
+
+    #[test]
+    fn or_branch_spec_carries_flip_mode_for_leaf_exists_or() {
+        // End-to-end: AST with OR-of-two-leaf-EXISTS should lower
+        // into a ChainSpec whose `or_branches[*]` each carry
+        // `flip_mode = true`. This is the handoff point between the
+        // planner-port and the OrBranchesT flip-mode selection.
+        let ast = AST {
+            schema: None,
+            table: "conv".into(),
+            alias: None,
+            where_clause: Some(Box::new(Condition::Or {
+                conditions: vec![
+                    mk_csq_exists("A", "t_a", "id"),
+                    mk_csq_exists("B", "t_b", "id"),
+                ],
+            })),
+            related: None,
+            start: None,
+            limit: None,
+            order_by: None,
+        };
+        let spec =
+            ast_to_chain_spec(&ast, "q1".into(), PrimaryKey::new(vec!["id".into()])).unwrap();
+        assert_eq!(spec.or_branches.len(), 2);
+        assert!(spec.or_branches[0].flip_mode);
+        assert!(spec.or_branches[1].flip_mode);
+    }
+
+    #[test]
+    fn or_branch_spec_defaults_flip_mode_false_for_scalar_mixed_or() {
+        // Non-leaf-EXISTS OR: the planner-port leaves `flip = None`,
+        // so `flip_mode` stays false and the OrBranchesT takes its
+        // union-all path (mirrors TS `applyOr` at
+        // `packages/zql/src/builder/builder.ts:514-557`).
+        let ast = AST {
+            schema: None,
+            table: "conv".into(),
+            alias: None,
+            where_clause: Some(Box::new(Condition::Or {
+                conditions: vec![
+                    mk_csq_exists("A", "t_a", "id"),
+                    mk_simple("name", SimpleOperator::Eq, LiteralValue::String("x".into())),
+                ],
+            })),
+            related: None,
+            start: None,
+            limit: None,
+            order_by: None,
+        };
+        let spec =
+            ast_to_chain_spec(&ast, "q1".into(), PrimaryKey::new(vec!["id".into()])).unwrap();
+        assert_eq!(spec.or_branches.len(), 2);
+        assert!(!spec.or_branches[0].flip_mode);
+        assert!(!spec.or_branches[1].flip_mode);
     }
 }

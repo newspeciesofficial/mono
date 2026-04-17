@@ -323,6 +323,7 @@ export class RustPipelineDriverV2 {
     //      snapshotter, matching TS).
     //   4. Re-register updated table metadata with Rust + refresh
     //      Rust's replica_version.
+    const droppedPipelines = this.#pipelines.size;
     this.#native.pipeline_v2_reset(this.#handle);
     this.#pipelines.clear();
     // Matches TS `PipelineDriver.reset` clearing `#tables`: drop cached
@@ -338,7 +339,14 @@ export class RustPipelineDriverV2 {
     // Re-pin Rust's read snapshot post-reset so subsequent reads align
     // with the refreshed TS-side state.
     this.#native.pipeline_v2_refresh_snapshot(this.#handle);
-    this.#logInit();
+    this.#lc.info?.('[ivm:reset]', {
+      driver: 'v2',
+      droppedPipelines,
+      syncedTables: this.#tableSpecs.size,
+      allTables: this.#allTableNames.size,
+      primaryKeys: this.#primaryKeys?.size ?? 0,
+      replicaVersion: this.#replicaVersion,
+    });
   }
 
   get replicaVersion(): string {
@@ -535,8 +543,10 @@ export class RustPipelineDriverV2 {
     // state Rust has in-flight state but `#pipelines` does not yet have
     // an entry. Rust's remove_query is idempotent across all three of
     // its maps (chains / infos / in_flight).
+    const existed = this.#pipelines.has(queryID);
     this.#pipelines.delete(queryID);
     this.#native.pipeline_v2_remove_query(this.#handle, queryID);
+    this.#lc.info?.('[ivm:removeQuery]', {driver: 'v2', queryID, existed});
   }
 
   getRow(table: string, pk: RowKey): Row | undefined {
@@ -568,6 +578,16 @@ export class RustPipelineDriverV2 {
     );
     const snapshotMs = performance.now() - t0;
     const nextVersion = diff.curr.version;
+    // Parity log — same key/values emitted by TS PipelineDriver.advance
+    // so both drivers can be diffed line-by-line. `prevVersion` reads
+    // the snapshot before this advance call; `version` is the new head.
+    this.#lc.info?.('[ivm:advance]', {
+      driver: 'v2',
+      prevVersion: diff.prev.version,
+      version: nextVersion,
+      numChanges: diff.changes,
+      replicaVersion: this.#replicaVersion,
+    });
     // Bind outside the generator so it sees `this`.
     const self = this;
     const changes = (function* () {

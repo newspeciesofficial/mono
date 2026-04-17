@@ -61,7 +61,9 @@ fn hydrate_filter_only() {
         limit: None,
         exists: None,
         exists_chain: vec![],
-        join: None,
+        joins: vec![],
+        or_branches: vec![],
+        order_by: None,
     };
     let mut chain = Chain::build(spec, source);
     let out = chain.hydrate();
@@ -85,7 +87,9 @@ fn hydrate_filter_then_skip() {
         limit: None,
         exists: None,
         exists_chain: vec![],
-        join: None,
+        joins: vec![],
+        or_branches: vec![],
+        order_by: None,
     };
     let mut chain = Chain::build(spec, source);
     let out = chain.hydrate();
@@ -121,7 +125,9 @@ fn advance_multi_op_push_propagates_through_chain() {
         limit: None,
         exists: None,
         exists_chain: vec![],
-        join: None,
+        joins: vec![],
+        or_branches: vec![],
+        order_by: None,
     };
     let mut chain = Chain::build(spec, source);
 
@@ -187,12 +193,16 @@ fn hydrate_with_join_decorates_parent_with_children() {
         limit: None,
         exists: None,
         exists_chain: vec![],
-        join: Some(JoinSpec {
+        joins: vec![JoinSpec {
             parent_key: vec!["id".into()],
             child_key: vec!["user_id".into()],
             relationship_name: "messages".into(),
             child_table: "messages".into(),
-        }),
+            child_subquery: None,
+            child_primary_key: None,
+        }],
+        or_branches: vec![],
+        order_by: None,
     };
     let _ = &mut spec;
     let mut chain = Chain::build_with_join(spec, user_source, Some(child_source));
@@ -220,7 +230,9 @@ fn advance_with_take_at_limit_refetches_new_bound() {
         limit: Some(2),
         exists: None,
         exists_chain: vec![],
-        join: None,
+        joins: vec![],
+        or_branches: vec![],
+        order_by: None,
     };
     let mut chain = Chain::build(spec, source);
     let hyd = chain.hydrate();

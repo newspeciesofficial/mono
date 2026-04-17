@@ -237,6 +237,7 @@ export class PipelineDriver {
    * as TableSources need to be recomputed.
    */
   reset(clientSchema: ClientSchema) {
+    const droppedPipelines = this.#pipelines.size;
     for (const pipeline of this.#pipelines.values()) {
       pipeline.input.destroy();
       for (const companion of pipeline.companions) {
@@ -247,6 +248,14 @@ export class PipelineDriver {
     this.#tables.clear();
     this.#allTableNames.clear();
     this.#initAndResetCommon(clientSchema);
+    this.#lc.info?.('[ivm:reset]', {
+      driver: 'ts',
+      droppedPipelines,
+      syncedTables: this.#tableSpecs.size,
+      allTables: this.#allTableNames.size,
+      primaryKeys: this.#primaryKeys?.size ?? 0,
+      replicaVersion: this.#replicaVersion,
+    });
   }
 
   #initAndResetCommon(clientSchema: ClientSchema) {
@@ -616,6 +625,7 @@ export class PipelineDriver {
    */
   removeQuery(queryID: string) {
     const pipeline = this.#pipelines.get(queryID);
+    const existed = !!pipeline;
     if (pipeline) {
       this.#pipelines.delete(queryID);
       pipeline.input.destroy();
@@ -623,6 +633,7 @@ export class PipelineDriver {
         companion.input.destroy();
       }
     }
+    this.#lc.info?.('[ivm:removeQuery]', {driver: 'ts', queryID, existed});
   }
 
   /**
@@ -667,6 +678,17 @@ export class PipelineDriver {
     this.#lc.debug?.(
       `advance ${prev.version} => ${curr.version}: ${changes} changes`,
     );
+    // Parity log — same key/values emitted by RustPipelineDriverV2.advance
+    // so side-by-side diffing tools can confirm both drivers report the
+    // same {prev→curr version, numChanges, replicaVersion} for each
+    // advance batch. Keep field order stable.
+    this.#lc.info?.('[ivm:advance]', {
+      driver: 'ts',
+      prevVersion: prev.version,
+      version: curr.version,
+      numChanges: changes,
+      replicaVersion: this.#replicaVersion,
+    });
 
     return {
       version: curr.version,
