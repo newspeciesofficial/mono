@@ -71,6 +71,15 @@ pub struct ChainSpec {
     /// emits rows in this order — critical for `Take` slicing and
     /// `Skip` cursor semantics to match TS.
     pub order_by: Option<Vec<(String, zero_cache_types::ast::Direction)>>,
+    /// Mirror of TS `buildPipelineInternal`'s `partitionKey` parameter at
+    /// `packages/zql/src/builder/builder.ts:255-261`, handed to the
+    /// `Take` operator at `builder.ts:341`. Populated by the driver
+    /// when recursively building a subquery Chain: the sub-Chain's
+    /// partition key is the child-side correlation column set
+    /// (`sq.correlation.childField`). Threaded to `TakeT` so the
+    /// `(size, bound)` state is partitioned per parent — matching
+    /// TS's per-partition semantics for `.related(..., q => q.limit(N))`.
+    pub partition_key: Option<CompoundKey>,
 }
 
 pub struct JoinSpec {
@@ -174,6 +183,17 @@ pub struct ExistsSpec {
     /// matching TS `Streamer#streamNodes` walking through nested
     /// `schema.relationships`.
     pub child_exists_child_tables: Option<ExistsChildTables>,
+    /// Mirror of the `flip` flag on `Condition::CorrelatedSubquery`
+    /// (populated by `apply_planner_flips` — see
+    /// `packages/zql/src/planner/planner-builder.ts:251-254` and
+    /// `applyPlansToAST` at :322-355). When `true`, TS takes the
+    /// `applyFilterWithFlips` FlippedJoin path at
+    /// `packages/zql/src/builder/builder.ts:450-478`, which does NOT
+    /// cap the subquery via `EXISTS_LIMIT`. Used by the driver to
+    /// decide whether to override the sub-AST's `limit` when building
+    /// the child input — mirror of the `if (!csqCondition.flip)` gate
+    /// at `builder.ts:310`.
+    pub flip: bool,
 }
 
 /// Multiple EXISTS conditions to stack in chain order. Used by the AST
@@ -606,7 +626,16 @@ impl Chain {
         }
 
         if let Some(limit) = spec.limit {
-            transformers.push(Box::new(TakeT::new(limit, std::sync::Arc::clone(&comparator))));
+            // Mirror of TS `new Take(end, storage, ast.limit, partitionKey)`
+            // at `packages/zql/src/builder/builder.ts:337-342`. When the
+            // Chain is a sub-query (driver set `spec.partition_key`),
+            // TakeT maintains per-partition `(size, bound)` so each
+            // parent's window is independent.
+            transformers.push(Box::new(TakeT::new_with_partition(
+                limit,
+                std::sync::Arc::clone(&comparator),
+                spec.partition_key.clone(),
+            )));
         }
         Self {
             query_id: spec.query_id,

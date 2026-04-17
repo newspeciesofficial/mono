@@ -185,6 +185,11 @@ pub fn ast_to_chain_spec(
         joins,
         or_branches,
         order_by,
+        // Top-level ChainSpec never has a partition key — TS passes
+        // `partitionKey = undefined` when buildPipelineInternal is
+        // called for the root query (`builder.ts:193-201`). Only
+        // sub-Chains built by the driver set this.
+        partition_key: None,
     })
 }
 
@@ -255,7 +260,27 @@ fn flip_condition_if_leaf_exists_or(cond: &mut Condition) {
             // Check if EVERY branch is a single leaf EXISTS.
             let all_leaf_exists = !conditions.is_empty()
                 && conditions.iter().all(is_leaf_exists_csq);
-            if all_leaf_exists {
+            // Further narrow: TS planner's cost model only flips when
+            // each branch's CSQ targets a DISTINCT child table. Two
+            // branches on the SAME relationship (e.g. `or(exists('convs'),
+            // exists('convs'))`) collapse to identical sub-plans — the
+            // cost model would not improve by flipping, so TS keeps the
+            // non-flip upfront-Join + applyOr path. Without this check
+            // RS over-flips and emits uncapped rows (fuzz_00140 canary:
+            // `or(exists('conversations'), exists('conversations',
+            // {scalar:true}))` → TS=8 capped; RS flipped→10 uncapped).
+            let distinct_child_tables = {
+                let mut seen: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                conditions.iter().all(|b| {
+                    if let Condition::CorrelatedSubquery { related, .. } = b {
+                        seen.insert(related.subquery.table.clone())
+                    } else {
+                        false
+                    }
+                })
+            };
+            if all_leaf_exists && distinct_child_tables {
                 for branch in conditions.iter_mut() {
                     if let Condition::CorrelatedSubquery { flip, .. } = branch {
                         // TS `applyPlansToAST` sets `flip = shouldFlip`
@@ -834,6 +859,11 @@ fn walk_exists(cond: &Condition, out: &mut Vec<ExistsSpec>) {
                 // sub-Chain (it needs the source factory, which the
                 // ast_builder doesn't have).
                 child_exists_child_tables: None,
+                // Mirror of TS `applyFilterWithFlips` per-CSQ flip
+                // decision — `true` means this CSQ is flipped, so TS
+                // builds a FlippedJoin at `builder.ts:450-478` WITHOUT
+                // the `EXISTS_LIMIT` cap from `builder.ts:314-320`.
+                flip: flip.unwrap_or(false),
             });
         }
         Condition::And { conditions } | Condition::Or { conditions } => {

@@ -30,6 +30,45 @@ use crate::ivm_v2::operator::{FetchRequest, Input};
 use super::pipeline::{Chain, ChainSpec};
 use super::row_change::RowChange;
 
+/// Mirror of TS `EXISTS_LIMIT` at
+/// `packages/zql/src/builder/builder.ts:223`. Applied when building the
+/// upfront child pipeline that decorates parent nodes with matching
+/// subquery rows for every non-flipped `whereExists` / `exists` CSQ —
+/// see `buildPipelineInternal` at `builder.ts:308-329` which spreads
+/// `{...csqCondition.related.subquery, limit: EXISTS_LIMIT}` before
+/// handing it to `applyCorrelatedSubQuery` (the upfront Join). Without
+/// this cap, RS decoration emits every matching child row; TS caps at
+/// 3 per parent. Observable as `conversations: ts=8 rs=10` on
+/// `channels.whereExists('conversations')` shapes.
+const EXISTS_LIMIT: u64 = 3;
+
+/// Mirror of TS `PERMISSIONS_EXISTS_LIMIT` at
+/// `packages/zql/src/builder/builder.ts:224`. TS uses this when the CSQ
+/// has `system === 'permissions'`. We keep the constant for symmetry
+/// even though the current RS corpus does not exercise it — applied
+/// identically if/when permissions system support lands.
+#[allow(dead_code)]
+const PERMISSIONS_EXISTS_LIMIT: u64 = 1;
+
+/// Clone `sub_ast` and override its `limit` with `EXISTS_LIMIT`, mirror
+/// of the TS spread at `packages/zql/src/builder/builder.ts:314-320`:
+/// ```ignore
+///   subquery: {
+///     ...csqCondition.related.subquery,
+///     limit: EXISTS_LIMIT,
+///   }
+/// ```
+/// Applied to the sub-AST used to build the UPFRONT-JOIN child input
+/// that decorates parent nodes. The user's original subquery `limit`
+/// (if any) is discarded — matches TS behavior.
+fn clone_sub_ast_with_exists_limit(
+    sub_ast: &zero_cache_types::ast::AST,
+) -> zero_cache_types::ast::AST {
+    let mut cloned = sub_ast.clone();
+    cloned.limit = Some(EXISTS_LIMIT);
+    cloned
+}
+
 /// Event sent from a hydration worker thread back to the driver.
 enum HydrationEvent {
     Chunk(Vec<RowChange>),
@@ -227,6 +266,7 @@ impl PipelineV2 {
         fn build_child_input(
             es: &mut crate::view_syncer_v2::pipeline::ExistsSpec,
             source_factory: &SourceFactory,
+            apply_exists_limit: bool,
         ) -> Option<Box<dyn crate::ivm_v2::operator::Input>> {
             let tbl = es.child_table.as_deref()?;
             // Recursive sub-Chain for the subquery's full AST.
@@ -235,17 +275,41 @@ impl PipelineV2 {
                 let sub_source = (source_factory)(tbl);
                 let sub_pk = sub_source.get_schema().primary_key.clone();
                 es.child_primary_key = Some(sub_pk.clone());
+                // Mirror of TS `buildPipelineInternal` at
+                // `packages/zql/src/builder/builder.ts:308-329` which
+                // only overwrites the subquery's `limit` with
+                // `EXISTS_LIMIT` for NON-FLIPPED CSQs (the loop is
+                // gated by `if (!csqCondition.flip)`). Flipped CSQs
+                // skip the upfront-Join and get lowered to
+                // `FlippedJoin` inside `applyFilterWithFlips` (at
+                // builder.ts:410-448) which does NOT cap the
+                // subquery — so we must not cap here either. The cap
+                // bounds the per-parent decoration to at most 3 rows,
+                // matching TS row counts for non-flip EXISTS shapes.
+                let sub_ast_owned;
+                let sub_ast_ref: &zero_cache_types::ast::AST = if apply_exists_limit {
+                    sub_ast_owned = clone_sub_ast_with_exists_limit(sub_ast);
+                    &sub_ast_owned
+                } else {
+                    sub_ast
+                };
                 let sub_spec =
-                    ast_to_chain_spec(sub_ast, format!("exists-sub:{}", tbl), sub_pk)
+                    ast_to_chain_spec(sub_ast_ref, format!("exists-sub:{}", tbl), sub_pk)
                         .ok()?;
                 let mut sub_spec_mut = sub_spec;
+                // Mirror of TS `buildPipelineInternal(sq.subquery, ...,
+                // sq.correlation.childField)` at
+                // `packages/zql/src/builder/builder.ts:626-632` — the
+                // sub-query's Take inherits the child correlation key
+                // as its partition key.
+                sub_spec_mut.partition_key = Some(es.child_key.clone());
                 let mut nested_inputs: Vec<Option<Box<dyn crate::ivm_v2::operator::Input>>> =
                     Vec::new();
                 if let Some(sub_es) = sub_spec_mut.exists.as_mut() {
-                    nested_inputs.push(build_child_input(sub_es, source_factory));
+                    nested_inputs.push(build_child_input(sub_es, source_factory, apply_exists_limit));
                 }
                 for sub_es in sub_spec_mut.exists_chain.iter_mut() {
-                    nested_inputs.push(build_child_input(sub_es, source_factory));
+                    nested_inputs.push(build_child_input(sub_es, source_factory, apply_exists_limit));
                 }
                 let sub_chain =
                     crate::view_syncer_v2::pipeline::Chain::build_with_join_and_exists(
@@ -273,11 +337,18 @@ impl PipelineV2 {
                 })
             }
         }
+        // Apply `EXISTS_LIMIT` cap iff the CSQ is NOT flipped — mirror
+        // of TS `buildPipelineInternal` at `builder.ts:308-329` gated by
+        // `if (!csqCondition.flip)`. Flipped CSQs go to
+        // `applyFilterWithFlips` → `FlippedJoin` (builder.ts:450-478)
+        // which does NOT override the subquery limit.
         if let Some(es) = spec.exists.as_mut() {
-            exists_child_inputs.push(build_child_input(es, &self.source_factory));
+            let apply_cap = !es.flip;
+            exists_child_inputs.push(build_child_input(es, &self.source_factory, apply_cap));
         }
         for es in spec.exists_chain.iter_mut() {
-            exists_child_inputs.push(build_child_input(es, &self.source_factory));
+            let apply_cap = !es.flip;
+            exists_child_inputs.push(build_child_input(es, &self.source_factory, apply_cap));
         }
 
         // Recursively build a sub-Chain for every `spec.joins[i]` —
@@ -300,15 +371,21 @@ impl PipelineV2 {
                 let mut sub_spec =
                     ast_to_chain_spec(sub_ast, format!("join-sub:{}", tbl), sub_pk.clone())
                         .ok()?;
+                // Mirror of TS `buildPipelineInternal(sq.subquery, ...,
+                // sq.correlation.childField)` at
+                // `packages/zql/src/builder/builder.ts:626-632` —
+                // same partition-key passthrough used for the EXISTS
+                // sub-Chain, but for the `.related()` Join path.
+                sub_spec.partition_key = Some(js.child_key.clone());
                 // Recurse for each nested EXISTS.
                 let mut sub_exists_inputs: Vec<
                     Option<Box<dyn crate::ivm_v2::operator::Input>>,
                 > = Vec::new();
                 if let Some(sub_es) = sub_spec.exists.as_mut() {
-                    sub_exists_inputs.push(build_child_input(sub_es, source_factory));
+                    sub_exists_inputs.push(build_child_input(sub_es, source_factory, true));
                 }
                 for sub_es in sub_spec.exists_chain.iter_mut() {
-                    sub_exists_inputs.push(build_child_input(sub_es, source_factory));
+                    sub_exists_inputs.push(build_child_input(sub_es, source_factory, true));
                 }
                 // Recurse for each nested JOIN.
                 let mut sub_join_inputs: Vec<
@@ -346,8 +423,21 @@ impl PipelineV2 {
         for branch in spec.or_branches.iter_mut() {
             let mut per_branch: Vec<Option<Box<dyn crate::ivm_v2::operator::Input>>> =
                 Vec::with_capacity(branch.exists.len());
+            // Per TS: non-flipped OR branches go through `applyOr` at
+            // `packages/zql/src/builder/builder.ts:514-557` which emits
+            // per-branch Exists operators that read
+            // `node.relationships[alias]` — those relationships were
+            // populated by the TOP-LEVEL upfront-Join loop at
+            // `builder.ts:308-329` with `limit = EXISTS_LIMIT`. So
+            // non-flip branches effectively see capped child rows. The
+            // RS analog is to apply the cap when building each
+            // non-flip branch's child_input. Flip-mode branches
+            // (every CSQ in the OR has `flip = Some(true)`) use
+            // `FlippedJoin` in TS (`builder.ts:410-448`) which does NOT
+            // cap — match that by skipping the cap.
+            let apply_cap = !branch.flip_mode;
             for es in branch.exists.iter_mut() {
-                per_branch.push(build_child_input(es, &self.source_factory));
+                per_branch.push(build_child_input(es, &self.source_factory, apply_cap));
             }
             or_branch_inputs.push(per_branch);
         }

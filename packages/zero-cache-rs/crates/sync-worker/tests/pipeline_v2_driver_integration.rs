@@ -74,6 +74,7 @@ fn driver_end_to_end_hydrate_advance_remove() {
         joins: vec![],
         or_branches: vec![],
         order_by: None,
+        partition_key: None,
     };
     let hydrated = driver.add_query("hash_1".into(), spec);
     assert_eq!(hydrated.len(), 3);
@@ -152,6 +153,7 @@ fn driver_add_queries_batch_and_budget_breakdown() {
                 joins: vec![],
                 or_branches: vec![],
                 order_by: None,
+                partition_key: None,
             },
         },
         AddQueryReq {
@@ -168,6 +170,7 @@ fn driver_add_queries_batch_and_budget_breakdown() {
                 joins: vec![],
                 or_branches: vec![],
                 order_by: None,
+                partition_key: None,
             },
         },
     ];

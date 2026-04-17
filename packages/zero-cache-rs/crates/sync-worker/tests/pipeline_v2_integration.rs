@@ -64,6 +64,7 @@ fn hydrate_filter_only() {
         joins: vec![],
         or_branches: vec![],
         order_by: None,
+        partition_key: None,
     };
     let mut chain = Chain::build(spec, source);
     let out = chain.hydrate();
@@ -90,6 +91,7 @@ fn hydrate_filter_then_skip() {
         joins: vec![],
         or_branches: vec![],
         order_by: None,
+        partition_key: None,
     };
     let mut chain = Chain::build(spec, source);
     let out = chain.hydrate();
@@ -128,6 +130,7 @@ fn advance_multi_op_push_propagates_through_chain() {
         joins: vec![],
         or_branches: vec![],
         order_by: None,
+        partition_key: None,
     };
     let mut chain = Chain::build(spec, source);
 
@@ -203,6 +206,7 @@ fn hydrate_with_join_decorates_parent_with_children() {
         }],
         or_branches: vec![],
         order_by: None,
+        partition_key: None,
     };
     let _ = &mut spec;
     let mut chain = Chain::build_with_join(spec, user_source, Some(child_source));
@@ -233,6 +237,7 @@ fn advance_with_take_at_limit_refetches_new_bound() {
         joins: vec![],
         or_branches: vec![],
         order_by: None,
+        partition_key: None,
     };
     let mut chain = Chain::build(spec, source);
     let hyd = chain.hydrate();
