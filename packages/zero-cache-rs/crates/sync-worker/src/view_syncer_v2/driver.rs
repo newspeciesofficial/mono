@@ -502,6 +502,7 @@ impl PipelineV2 {
         change: Change,
     ) -> Vec<RowChange> {
         let mut out = Vec::new();
+        let trace = std::env::var("IVM_PARITY_TRACE").is_ok();
         for (qid, chain) in self.chains.iter_mut() {
             let Some(_info) = self.infos.get(qid) else { continue };
             let parent_matches = chain.table() == table;
@@ -510,6 +511,20 @@ impl PipelineV2 {
             // to its own child source regardless of nesting depth.
             let join_tables = chain.join_tables_recursive();
             let child_matches = join_tables.iter().any(|t| t == table);
+            let exists_child_tables = chain.exists_child_tables_flat_recursive();
+            let exists_matches = exists_child_tables.iter().any(|t| t == table);
+            if trace {
+                eprintln!(
+                    "[ivm:rs:driver:advance] qid={} chain.table={} mutation_table={} parent={} child_join={} exists_child={} exists_tables={:?}",
+                    qid,
+                    chain.table(),
+                    table,
+                    parent_matches,
+                    child_matches,
+                    exists_matches,
+                    exists_child_tables
+                );
+            }
             if parent_matches {
                 let c = shallow_clone_change(&change);
                 out.extend(chain.advance(c));
@@ -523,8 +538,7 @@ impl PipelineV2 {
             // recursive helper so grandchild-table mutations
             // (e.g. channels update in p19) cascade top-down through
             // every sub-Chain exactly once.
-            let exists_child_tables = chain.exists_child_tables_flat_recursive();
-            if exists_child_tables.iter().any(|t| t == table) {
+            if exists_matches {
                 let c = shallow_clone_change(&change);
                 out.extend(chain.advance_child_for_exists_recursive(table, c));
             }

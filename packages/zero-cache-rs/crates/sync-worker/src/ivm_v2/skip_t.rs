@@ -57,7 +57,9 @@ impl Transformer for SkipT {
     }
 
     fn push<'a>(&'a mut self, change: Change) -> Box<dyn Iterator<Item = Change> + 'a> {
-        eprintln!("[TRACE ivm_v2] SkipT::push enter");
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!("[ivm:rs:skip_t:push] enter");
+        }
         if let Change::Edit(edit) = change {
             let comparator = Arc::clone(&self.comparator);
             let bound_row = self.bound.row.clone();

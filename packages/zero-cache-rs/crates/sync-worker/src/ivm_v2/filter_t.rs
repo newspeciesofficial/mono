@@ -35,15 +35,17 @@ impl Transformer for FilterT {
     }
 
     fn push<'a>(&'a mut self, change: Change) -> Box<dyn Iterator<Item = Change> + 'a> {
-        eprintln!(
-            "[TRACE ivm_v2] FilterT::push enter op={}",
-            match &change {
-                Change::Add(_) => "Add",
-                Change::Remove(_) => "Remove",
-                Change::Child(_) => "Child",
-                Change::Edit(_) => "Edit",
-            }
-        );
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:filter_t:push] op={}",
+                match &change {
+                    Change::Add(_) => "Add",
+                    Change::Remove(_) => "Remove",
+                    Change::Child(_) => "Child",
+                    Change::Edit(_) => "Edit",
+                }
+            );
+        }
         let out: Option<Change> = match change {
             Change::Add(AddChange { ref node }) => {
                 if (self.predicate)(&node.row) {

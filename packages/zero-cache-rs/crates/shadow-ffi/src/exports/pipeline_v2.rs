@@ -395,6 +395,127 @@ pub fn pipeline_v2_next_chunk(
 
 // ─── advance ──────────────────────────────────────────────────────────
 
+/// Build an INSERT/UPDATE/DELETE SQL statement + params for a single
+/// change on `table` using the columns / primary_key captured by
+/// `pipeline_v2_register_tables`. Mirror of TS
+/// `TableSource::#writeChange` at
+/// `packages/zqlite/src/table-source.ts:426-471` which prepares the
+/// same three statements from the table spec and binds row values by
+/// position. Values pass through `json_to_sqlite` for JSON→SQLite
+/// coercion (matches TS `toSQLiteTypes` at
+/// `packages/zqlite/src/internal/tables.ts:120-144`).
+fn sql_for_change(
+    change: &Change,
+    table: &str,
+    meta: &TableMeta,
+) -> Option<(String, Vec<rusqlite::types::Value>)> {
+    let quoted_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let quoted_table = quoted_ident(table);
+    match change {
+        Change::Add(a) => {
+            let mut cols: Vec<String> = Vec::new();
+            let mut vals: Vec<rusqlite::types::Value> = Vec::new();
+            for col in &meta.columns {
+                let v = a.node.row.get(col).cloned().unwrap_or(None);
+                cols.push(quoted_ident(col));
+                vals.push(json_to_sqlite(v));
+            }
+            let placeholders: Vec<&str> = vals.iter().map(|_| "?").collect();
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                quoted_table,
+                cols.join(","),
+                placeholders.join(",")
+            );
+            Some((sql, vals))
+        }
+        Change::Remove(r) => {
+            let mut where_clauses: Vec<String> = Vec::new();
+            let mut vals: Vec<rusqlite::types::Value> = Vec::new();
+            for k in &meta.primary_key {
+                where_clauses.push(format!("{}=?", quoted_ident(k)));
+                vals.push(json_to_sqlite(r.node.row.get(k).cloned().unwrap_or(None)));
+            }
+            if where_clauses.is_empty() {
+                return None;
+            }
+            let sql = format!(
+                "DELETE FROM {} WHERE {}",
+                quoted_table,
+                where_clauses.join(" AND ")
+            );
+            Some((sql, vals))
+        }
+        Change::Edit(e) => {
+            // All non-PK columns → SET. PK columns → WHERE (keyed by
+            // the OLD row so PK-changing edits still locate the
+            // target row — TS also updates against oldRow keys
+            // at `table-source.ts:457-468`).
+            let pk_set: std::collections::HashSet<&str> =
+                meta.primary_key.iter().map(String::as_str).collect();
+            let non_pk: Vec<&String> = meta
+                .columns
+                .iter()
+                .filter(|c| !pk_set.contains(c.as_str()))
+                .collect();
+            if non_pk.is_empty() {
+                return None;
+            }
+            let mut vals: Vec<rusqlite::types::Value> = Vec::new();
+            let set_clauses: Vec<String> = non_pk
+                .iter()
+                .map(|c| {
+                    vals.push(json_to_sqlite(
+                        e.node.row.get(c.as_str()).cloned().unwrap_or(None),
+                    ));
+                    format!("{}=?", quoted_ident(c))
+                })
+                .collect();
+            let where_clauses: Vec<String> = meta
+                .primary_key
+                .iter()
+                .map(|k| {
+                    vals.push(json_to_sqlite(
+                        e.old_node.row.get(k.as_str()).cloned().unwrap_or(None),
+                    ));
+                    format!("{}=?", quoted_ident(k))
+                })
+                .collect();
+            let sql = format!(
+                "UPDATE {} SET {} WHERE {}",
+                quoted_table,
+                set_clauses.join(","),
+                where_clauses.join(" AND ")
+            );
+            Some((sql, vals))
+        }
+        Change::Child(_) => None,
+    }
+}
+
+/// Coerce a serialized JSON value (Option<serde_json::Value>) into the
+/// matching rusqlite `Value` for bind-position params. Arrays / objects
+/// are stored as JSON strings — matches TS `toSQLiteTypes`.
+fn json_to_sqlite(v: Option<serde_json::Value>) -> rusqlite::types::Value {
+    use rusqlite::types::Value as V;
+    match v {
+        None => V::Null,
+        Some(serde_json::Value::Null) => V::Null,
+        Some(serde_json::Value::Bool(b)) => V::Integer(if b { 1 } else { 0 }),
+        Some(serde_json::Value::Number(n)) => {
+            if let Some(i) = n.as_i64() {
+                V::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                V::Real(f)
+            } else {
+                V::Text(n.to_string())
+            }
+        }
+        Some(serde_json::Value::String(s)) => V::Text(s),
+        Some(other) => V::Text(other.to_string()),
+    }
+}
+
 #[napi(js_name = "pipeline_v2_advance")]
 pub fn pipeline_v2_advance(
     handle: &External<PipelineV2Handle>,
@@ -403,6 +524,49 @@ pub fn pipeline_v2_advance(
 ) -> napi::Result<JsonValue> {
     run("pipeline_v2_advance", || {
         let change = parse_change(&change_json)?;
+        // Apply the mutation to the pinned read+write tx BEFORE
+        // routing it through the IVM pipeline. Mirror of TS
+        // `TableSource::genPush` which calls `writeChange(change)` at
+        // `packages/zql/src/ivm/memory-source.ts:511` (wrapped by
+        // `packages/zqlite/src/table-source.ts:414-423`). TS writes
+        // to the prev-snapshot connection so subsequent pushes in the
+        // same advance loop (e.g. step 2 querying the channels source
+        // after step 1 has added a channel) observe the updated state.
+        // Without this, RS's source stays frozen at the pinned
+        // snapshot across all diff iterations — `Join::#pushChildChange`
+        // at `packages/zql/src/ivm/join.ts:227` fetches
+        // `this.#parent.fetch({constraint})` and misses rows that
+        // earlier changes in the same diff added, producing silent
+        // push-path divergences (fuzz_00089 channels.whereExists
+        // ('participants') canary). Rolled back at the next
+        // `pipeline_v2_refresh_snapshot`, matching TS Snapshotter
+        // semantics (never commits — see
+        // `packages/zero-cache/src/services/view-syncer/snapshotter.ts:54-56`).
+        let trace = std::env::var("IVM_PARITY_TRACE").is_ok();
+        let meta = {
+            let tables = handle
+                .tables
+                .lock()
+                .map_err(|_| "tables mutex poisoned".to_string())?;
+            tables.get(&table).cloned()
+        };
+        if let Some(meta) = meta {
+            if let Some((sql, params)) = sql_for_change(&change, &table, &meta) {
+                if let Err(e) = handle.reader.apply_exec(sql.clone(), params) {
+                    // Write conflicts (e.g. duplicate PK from a
+                    // previous tx) are non-fatal for parity: we log
+                    // but still run the IVM pipeline since the
+                    // downstream assertion failures are more
+                    // informative than a hidden silent skip.
+                    if trace {
+                        eprintln!(
+                            "[ivm:rs:driver:apply_exec] table={} err={}",
+                            table, e
+                        );
+                    }
+                }
+            }
+        }
         let mut d = handle
             .driver
             .lock()

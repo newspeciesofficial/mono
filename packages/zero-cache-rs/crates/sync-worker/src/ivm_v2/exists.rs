@@ -153,10 +153,12 @@ impl Exists {
                 crate::ivm::data::NodeOrYield::Yield => {}
             }
         }
-        eprintln!(
-            "[TRACE ivm_v2] Exists::fetch_size rel={} size={}",
-            relationship_name, size
-        );
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:exists:fetch_size] rel={} size={}",
+                relationship_name, size
+            );
+        }
         size
     }
 
@@ -256,11 +258,13 @@ impl Input for Exists {
 
 impl Operator for Exists {
     fn push<'a>(&'a mut self, change: Change) -> Box<dyn Iterator<Item = Change> + 'a> {
-        eprintln!(
-            "[TRACE ivm_v2] Exists::push enter change={} rel={}",
-            change_name(&change),
-            self.relationship_name
-        );
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:exists:push] change={} rel={}",
+                change_name(&change),
+                self.relationship_name
+            );
+        }
         assert!(!self.in_push, "Unexpected re-entrancy");
         self.in_push = true;
 

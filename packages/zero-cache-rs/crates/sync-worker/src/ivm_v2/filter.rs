@@ -91,10 +91,12 @@ impl Input for Filter {
 
 impl Operator for Filter {
     fn push<'a>(&'a mut self, change: Change) -> Box<dyn Iterator<Item = Change> + 'a> {
-        eprintln!(
-            "[TRACE ivm_v2] Filter::push enter change={}",
-            change_name(&change)
-        );
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:filter:push] change={}",
+                change_name(&change)
+            );
+        }
         let filtered = self.filter_change(change);
         Box::new(filtered.into_iter())
     }

@@ -153,10 +153,12 @@ impl Input for Skip {
 
 impl Operator for Skip {
     fn push<'a>(&'a mut self, change: Change) -> Box<dyn Iterator<Item = Change> + 'a> {
-        eprintln!(
-            "[TRACE ivm_v2] Skip::push enter change={}",
-            change_name(&change)
-        );
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:skip:push] change={}",
+                change_name(&change)
+            );
+        }
 
         // Edit splits based on presence at bound.
         if let Change::Edit(edit) = change {

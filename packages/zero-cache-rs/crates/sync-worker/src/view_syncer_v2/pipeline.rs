@@ -208,6 +208,17 @@ pub struct Chain {
     /// relationships map) — `Streamer#streamNodes` uses that to
     /// recurse arbitrarily deep.
     exists_child_tables: ExistsChildTables,
+    /// Parallel map for `related()` relationships (the `Join`/`FlippedJoin`
+    /// path). Kept separate from `exists_child_tables` because child-
+    /// source mutations on a related() child route through
+    /// `advance_child` (Join push), not `advance_child_for_exists` —
+    /// mixing the two maps would misroute. Used by the parent-push
+    /// emission path to walk decorated relationships and emit nested
+    /// child rows, mirror of TS `Streamer#streamNodes` at
+    /// `packages/zero-cache/src/services/view-syncer/pipeline-driver.ts:1049-1052`
+    /// which recurses `node.relationships` emitting a RowChange per
+    /// child row per level.
+    related_child_tables: ExistsChildTables,
 }
 
 /// Recursive map from relationship name → child meta. Wraps a
@@ -237,6 +248,12 @@ struct JoinStage {
     transformer: Box<dyn BinaryTransformer>,
     child_source: Box<dyn Input>,
     child_table: String,
+    /// Relationship name this join implements (mirror of
+    /// `packages/zql/src/ivm/join.ts` constructor arg `relationshipName`).
+    /// Needed by the parent-push emission path to look up the child
+    /// schema in `related_child_tables` and recurse into the decorated
+    /// node's relationships factory.
+    relationship_name: String,
     /// Child-side primary key — populated from the driver so
     /// `advance_child` can emit `RowChange`s keyed by the correct
     /// column set. Previously the Chain relied on
@@ -356,6 +373,7 @@ impl Chain {
                 .child_primary_key
                 .clone()
                 .unwrap_or_else(|| child.get_schema().primary_key.clone());
+            let rel_name = js.relationship_name.clone();
             join_stages.push(JoinStage {
                 transformer: Box::new(JoinT::new(
                     js.parent_key,
@@ -365,6 +383,7 @@ impl Chain {
                 child_source: child,
                 child_table: js.child_table,
                 child_primary_key: child_pk,
+                relationship_name: rel_name,
             });
         }
         let mut chain = Self::build_inner_full(
@@ -373,6 +392,44 @@ impl Chain {
             exists_child_inputs,
             or_branch_child_inputs,
         );
+        // Build related_child_tables from the join stages, mirroring
+        // the ExistsChildTables shape so emission code can call the
+        // same recursive helpers for both. Nested maps for grandchild
+        // relationships are pulled from the sub-Chain's own
+        // exists_child_tables + related_child_tables (merged) — mirror
+        // of TS `schema.relationships[name]` carrying the child schema
+        // with its own `relationships` map.
+        // Populate related_child_tables with the immediate child
+        // metadata for each join (relationship_name → child_table +
+        // child_pk). For the nested map (used when the child row has
+        // its own relationships that should recurse further), we pull
+        // from the sub-Chain's own combined map. Mirror of TS
+        // `schema.relationships[name]` carrying the full child schema
+        // (including its own `relationships`) so
+        // `Streamer#streamNodes` can recurse arbitrarily deep via
+        // `pipeline-driver.ts:1049-1052`.
+        // Populate related_child_tables with immediate child meta
+        // PLUS the sub-Chain's own combined emission map (so the
+        // recursion in `emit_node_subtree` can walk grandchildren).
+        // Mirror of TS `schema.relationships[name]` carrying the full
+        // child schema (its own `relationships` map) so
+        // `Streamer#streamNodes` can recurse arbitrarily deep via
+        // `pipeline-driver.ts:1049-1052`.
+        for js in &mut join_stages {
+            let nested = js
+                .child_source
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<Chain>())
+                .map(|sub_chain| sub_chain.all_emission_child_tables())
+                .unwrap_or_default();
+            chain.related_child_tables.0.entry(
+                js.relationship_name.clone(),
+            ).or_insert((
+                js.child_table.clone(),
+                js.child_primary_key.clone(),
+                Box::new(nested),
+            ));
+        }
         chain.joins = join_stages;
         chain
     }
@@ -559,7 +616,26 @@ impl Chain {
             transformers,
             joins: Vec::new(),
             exists_child_tables,
+            related_child_tables: ExistsChildTables::new(),
         }
+    }
+
+    /// Combined recursive map of `relationship_name → (child_table,
+    /// child_pk, nested_map)` covering BOTH `related()` joins and
+    /// `ExistsT` subquery child tables on this chain. Used by the
+    /// parent-push emission path to walk a decorated node's
+    /// relationships and emit nested child rows. Mirror of TS
+    /// `SourceSchema.relationships` which unifies both kinds of
+    /// subquery relationship under one `name → childSchema` map —
+    /// `Streamer#streamNodes` at
+    /// `packages/zero-cache/src/services/view-syncer/pipeline-driver.ts:1049-1052`
+    /// walks this to recurse arbitrarily deep.
+    pub fn all_emission_child_tables(&mut self) -> ExistsChildTables {
+        let mut out = self.related_child_tables.clone();
+        for (k, v) in self.exists_child_tables.0.iter() {
+            out.0.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        out
     }
 
     pub fn table(&self) -> &str {
@@ -755,6 +831,13 @@ impl Chain {
         child_table: &str,
         change: Change,
     ) -> Vec<RowChange> {
+        let trace = std::env::var("IVM_PARITY_TRACE").is_ok();
+        if trace {
+            eprintln!(
+                "[ivm:rs:chain:advance_child_for_exists] chain.table={} child_table={}",
+                self.table, child_table
+            );
+        }
         // Find the index of the Transformer owning this child_table —
         // either a top-level ExistsT (standard case) or an OrBranchesT
         // whose internal ExistsT references the table (p32/p36 case).
@@ -780,6 +863,12 @@ impl Chain {
             }
         }
         let Some(target_idx) = target_idx else {
+            if trace {
+                eprintln!(
+                    "[ivm:rs:chain:advance_child_for_exists] no target found for child_table={}",
+                    child_table
+                );
+            }
             return Vec::new();
         };
 
@@ -798,6 +887,22 @@ impl Chain {
             }
             stream.collect()
         };
+        if trace {
+            let ids: Vec<String> = parent_snapshot
+                .iter()
+                .filter_map(|n| {
+                    n.row.get("id")
+                        .and_then(|v| v.as_ref().cloned())
+                        .map(|v| v.to_string())
+                })
+                .collect();
+            eprintln!(
+                "[ivm:rs:chain:advance_child_for_exists] parent_snapshot.len={} target_idx={} ids={:?}",
+                parent_snapshot.len(),
+                target_idx,
+                ids
+            );
+        }
 
         // Call push_child on the target ExistsT. Capture the target's
         // relationship_name up-front so we can later look up its
@@ -1315,54 +1420,112 @@ impl Chain {
             }
             buf = next;
         }
-        // Parent-side join: forward through each join's push_parent.
-        // Mirrors TS `buildPipelineInternal` chaining joins in order
-        // (builder.ts:353-355); each downstream join wraps the prior
-        // decorated parent node.
+        // Parent-side join: forward through each join's push_parent,
+        // THEN decorate the emitted parent node with a relationship
+        // factory that fetches child rows matching the parent's
+        // correlation key. Mirror of TS `Join#processParentNode` at
+        // `packages/zql/src/ivm/join.ts:253-295` which inserts
+        // `relationships[relationshipName] = childStream` where
+        // `childStream` calls `this.#child.fetch({constraint})`.
+        // Without the decoration, `Streamer#streamNodes` has no
+        // child rows to recurse over and the push-path drops all
+        // decorated children (fuzz_00394 canary).
         for join in self.joins.iter_mut() {
             let mut next: Vec<Change> = Vec::new();
+            // Extract the parent/child keys from the join transformer
+            // up-front so we can hold a mutable borrow on child_source
+            // during decoration.
+            let (parent_key, child_key) = {
+                let any = join.transformer.as_any_mut().expect("JoinT should expose as_any_mut");
+                let jt = any
+                    .downcast_mut::<crate::ivm_v2::join_t::JoinT>()
+                    .expect("BinaryTransformer downcast to JoinT should succeed for related joins");
+                (jt.parent_key().clone(), jt.child_key().clone())
+            };
+            let rel_name = join.relationship_name.clone();
             for c in buf.drain(..) {
                 for emit in join.transformer.push_parent(c) {
-                    next.push(emit);
+                    let decorated = decorate_parent_emission(
+                        emit,
+                        &rel_name,
+                        &parent_key,
+                        &child_key,
+                        &mut *join.child_source,
+                    );
+                    next.push(decorated);
                 }
             }
             buf = next;
         }
-        let query_id = &self.query_id;
-        let table = &self.table;
-        let pk = &self.primary_key;
-        buf.into_iter()
-            .map(|c| match c {
-                Change::Add(AddChange { node }) => RowChange::Add(RowAdd {
-                    query_id: query_id.clone(),
-                    table: table.clone(),
-                    row_key: build_row_key(pk, &node.row),
-                    row: node.row,
-                }),
-                Change::Remove(RemoveChange { node }) => RowChange::Remove(RowRemove {
-                    query_id: query_id.clone(),
-                    table: table.clone(),
-                    row_key: build_row_key(pk, &node.row),
-                }),
-                Change::Edit(EditChange { node, .. }) => RowChange::Edit(RowEdit {
-                    query_id: query_id.clone(),
-                    table: table.clone(),
-                    row_key: build_row_key(pk, &node.row),
-                    row: node.row,
-                }),
+        let query_id = self.query_id.clone();
+        let table = self.table.clone();
+        let pk = self.primary_key.clone();
+        // Mirror of TS `Streamer#streamNodes` at
+        // `packages/zero-cache/src/services/view-syncer/pipeline-driver.ts:1049-1052`
+        // — walk each emitted node's `relationships` and emit child
+        // RowChanges per relationship. Without this, `related()` push
+        // only emits the top-level parent row and drops the decorated
+        // children Join populated (fuzz_00394 canary). TS streamNodes
+        // skips relationships on `edit` (see pipeline-driver.ts:995-998
+        // passing `{row, relationships: {}}`) so we mirror that too.
+        let emission_tables = self.all_emission_child_tables();
+        let mut out: Vec<RowChange> = Vec::new();
+        let mut total: usize = 0;
+        for c in buf {
+            match c {
+                Change::Add(AddChange { node }) => {
+                    out.push(RowChange::Add(RowAdd {
+                        query_id: query_id.clone(),
+                        table: table.clone(),
+                        row_key: build_row_key(&pk, &node.row),
+                        row: node.row.clone(),
+                    }));
+                    emit_node_subtree(
+                        &node,
+                        &emission_tables,
+                        &query_id,
+                        &mut out,
+                        &mut total,
+                    );
+                }
+                Change::Remove(RemoveChange { node }) => {
+                    out.push(RowChange::Remove(RowRemove {
+                        query_id: query_id.clone(),
+                        table: table.clone(),
+                        row_key: build_row_key(&pk, &node.row),
+                    }));
+                    emit_node_subtree(
+                        &node,
+                        &emission_tables,
+                        &query_id,
+                        &mut out,
+                        &mut total,
+                    );
+                }
+                Change::Edit(EditChange { node, .. }) => {
+                    out.push(RowChange::Edit(RowEdit {
+                        query_id: query_id.clone(),
+                        table: table.clone(),
+                        row_key: build_row_key(&pk, &node.row),
+                        row: node.row,
+                    }));
+                }
                 // ChildChange = "a relationship's nested change happened, but the
                 // parent row's columns are unchanged." From the client's POV the
                 // client-side row's `_relationships` view changed, so we surface
                 // it as a RowEdit on the parent row (matches TS Streamer's
                 // Streamer#streamChanges, which produces an Edit on the parent).
-                Change::Child(ChildChange { node, .. }) => RowChange::Edit(RowEdit {
-                    query_id: query_id.clone(),
-                    table: table.clone(),
-                    row_key: build_row_key(pk, &node.row),
-                    row: node.row,
-                }),
-            })
-            .collect()
+                Change::Child(ChildChange { node, .. }) => {
+                    out.push(RowChange::Edit(RowEdit {
+                        query_id: query_id.clone(),
+                        table: table.clone(),
+                        row_key: build_row_key(&pk, &node.row),
+                        row: node.row,
+                    }));
+                }
+            }
+        }
+        out
     }
 }
 
@@ -1446,6 +1609,92 @@ impl crate::ivm_v2::operator::Input for Chain {
 /// `Streamer#streamNodes` recursion. The `tables` map is the child's
 /// own `exists_child_tables` (carrying its grandchildren's metadata),
 /// so the recursion matches the schema.relationships chain TS uses.
+/// Mirror of TS `Join#processParentNode` at
+/// `packages/zql/src/ivm/join.ts:253-295`. Takes a parent `Change`
+/// (the emission from `JoinT::push_parent`) and returns a new `Change`
+/// whose node carries a relationship factory that yields the child
+/// rows matching the parent's correlation key. Fetches through the
+/// join's `child_source` — which, for real `related()` cases, is the
+/// sub-Chain so the fetch runs the full Filter/OrderBy/Take/Skip
+/// pipeline before rows come back. Used by `Chain::advance` so
+/// `Streamer#streamNodes` downstream (our `emit_node_subtree`) has
+/// child rows to recurse into.
+fn decorate_parent_emission(
+    change: Change,
+    relationship_name: &str,
+    parent_key: &zero_cache_types::ast::CompoundKey,
+    child_key: &zero_cache_types::ast::CompoundKey,
+    child_source: &mut dyn crate::ivm_v2::operator::Input,
+) -> Change {
+    use crate::ivm::data::{NodeOrYield, RelationshipFactory};
+    use crate::ivm::join_utils::build_join_constraint;
+    use crate::ivm_v2::operator::FetchRequest;
+    let fetch_and_wrap = |parent_row: &zero_cache_types::value::Row,
+                          child_source: &mut dyn crate::ivm_v2::operator::Input|
+     -> Vec<Node> {
+        let Some(constraint) = build_join_constraint(parent_row, parent_key, child_key) else {
+            return Vec::new();
+        };
+        child_source
+            .fetch(FetchRequest {
+                constraint: Some(constraint),
+                ..FetchRequest::default()
+            })
+            .collect()
+    };
+    let attach = |mut node: Node,
+                  child_source: &mut dyn crate::ivm_v2::operator::Input|
+     -> Node {
+        let matched = fetch_and_wrap(&node.row, child_source);
+        // One-shot take factory — same pattern as ExistsT's
+        // `decorate_for_forward` (exists_t.rs:344-366). Node::clone
+        // drops relationships (see `ivm/data.rs`), so a cloning
+        // factory would lose sub-chain grandchild decorations;
+        // one-shot take moves the Vec out on first invocation.
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Some(matched)));
+        let factory: RelationshipFactory = Box::new(move || {
+            let taken = cell
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take())
+                .unwrap_or_default();
+            Box::new(taken.into_iter().map(NodeOrYield::Node))
+        });
+        node.relationships
+            .entry(relationship_name.to_string())
+            .or_insert(factory);
+        node
+    };
+    match change {
+        Change::Add(a) => {
+            let decorated = attach(a.node, child_source);
+            Change::Add(AddChange { node: decorated })
+        }
+        Change::Remove(r) => {
+            let decorated = attach(r.node, child_source);
+            Change::Remove(RemoveChange { node: decorated })
+        }
+        Change::Edit(e) => {
+            // Edit doesn't recurse into relationships (TS
+            // `Streamer#streamNodes` passes empty relationships at
+            // `pipeline-driver.ts:995-998`), so no need to decorate.
+            Change::Edit(e)
+        }
+        Change::Child(cc) => {
+            // Child emissions from `push_parent` carry a `ChildSpec`
+            // for the nested change. We only decorate the outer
+            // parent's relationship — that matches TS's
+            // `#processParentNode(change.node.row, change.node.relationships)`
+            // at join.ts:150-156. The inner `change` stays unchanged.
+            let decorated = attach(cc.node, child_source);
+            Change::Child(ChildChange {
+                node: decorated,
+                child: cc.child,
+            })
+        }
+    }
+}
+
 fn emit_node_subtree(
     node: &Node,
     tables: &ExistsChildTables,

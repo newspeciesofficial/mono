@@ -146,7 +146,23 @@ impl JoinT {
     }
 }
 
+impl JoinT {
+    pub fn parent_key(&self) -> &CompoundKey {
+        &self.parent_key
+    }
+    pub fn child_key(&self) -> &CompoundKey {
+        &self.child_key
+    }
+    pub fn relationship_name(&self) -> &str {
+        &self.relationship_name
+    }
+}
+
 impl BinaryTransformer for JoinT {
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     fn fetch_through<'a>(
         &'a mut self,
         parent_upstream: Box<dyn Iterator<Item = Node> + 'a>,

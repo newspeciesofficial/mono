@@ -535,6 +535,17 @@ impl Transformer for ExistsT {
             .filter(|p| correlates(&p.row, &self.parent_join_key, child_row, &self.child_key))
             .map(|p| p.row.clone())
             .collect();
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:exists:push_child_entry] child_table={} parent_snapshot.len={} matched_parents.len={} parent_join_key={:?} child_key={:?} child_row={:?}",
+                child_table,
+                parent_snapshot.len(),
+                parent_rows.len(),
+                self.parent_join_key,
+                self.child_key,
+                child_row
+            );
+        }
 
         let mut emissions: Vec<Change> = Vec::new();
         for parent_row in parent_rows {
@@ -722,10 +733,12 @@ impl Transformer for ExistsT {
     }
 
     fn push<'a>(&'a mut self, change: Change) -> Box<dyn Iterator<Item = Change> + 'a> {
-        eprintln!(
-            "[TRACE ivm_v2] ExistsT::push enter rel={}",
-            self.relationship_name
-        );
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:exists:push] enter rel={}",
+                self.relationship_name
+            );
+        }
         self.in_push = true;
         let out = match change {
             Change::Add(AddChange { ref node }) | Change::Remove(RemoveChange { ref node }) => {

@@ -71,17 +71,19 @@ impl Transformer for TakeT {
     }
 
     fn push<'a>(&'a mut self, change: Change) -> Box<dyn Iterator<Item = Change> + 'a> {
-        eprintln!(
-            "[TRACE ivm_v2] TakeT::push enter op={} size={} has_bound={}",
-            match &change {
-                Change::Add(_) => "Add",
-                Change::Remove(_) => "Remove",
-                Change::Child(_) => "Child",
-                Change::Edit(_) => "Edit",
-            },
-            self.state.size,
-            self.state.bound.is_some(),
-        );
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:take_t:push] op={} size={} has_bound={}",
+                match &change {
+                    Change::Add(_) => "Add",
+                    Change::Remove(_) => "Remove",
+                    Change::Child(_) => "Child",
+                    Change::Edit(_) => "Edit",
+                },
+                self.state.size,
+                self.state.bound.is_some(),
+            );
+        }
         let out = self.push_internal(change);
         Box::new(out.into_iter())
     }
@@ -203,10 +205,12 @@ impl TakeT {
     fn ingest_refetch(&mut self, rows: Vec<Node>) {
         // The first returned row becomes the new bound.
         self.state.bound = rows.into_iter().next().map(|n| n.row);
-        eprintln!(
-            "[TRACE ivm_v2] TakeT::ingest_refetch new_bound_is_some={}",
-            self.state.bound.is_some()
-        );
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:take_t:ingest_refetch] new_bound_is_some={}",
+                self.state.bound.is_some()
+            );
+        }
     }
 }
 

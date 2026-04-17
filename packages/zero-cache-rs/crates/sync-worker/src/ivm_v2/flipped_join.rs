@@ -79,7 +79,9 @@ impl FlippedJoin {
         &'a mut self,
         change: Change,
     ) -> Box<dyn Iterator<Item = Change> + 'a> {
-        eprintln!("[TRACE ivm_v2] FlippedJoin::push_child enter op={}", change_name(&change));
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!("[ivm:rs:flipped_join:push_child] op={}", change_name(&change));
+        }
         if let Change::Edit(ref edit) = change {
             assert!(
                 row_equals_for_compound_key(&edit.old_node.row, &edit.node.row, &self.child_key),

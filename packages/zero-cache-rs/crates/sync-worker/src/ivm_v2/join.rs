@@ -104,10 +104,12 @@ impl Join {
         &'a mut self,
         change: Change,
     ) -> Box<dyn Iterator<Item = Change> + 'a> {
-        eprintln!(
-            "[TRACE ivm_v2] Join::push_parent enter op={}",
-            change_name(&change)
-        );
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:join:push_parent] op={}",
+                change_name(&change)
+            );
+        }
         // Parent-side changes pass through with presence tied to parent.
         // TS asserts parent edit doesn't change the relationship keys.
         if let Change::Edit(ref edit) = change {
@@ -125,11 +127,13 @@ impl Join {
         &'a mut self,
         change: Change,
     ) -> Box<dyn Iterator<Item = Change> + 'a> {
-        eprintln!(
-            "[TRACE ivm_v2] Join::push_child enter op={} rel={}",
-            change_name(&change),
-            self.relationship_name
-        );
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:join:push_child] op={} rel={}",
+                change_name(&change),
+                self.relationship_name
+            );
+        }
         if let Change::Edit(ref edit) = change {
             assert!(
                 row_equals_for_compound_key(&edit.old_node.row, &edit.node.row, &self.child_key),

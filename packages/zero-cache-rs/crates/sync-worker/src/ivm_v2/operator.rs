@@ -182,6 +182,14 @@ pub trait BinaryTransformer: Send {
         parent_snapshot: &[crate::ivm::data::Node],
     ) -> Box<dyn Iterator<Item = Change> + 'a>;
 
+    /// Downcast hook so callers can reach the concrete type (e.g.
+    /// `Chain::advance` needs the join's parent/child keys to
+    /// decorate emitted nodes with matched children). Mirrors the
+    /// `Transformer::as_any_mut` entry point at line 50.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
+
     fn destroy(&mut self) {}
 }
 

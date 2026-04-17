@@ -54,12 +54,14 @@ impl Take {
 
     /// TS `*push(change)`.
     pub fn push_iter<'a>(&'a mut self, change: Change) -> TakePushIter<'a> {
-        eprintln!(
-            "[TRACE ivm_v2] Take::push enter change={} size={} has_bound={}",
-            change_name(&change),
-            self.state.size,
-            self.state.bound.is_some()
-        );
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:take:push] change={} size={} has_bound={}",
+                change_name(&change),
+                self.state.size,
+                self.state.bound.is_some()
+            );
+        }
         TakePushIter::new(
             change,
             &mut self.input,
@@ -209,7 +211,9 @@ impl<'a> TakePushIter<'a> {
                 pending.push_back(Change::Remove(RemoveChange { node }));
             }
             Change::Child(_) | Change::Edit(_) => {
-                eprintln!("[TRACE ivm_v2] Take::push: Child/Edit deferred — dropped");
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!("[ivm:rs:take:push] Child/Edit deferred — dropped");
+                }
             }
         }
 
@@ -235,10 +239,12 @@ impl<'a> Iterator for TakePushIter<'a> {
                     // will pass `start: after anchor` once fetch is ported.
                     let mut rows = input.fetch(FetchRequest::default());
                     state.bound = rows.next().map(|n| n.row);
-                    eprintln!(
-                        "[TRACE ivm_v2] Take::push: RefreshBoundAfter has_bound={}",
-                        state.bound.is_some()
-                    );
+                    if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                        eprintln!(
+                            "[ivm:rs:take:push] RefreshBoundAfter has_bound={}",
+                            state.bound.is_some()
+                        );
+                    }
                 }
             }
         }

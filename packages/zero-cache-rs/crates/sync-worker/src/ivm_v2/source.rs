@@ -159,6 +159,21 @@ enum ReaderCmd {
     PinnedVersion {
         ack: Sender<Result<String, String>>,
     },
+    /// Apply a write (INSERT / UPDATE / DELETE) inside the currently
+    /// pinned `BEGIN CONCURRENT` read+write tx, making the write
+    /// visible to subsequent reads within the same tx. Mirror of
+    /// TS `TableSource::genPush` → `writeChange` at
+    /// `packages/zqlite/src/table-source.ts:400-424` which persists
+    /// the mutation to the prev-snapshot DB connection during advance
+    /// so that downstream pushes can fetch the updated state. The tx
+    /// is rolled back at the next `Refresh`, matching TS's behavior
+    /// of never committing view-syncer writes (see `Snapshotter` doc
+    /// at `packages/zero-cache/src/services/view-syncer/snapshotter.ts:54-56`).
+    Exec {
+        sql: String,
+        params: Vec<SqlValue>,
+        ack: Sender<Result<(), String>>,
+    },
 }
 
 /// Driver-scoped SQLite reader. Holds ONE `rusqlite::Connection` in a
@@ -210,6 +225,13 @@ impl SnapshotReader {
                     }
                     ReaderCmd::PinnedVersion { ack } => {
                         let _ = ack.send(read_pinned_version(&conn));
+                    }
+                    ReaderCmd::Exec { sql, params, ack } => {
+                        let result = conn
+                            .execute(&sql, params_from_iter(params.iter()))
+                            .map(|_| ())
+                            .map_err(|e| format!("exec failed: {e} (sql={sql})"));
+                        let _ = ack.send(result);
                     }
                 }
             }
@@ -264,6 +286,31 @@ impl SnapshotReader {
         self.inner
             .cmd_tx
             .send(ReaderCmd::PinnedVersion { ack: ack_tx })
+            .map_err(|_| "SnapshotReader worker thread is gone".to_string())?;
+        ack_rx
+            .recv()
+            .map_err(|_| "SnapshotReader worker dropped before ack".to_string())?
+    }
+
+    /// Apply an INSERT / UPDATE / DELETE inside the pinned tx. Mirror
+    /// of TS `TableSource::genPush` → `writeChange` at
+    /// `packages/zqlite/src/table-source.ts:408-424` which persists
+    /// the mutation to the prev-snapshot connection during advance so
+    /// subsequent pushes within the same advance loop fetch the
+    /// updated state. Rolled back at the next `refresh()`.
+    pub fn apply_exec(
+        &self,
+        sql: String,
+        params: Vec<SqlValue>,
+    ) -> Result<(), String> {
+        let (ack_tx, ack_rx) = bounded::<Result<(), String>>(1);
+        self.inner
+            .cmd_tx
+            .send(ReaderCmd::Exec {
+                sql,
+                params,
+                ack: ack_tx,
+            })
             .map_err(|_| "SnapshotReader worker thread is gone".to_string())?;
         ack_rx
             .recv()
