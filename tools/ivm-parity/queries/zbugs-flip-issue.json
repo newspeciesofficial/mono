@@ -1,0 +1,54 @@
+[
+  "initConnection",
+  {
+    "desiredQueriesPatch": [
+      {
+        "op": "put",
+        "hash": "zbugs-flip-issue-has-label",
+        "ast": {
+          "table": "issue",
+          "orderBy": [["modified", "desc"], ["id", "desc"]],
+          "limit": 50,
+          "where": {
+            "type": "correlatedSubquery",
+            "op": "EXISTS",
+            "flip": true,
+            "related": {
+              "correlation": {
+                "parentField": ["id"],
+                "childField": ["issueID"]
+              },
+              "subquery": {
+                "table": "issueLabel",
+                "alias": "issueLabel"
+              }
+            }
+          }
+        }
+      },
+      {
+        "op": "put",
+        "hash": "zbugs-noflip-baseline",
+        "ast": {
+          "table": "issue",
+          "orderBy": [["modified", "desc"], ["id", "desc"]],
+          "limit": 50,
+          "where": {
+            "type": "correlatedSubquery",
+            "op": "EXISTS",
+            "related": {
+              "correlation": {
+                "parentField": ["id"],
+                "childField": ["issueID"]
+              },
+              "subquery": {
+                "table": "issueLabel",
+                "alias": "issueLabel"
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+]

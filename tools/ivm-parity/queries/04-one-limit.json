@@ -1,0 +1,21 @@
+[
+  "initConnection",
+  {
+    "desiredQueriesPatch": [
+      {
+        "op": "put",
+        "hash": "xynelite-one-limit",
+        "ast": {
+          "table": "conversations",
+          "limit": 1,
+          "where": {
+            "type": "simple",
+            "op": "=",
+            "left": {"type": "column", "name": "id"},
+            "right": {"type": "literal", "value": "co-1"}
+          }
+        }
+      }
+    ]
+  }
+]

@@ -1,0 +1,35 @@
+[
+  "initConnection",
+  {
+    "desiredQueriesPatch": [
+      {
+        "op": "put",
+        "hash": "xynelite-nested-exists",
+        "ast": {
+          "table": "conversations",
+          "orderBy": [["createdAt", "asc"], ["id", "asc"]],
+          "where": {
+            "type": "correlatedSubquery",
+            "op": "EXISTS",
+            "related": {
+              "correlation": {
+                "parentField": ["channelId"],
+                "childField": ["id"]
+              },
+              "subquery": {
+                "table": "channels",
+                "alias": "channel",
+                "where": {
+                  "type": "simple",
+                  "op": "=",
+                  "left": {"type": "column", "name": "visibility"},
+                  "right": {"type": "literal", "value": "public"}
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+]

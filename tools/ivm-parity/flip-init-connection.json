@@ -1,0 +1,42 @@
+[
+  "initConnection",
+  {
+    "clientSchema": {
+      "tables": {
+        "issue": {
+          "columns": {
+            "id": {"type": "string"},
+            "shortID": {"type": "number"},
+            "title": {"type": "string"},
+            "open": {"type": "boolean"},
+            "modified": {"type": "number"},
+            "created": {"type": "number"},
+            "projectID": {"type": "string"},
+            "creatorID": {"type": "string"},
+            "assigneeID": {"type": "string"},
+            "description": {"type": "string"},
+            "visibility": {"type": "string"}
+          },
+          "primaryKey": ["id"]
+        }
+      }
+    },
+    "desiredQueriesPatch": [
+      {
+        "op": "put",
+        "hash": "simple-open-issues",
+        "ast": {
+          "table": "issue",
+          "orderBy": [["modified", "desc"], ["id", "desc"]],
+          "limit": 10,
+          "where": {
+            "type": "simple",
+            "op": "=",
+            "left": {"type": "column", "name": "open"},
+            "right": {"type": "literal", "value": true}
+          }
+        }
+      }
+    ]
+  }
+]

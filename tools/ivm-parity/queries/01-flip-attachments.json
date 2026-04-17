@@ -1,0 +1,114 @@
+[
+  "initConnection",
+  {
+    "desiredQueriesPatch": [
+      {
+        "op": "put",
+        "hash": "xynelite-flip-attachments",
+        "ast": {
+          "table": "attachments",
+          "orderBy": [["createdAt", "desc"], ["id", "desc"]],
+          "limit": 50,
+          "where": {
+            "type": "correlatedSubquery",
+            "op": "EXISTS",
+            "related": {
+              "correlation": {
+                "parentField": ["conversationId"],
+                "childField": ["id"]
+              },
+              "subquery": {
+                "table": "conversations",
+                "alias": "conversation",
+                "where": {
+                  "type": "and",
+                  "conditions": [
+                    {
+                      "type": "simple",
+                      "op": "=",
+                      "left": {"type": "column", "name": "channelId"},
+                      "right": {"type": "literal", "value": "ch-pub-1"}
+                    },
+                    {
+                      "type": "or",
+                      "conditions": [
+                        {
+                          "type": "correlatedSubquery",
+                          "op": "EXISTS",
+                          "flip": true,
+                          "related": {
+                            "correlation": {
+                              "parentField": ["channelId"],
+                              "childField": ["id"]
+                            },
+                            "subquery": {
+                              "table": "channels",
+                              "alias": "channel",
+                              "where": {
+                                "type": "simple",
+                                "op": "=",
+                                "left": {"type": "column", "name": "visibility"},
+                                "right": {"type": "literal", "value": "public"}
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "type": "correlatedSubquery",
+                          "op": "EXISTS",
+                          "flip": true,
+                          "related": {
+                            "correlation": {
+                              "parentField": ["channelId"],
+                              "childField": ["id"]
+                            },
+                            "subquery": {
+                              "table": "channels",
+                              "alias": "channel",
+                              "where": {
+                                "type": "correlatedSubquery",
+                                "op": "EXISTS",
+                                "flip": true,
+                                "related": {
+                                  "correlation": {
+                                    "parentField": ["id"],
+                                    "childField": ["channelId"]
+                                  },
+                                  "subquery": {
+                                    "table": "participants",
+                                    "alias": "participants",
+                                    "where": {
+                                      "type": "and",
+                                      "conditions": [
+                                        {
+                                          "type": "simple",
+                                          "op": "=",
+                                          "left": {"type": "column", "name": "userId"},
+                                          "right": {"type": "literal", "value": "u1"}
+                                        },
+                                        {
+                                          "type": "simple",
+                                          "op": "=",
+                                          "left": {"type": "column", "name": "channelId"},
+                                          "right": {"type": "literal", "value": "ch-pub-1"}
+                                        }
+                                      ]
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+]

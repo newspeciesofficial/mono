@@ -1,0 +1,19 @@
+{
+  "name": "ivm-parity",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy-schema": "npx zero-deploy-permissions -p zero-schema.ts --output-file schema.json",
+    "start-ts": "ZERO_USE_RUST_IVM_V2=0 ZERO_PORT=4858 ZERO_UPSTREAM_DB=postgresql://user:password@127.0.0.1:6434/postgres ZERO_REPLICA_FILE=/tmp/ivm-parity-ts.db ZERO_SCHEMA_FILE=./schema.json ZERO_APP_ID=parity_ts zero-cache",
+    "start-rs": "ZERO_USE_RUST_IVM_V2=1 ZERO_PORT=4868 ZERO_UPSTREAM_DB=postgresql://user:password@127.0.0.1:6434/postgres ZERO_REPLICA_FILE=/tmp/ivm-parity-rs.db ZERO_SCHEMA_FILE=./schema.json ZERO_APP_ID=parity_rs zero-cache",
+    "harness": "tsx harness.ts"
+  },
+  "dependencies": {
+    "@rocicorp/zero": "file:../../packages/zero",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0"
+  }
+}

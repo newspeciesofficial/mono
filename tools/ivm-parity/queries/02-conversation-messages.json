@@ -1,0 +1,56 @@
+[
+  "initConnection",
+  {
+    "desiredQueriesPatch": [
+      {
+        "op": "put",
+        "hash": "xynelite-conversation-messages",
+        "ast": {
+          "table": "messages",
+          "orderBy": [["createdAt", "asc"], ["id", "asc"]],
+          "where": {
+            "type": "and",
+            "conditions": [
+              {
+                "type": "simple",
+                "op": "=",
+                "left": {"type": "column", "name": "conversationId"},
+                "right": {"type": "literal", "value": "co-1"}
+              },
+              {
+                "type": "or",
+                "conditions": [
+                  {
+                    "type": "simple",
+                    "op": "IS",
+                    "left": {"type": "column", "name": "visibleTo"},
+                    "right": {"type": "literal", "value": null}
+                  },
+                  {
+                    "type": "simple",
+                    "op": "=",
+                    "left": {"type": "column", "name": "visibleTo"},
+                    "right": {"type": "literal", "value": "u1"}
+                  }
+                ]
+              }
+            ]
+          },
+          "related": [
+            {
+              "correlation": {
+                "parentField": ["id"],
+                "childField": ["messageId"]
+              },
+              "subquery": {
+                "table": "attachments",
+                "alias": "attachments",
+                "orderBy": [["messageId", "asc"], ["id", "asc"]]
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+]

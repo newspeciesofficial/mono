@@ -1,0 +1,35 @@
+[
+  "initConnection",
+  {
+    "desiredQueriesPatch": [
+      {
+        "op": "put",
+        "hash": "xynelite-whereexists-nonpk",
+        "ast": {
+          "table": "channels",
+          "orderBy": [["id", "asc"]],
+          "where": {
+            "type": "correlatedSubquery",
+            "op": "EXISTS",
+            "related": {
+              "correlation": {
+                "parentField": ["id"],
+                "childField": ["channelId"]
+              },
+              "subquery": {
+                "table": "participants",
+                "alias": "participants",
+                "where": {
+                  "type": "simple",
+                  "op": "=",
+                  "left": {"type": "column", "name": "userId"},
+                  "right": {"type": "literal", "value": "u1"}
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+]
