@@ -104,6 +104,15 @@ impl TakeT {
         let mut out: Vec<Change> = Vec::new();
         match change {
             Change::Add(AddChange { node }) => {
+                if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                    eprintln!(
+                        "[ivm:rs:take_t:internal_add] size={}/limit={} bound={:?} row={:?}",
+                        self.state.size,
+                        self.limit,
+                        self.state.bound.as_ref().and_then(|r| r.get("id").cloned()),
+                        node.row.get("id").cloned()
+                    );
+                }
                 if self.state.size < self.limit {
                     self.state.size += 1;
                     let row = node.row.clone();
@@ -126,6 +135,12 @@ impl TakeT {
                         .map_or(false, |b| {
                             (self.compare_rows)(b, &node.row) == CmpOrdering::Greater
                         });
+                    if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                        eprintln!(
+                            "[ivm:rs:take_t:internal_add] at_limit replaces={}",
+                            replaces
+                        );
+                    }
                     if replaces {
                         let old_bound = self.state.bound.clone().unwrap();
                         out.push(Change::Remove(RemoveChange {
@@ -152,11 +167,28 @@ impl TakeT {
                 }
             }
             Change::Remove(RemoveChange { node }) => {
-                let was_bound = self
-                    .state
-                    .bound
-                    .as_ref()
-                    .map_or(false, |b| (self.compare_rows)(b, &node.row) == CmpOrdering::Equal);
+                // Mirror of TS `packages/zql/src/ivm/take.ts:334-343`:
+                // if bound is undefined (no window yet) OR
+                // `compareRows(change.row, bound) > 0` (row ranks AFTER
+                // bound — i.e. outside the at-most-`limit` window),
+                // the remove is a no-op and must NOT be emitted.
+                // Without this guard RS emits phantom Removes for
+                // rows that were never in the window, which produces
+                // spurious adds/removes in edit-split cases
+                // (fuzz_00168 canary: channel update reaches TakeT
+                // as Remove(old) + Add(new); if the channel was
+                // outside the limit window, RS previously emitted
+                // Remove(old) then the Add branch re-entered below-
+                // limit state and emitted Add(new), producing a net
+                // phantom insert).
+                let Some(bound) = self.state.bound.as_ref() else {
+                    return out;
+                };
+                let cmp = (self.compare_rows)(&node.row, bound);
+                if cmp == CmpOrdering::Greater {
+                    return out;
+                }
+                let was_bound = cmp == CmpOrdering::Equal;
                 self.state.size = self.state.size.saturating_sub(1);
                 if was_bound {
                     self.state.bound = None;

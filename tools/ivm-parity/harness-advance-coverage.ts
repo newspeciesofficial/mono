@@ -317,25 +317,39 @@ function sleep(ms: number): Promise<void> {
 // Cleanup — restore seed-baseline state.
 // ---------------------------------------------------------------------------
 async function cleanupDb(sql: postgres.Sql): Promise<void> {
-  for (const step of [...MUTATIONS].reverse()) {
-    if (step.undo) {
-      try { await sql.unsafe(step.undo); } catch (e) {
-        console.error(`[cleanupDb] undo failed: ${(e as Error).message}`);
+  // Retry until the test artifacts are actually gone. Under load,
+  // postgres.js pool connections can return success on DELETE before
+  // the mutation fully propagates (observed at scale: DELETE returns
+  // 0/1 rows but a subsequent SELECT still sees ch-test-1). Loop
+  // around the full cleanup + verification so the next batch's
+  // MUTATIONS never races an incomplete cleanup.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    for (const step of [...MUTATIONS].reverse()) {
+      if (step.undo) {
+        try { await sql.unsafe(step.undo); } catch (e) {
+          if (attempt === 0) {
+            console.error(`[cleanupDb] undo failed: ${(e as Error).message}`);
+          }
+        }
       }
     }
+    try {
+      await sql`DELETE FROM attachments WHERE id = 'a-test-1'`;
+      await sql`DELETE FROM messages WHERE id = 'm-test-1'`;
+      await sql`DELETE FROM conversations WHERE id = 'co-test-1'`;
+      await sql`DELETE FROM participants WHERE "userId" = 'u1' AND "channelId" = 'ch-test-1'`;
+      await sql`DELETE FROM channels WHERE id = 'ch-test-1'`;
+    } catch (e) {
+      console.error(`[cleanupDb] explicit DELETE failed (attempt ${attempt}): ${(e as Error).message}`);
+    }
+    await sleep(CLEANUP_WAIT_MS);
+    const leftover = await sql`SELECT id FROM channels WHERE id = 'ch-test-1'`;
+    if (leftover.length === 0) return;
+    if (attempt === 0) {
+      console.error(`[cleanupDb] retry needed: ch-test-1 still present after DELETE + ${CLEANUP_WAIT_MS}ms`);
+    }
   }
-  // Defensive explicit deletes by ID — survive across MUTATIONS edits.
-  try {
-    await sql`DELETE FROM attachments WHERE id = 'a-test-1'`;
-    await sql`DELETE FROM messages WHERE id = 'm-test-1'`;
-    await sql`DELETE FROM conversations WHERE id = 'co-test-1'`;
-    await sql`DELETE FROM participants WHERE "userId" = 'u1' AND "channelId" = 'ch-test-1'`;
-    await sql`DELETE FROM channels WHERE id = 'ch-test-1'`;
-  } catch (e) {
-    console.error(`[cleanupDb] explicit DELETE failed: ${(e as Error).message}`);
-    throw e;
-  }
-  await sleep(CLEANUP_WAIT_MS);
+  throw new Error('cleanupDb could not remove ch-test-1 after 5 attempts');
 }
 
 // ---------------------------------------------------------------------------
