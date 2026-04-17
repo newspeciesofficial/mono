@@ -657,10 +657,33 @@ impl Chain {
             }
             stream.collect()
         };
-        let emissions: Vec<Change> = join
-            .transformer
-            .push_child(change, &parent_snapshot)
-            .collect();
+        // TS implements this at packages/zql/src/builder/builder.ts:611+
+        // (`applyCorrelatedSubQuery`) as a full sub-pipeline: the
+        // child's subquery builds Filter/OrderBy/Take/Skip operators
+        // BEFORE the Join sees the change. Child inserts that fail the
+        // subquery's filter never reach the Join. I missed this in RS
+        // — `change` went straight to `join.transformer.push_child`,
+        // bypassing the sub-pipeline filter. Hydration was correct
+        // (child_source.fetch runs through the full sub-chain), but
+        // push was not. Adding the pre-routing now: downcast
+        // `child_source` to the sub-Chain and run `change` through its
+        // transformer stack first. If the sub-chain is a plain source
+        // (legacy path — no subquery), fall through with the change
+        // unchanged (preserves current behaviour for test stubs).
+        let filtered_changes: Vec<Change> = match join
+            .child_source
+            .as_any_mut()
+            .and_then(|any| any.downcast_mut::<Chain>())
+        {
+            Some(sub_chain) => sub_chain.push_through_transformers(change),
+            None => vec![change],
+        };
+        let mut emissions: Vec<Change> = Vec::new();
+        for filtered in filtered_changes {
+            emissions.extend(
+                join.transformer.push_child(filtered, &parent_snapshot),
+            );
+        }
         let query_id = self.query_id.clone();
         let child_table = join.child_table.clone();
         let child_pk = join.child_primary_key.clone();
@@ -1238,6 +1261,35 @@ impl Chain {
             true
         });
         all
+    }
+
+    /// Push a change through this chain's transformers only (Filter /
+    /// Skip / Take / ExistsT) and return the filtered `Change` list.
+    /// Unlike `advance`, does NOT run the join push_parent stage or
+    /// convert to `RowChange` — used when a parent Chain needs to
+    /// apply this Chain's sub-pipeline filter to a child mutation
+    /// before handing it to the parent Join's `push_child` (mirrors
+    /// TS `applyCorrelatedSubQuery` wrapping the child source in a
+    /// full Filter/Skip/Take/ExistsT sub-pipeline at
+    /// `packages/zql/src/builder/builder.ts:611-647`).
+    pub fn push_through_transformers(&mut self, change: Change) -> Vec<Change> {
+        let mut buf: Vec<Change> = vec![change];
+        let n = self.transformers.len();
+        for idx in 0..n {
+            let mut next: Vec<Change> = Vec::new();
+            let (preceding, rest) = self.transformers.split_at_mut(idx);
+            let t = &mut rest[0];
+            for c in buf.drain(..) {
+                let emissions: Vec<Change> = t.push(c).collect();
+                next.extend(emissions);
+                if let Some(req) = t.take_pending_refetch() {
+                    let rows = fetch_prefix(&mut *self.source, preceding, req);
+                    t.ingest_refetch(rows);
+                }
+            }
+            buf = next;
+        }
+        buf
     }
 
     /// Advance (parent-side). Pushes a change that originated on this

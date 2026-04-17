@@ -385,18 +385,11 @@ impl ExistsT {
     /// derived from the parent row. Returns the number of matching
     /// child rows, or `None` when no `child_input` is wired.
     ///
-    /// **IMPORTANT — snapshot semantics**: This reads from the pinned
-    /// PREV snapshot (the SnapshotReader is refreshed AFTER all advance
-    /// calls for a diff cycle, per `pipeline_v2_refresh_snapshot` in
-    /// `rust-pipeline-driver-v2.ts:673-677`). So the count returned is
-    /// the PRE-mutation count for the current change, not post-mutation.
-    ///
-    /// TS contrast: `packages/zql/src/ivm/exists.ts:133-167` reads
-    /// `change.node.relationships[name]()` which is decorated by the
-    /// upstream Join *after* the child was applied → POST-mutation count.
-    /// RS therefore checks the inverse thresholds (see `push_child`):
-    ///   - Add flip: TS checks `size === 1` (post); RS checks `== 0` (pre)
-    ///   - Remove flip: TS checks `size === 0` (post); RS checks `== 1` (pre)
+    /// Used by `push_child` to compute the *post-mutation* size of the
+    /// EXISTS relationship for a given parent — by the time `push_child`
+    /// runs, the child source has already applied the Add/Remove. This
+    /// matches TS `packages/zql/src/ivm/exists.ts:136/171` semantics
+    /// where `size === 1` / `size === 0` are post-mutation flip thresholds.
     fn child_size_for(&mut self, parent_row: &Row) -> Option<usize> {
         let child = self.child_input.as_mut()?;
         let constraint = build_join_constraint(
@@ -560,15 +553,12 @@ impl Transformer for ExistsT {
             match &change {
                 Change::Add(_) => {
                     // TS implements this at packages/zql/src/ivm/exists.ts:136
-                    // where `size === 1` means POST-mutation size is 1 (first
-                    // child was just added). RS `child_size_for` returns the
-                    // PRE-mutation count from the pinned PREV snapshot
-                    // (SnapshotReader is refreshed AFTER the advance cycle,
-                    // per rust-pipeline-driver-v2.ts:673-677). So the
-                    // equivalent pre-mutation threshold is `== 0` (was empty,
-                    // now becomes non-empty after this Add). I missed this in
-                    // RS, adding it now.
-                    if new_size == 0 {
+                    // as `if (size === 1)` — POST-mutation size is 1 (first
+                    // child was just added, flip 0→1). RS `child_size_for`
+                    // also returns POST-mutation count because the child
+                    // source has already applied the change by the time
+                    // push_child runs — same threshold as TS.
+                    if new_size == 1 {
                         // Mirror of TS exists.ts:155-162 (EXISTS add-flip):
                         // emit `add` of the parent. TS passes the full
                         // node (with its relationships) unchanged because
@@ -598,11 +588,11 @@ impl Transformer for ExistsT {
                 }
                 Change::Remove(_) => {
                     // TS implements this at packages/zql/src/ivm/exists.ts:171
-                    // where `size === 0` means POST-mutation size is 0 (last
-                    // child was just removed). RS pre-mutation equivalent is
-                    // `== 1` (had exactly one child, now becomes empty). I
-                    // missed this in RS, adding it now.
-                    if new_size == 1 {
+                    // as `if (size === 0)` — POST-mutation size is 0 (last
+                    // child was just removed, flip 1→0). RS `child_size_for`
+                    // is also POST-mutation (child source applies the Remove
+                    // before push_child runs) — same threshold as TS.
+                    if new_size == 0 {
                         // Mirror of TS exists.ts:171-199 (EXISTS remove-flip):
                         // For NotExists → emit Add of parent (with empty
                         // relationships — subquery rows aren't emitted).
