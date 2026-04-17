@@ -58,7 +58,7 @@ const SIMPLES_PER_TABLE = num('SIMPLES_PER_TABLE', 96);
 const ANDS_PER_TABLE = num('ANDS_PER_TABLE', 12);
 const ORS_PER_TABLE = num('ORS_PER_TABLE', 12);
 const DEEP_PER_TABLE = num('DEEP_PER_TABLE', 16);
-const MAX_RELATED_PER_TABLE = num('MAX_RELATED_PER_TABLE', 6);
+const MAX_RELATED_PER_TABLE = num('MAX_RELATED_PER_TABLE', 16);
 const JOINT_QUERIES_PER_TABLE = num('JOINT_QUERIES_PER_TABLE', 8);
 
 // Sentinel literal values per type. Kept small (1 matching, 1 non-matching)
@@ -326,6 +326,61 @@ function csqWithSubWhere(table: TableDef, ctx: GenCtx): CorrelatedSubqueryCondit
 }
 
 /**
+ * CSQ variant where the subquery contains its own CorrelatedSubquery in
+ * its `where`. Produces `exists(A, q => q.whereExists(B))` — the
+ * nested-whereExists pattern shipped apps use heavily (e.g. messages →
+ * conversation → channel visibility checks). Previously absent from the
+ * fuzzer output.
+ */
+function csqWithNestedCsqSubWhere(table: TableDef, ctx: GenCtx): CorrelatedSubqueryCondition[] {
+  if (ctx.hops + 2 >= MAX_RELATIONSHIP_HOPS) return [];
+  const out: CorrelatedSubqueryCondition[] = [];
+  for (const rel of table.relationships) {
+    if (ctx.ancestorTables.has(rel.childTable)) continue;
+    const childTable = SCHEMA[rel.childTable];
+    if (!childTable) continue;
+    const childCtx: GenCtx = {
+      ancestorTables: new Set([...ctx.ancestorTables, rel.childTable]),
+      hops: ctx.hops + 1,
+    };
+    // Look for a grandchild relationship the subquery can whereExists into.
+    const grandRel = childTable.relationships.find(
+      r => !childCtx.ancestorTables.has(r.childTable),
+    );
+    if (!grandRel) continue;
+    const grandTable = SCHEMA[grandRel.childTable];
+    if (!grandTable) continue;
+    // Pick a simple predicate on the grandchild to make it concrete.
+    const grandLeaf = simpleConditions(grandTable).find(l => l.op === '=') ?? simpleConditions(grandTable)[0];
+    if (!grandLeaf) continue;
+    const innerCsq: CorrelatedSubqueryCondition = {
+      type: 'correlatedSubquery',
+      related: {
+        correlation: {parentField: cKey(grandRel.parentField), childField: cKey(grandRel.childField)},
+        subquery: {table: grandRel.childTable, alias: nextAlias(grandRel.name), where: grandLeaf},
+      },
+      op: 'EXISTS',
+    };
+    // Build the outer CSQ wrapping this inner whereExists.
+    for (const op of ['EXISTS', 'NOT EXISTS'] as const) {
+      out.push({
+        type: 'correlatedSubquery',
+        related: {
+          correlation: {parentField: cKey(rel.parentField), childField: cKey(rel.childField)},
+          subquery: {
+            table: rel.childTable,
+            alias: nextAlias(rel.name),
+            where: innerCsq,
+          },
+        },
+        op,
+      });
+    }
+  }
+  return out;
+}
+
+/**
  * Stratified where-shape generator. Returns a deduped flat list whose
  * categories are guaranteed represented (vs naive pickPairs which lets
  * one stratum starve the others through prefix slicing).
@@ -334,7 +389,8 @@ function whereShapes(table: TableDef, ctx: GenCtx): Condition[] {
   const simples = simpleConditions(table);
   const csqs = csqLeafConditions(table, ctx);
   const csqsDeep = csqWithSubWhere(table, ctx);
-  const csqAll = [...csqs, ...csqsDeep];
+  const csqsNested = csqWithNestedCsqSubWhere(table, ctx);
+  const csqAll = [...csqs, ...csqsDeep, ...csqsNested];
 
   // Combinator leaf pool: small to keep depth-2 finite. Deliberately mix
   // simples and csqs so AND/OR cover both kinds.
@@ -429,7 +485,10 @@ function astNodes(ast: AST): number {
 
 /**
  * `related[]` shapes up to MAX_RELATED_DEPTH. Each entry is a candidate
- * value for `AST.related`.
+ * value for `AST.related`. Enumerates plain related, related-with-where,
+ * related-with-orderBy+limit, related-with-one, multi-sibling, and nested.
+ * These are the shapes shipped apps use most heavily and the fuzzer was
+ * previously silent on.
  */
 function relatedShapes(table: TableDef, ctx: GenCtx): readonly CorrelatedSubquery[][] {
   if (ctx.hops >= MAX_RELATIONSHIP_HOPS) return [[]];
@@ -438,12 +497,54 @@ function relatedShapes(table: TableDef, ctx: GenCtx): readonly CorrelatedSubquer
 
   const out: CorrelatedSubquery[][] = [[]];
 
+  // Category A — plain related (existing behaviour).
   for (const rel of rels) {
     out.push([buildCsq(rel, undefined)]);
   }
+
+  // Category B — related with a where on the child subquery. Models
+  // `.related(rel, q => q.where(...))` from shipped queries.
+  for (const rel of rels) {
+    const childTable = SCHEMA[rel.childTable];
+    if (!childTable) continue;
+    const leaves = simpleConditions(childTable);
+    if (leaves.length === 0) continue;
+    // Pick 2 representative filter ops on the child.
+    const eqLeaf = leaves.find(l => l.op === '=');
+    const ilikeLeaf = leaves.find(l => l.op === 'ILIKE');
+    const isNullLeaf = leaves.find(l => l.op === 'IS');
+    for (const leaf of [eqLeaf, ilikeLeaf, isNullLeaf]) {
+      if (!leaf) continue;
+      out.push([buildCsqRich(rel, {where: leaf})]);
+    }
+  }
+
+  // Category C — related with orderBy + limit on the child (the classic
+  // "latest-N per parent" pattern).
+  for (const rel of rels) {
+    const childTable = SCHEMA[rel.childTable];
+    if (!childTable) continue;
+    const childPk = childTable.pk[0];
+    const childOther = childTable.columns.find(c => !childTable.pk.includes(c.name))?.name;
+    if (!childPk) continue;
+    const childOrderBy1: Ordering = [[childPk, 'asc']];
+    const childOrderBy2: Ordering | undefined = childOther
+      ? [[childOther, 'desc'], [childPk, 'desc']]
+      : undefined;
+    out.push([buildCsqRich(rel, {orderBy: childOrderBy1, limit: 5})]);
+    if (childOrderBy2) {
+      out.push([buildCsqRich(rel, {orderBy: childOrderBy2, limit: 3})]);
+      // Child with limit: 1 models related().one() shape.
+      out.push([buildCsqRich(rel, {orderBy: childOrderBy2, limit: 1})]);
+    }
+  }
+
+  // Category D — multi-sibling related (two rels in one array).
   if (MAX_RELATED_PER_NODE >= 2 && rels.length >= 2) {
     out.push([buildCsq(rels[0], undefined), buildCsq(rels[1], undefined)]);
   }
+
+  // Category E — nested related (existing behaviour): parent.related(A).subquery.related(B).
   if (MAX_RELATED_DEPTH >= 2) {
     for (const rel of rels) {
       const childCtx: GenCtx = {
@@ -457,6 +558,7 @@ function relatedShapes(table: TableDef, ctx: GenCtx): readonly CorrelatedSubquer
       out.push([buildCsq(rel, [buildCsq(grand, undefined)])]);
     }
   }
+
   return out.slice(0, MAX_RELATED_PER_TABLE);
 }
 
@@ -464,6 +566,28 @@ function buildCsq(rel: RelationshipDef, related: readonly CorrelatedSubquery[] |
   return {
     correlation: {parentField: cKey(rel.parentField), childField: cKey(rel.childField)},
     subquery: {table: rel.childTable, alias: nextAlias(rel.name), related},
+  };
+}
+
+/**
+ * `buildCsq` variant that lets callers attach where/orderBy/limit on the
+ * child subquery. Used by Categories B and C above — these shapes were
+ * completely absent from the previous fuzzer output despite being the
+ * dominant pattern in shipped apps.
+ */
+function buildCsqRich(
+  rel: RelationshipDef,
+  extra: {where?: Condition; orderBy?: Ordering; limit?: number},
+): CorrelatedSubquery {
+  return {
+    correlation: {parentField: cKey(rel.parentField), childField: cKey(rel.childField)},
+    subquery: {
+      table: rel.childTable,
+      alias: nextAlias(rel.name),
+      where: extra.where,
+      orderBy: extra.orderBy,
+      limit: extra.limit,
+    },
   };
 }
 
