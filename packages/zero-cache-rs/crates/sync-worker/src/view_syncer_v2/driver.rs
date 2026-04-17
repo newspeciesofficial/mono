@@ -305,11 +305,20 @@ impl PipelineV2 {
                 sub_spec_mut.partition_key = Some(es.child_key.clone());
                 let mut nested_inputs: Vec<Option<Box<dyn crate::ivm_v2::operator::Input>>> =
                     Vec::new();
+                // Mirror of TS `buildPipelineInternal` at
+                // `packages/zql/src/builder/builder.ts:308-329`: the cap
+                // is gated by `!csqCondition.flip` PER-CSQ, re-evaluated
+                // at every recursion level. Previously this recursion
+                // inherited the parent's `apply_exists_limit`, which is
+                // wrong for multi-level flipped shapes — a nested flip
+                // would get capped when TS would not (and vice versa).
                 if let Some(sub_es) = sub_spec_mut.exists.as_mut() {
-                    nested_inputs.push(build_child_input(sub_es, source_factory, apply_exists_limit));
+                    let nested_cap = !sub_es.flip;
+                    nested_inputs.push(build_child_input(sub_es, source_factory, nested_cap));
                 }
                 for sub_es in sub_spec_mut.exists_chain.iter_mut() {
-                    nested_inputs.push(build_child_input(sub_es, source_factory, apply_exists_limit));
+                    let nested_cap = !sub_es.flip;
+                    nested_inputs.push(build_child_input(sub_es, source_factory, nested_cap));
                 }
                 let sub_chain =
                     crate::view_syncer_v2::pipeline::Chain::build_with_join_and_exists(
@@ -377,15 +386,21 @@ impl PipelineV2 {
                 // same partition-key passthrough used for the EXISTS
                 // sub-Chain, but for the `.related()` Join path.
                 sub_spec.partition_key = Some(js.child_key.clone());
-                // Recurse for each nested EXISTS.
+                // Recurse for each nested EXISTS. Per TS
+                // `buildPipelineInternal` at `builder.ts:308-329` the cap
+                // is gated by the NESTED CSQ's own `!csqCondition.flip`,
+                // not the parent's — hardcoding `true` here over-capped
+                // flipped sub-subqueries under a JOIN relationship.
                 let mut sub_exists_inputs: Vec<
                     Option<Box<dyn crate::ivm_v2::operator::Input>>,
                 > = Vec::new();
                 if let Some(sub_es) = sub_spec.exists.as_mut() {
-                    sub_exists_inputs.push(build_child_input(sub_es, source_factory, true));
+                    let nested_cap = !sub_es.flip;
+                    sub_exists_inputs.push(build_child_input(sub_es, source_factory, nested_cap));
                 }
                 for sub_es in sub_spec.exists_chain.iter_mut() {
-                    sub_exists_inputs.push(build_child_input(sub_es, source_factory, true));
+                    let nested_cap = !sub_es.flip;
+                    sub_exists_inputs.push(build_child_input(sub_es, source_factory, nested_cap));
                 }
                 // Recurse for each nested JOIN.
                 let mut sub_join_inputs: Vec<
