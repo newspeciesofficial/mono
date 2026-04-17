@@ -1,119 +1,84 @@
 # RS Bug Investigation Notes
 
-Per-divergence diagnoses captured from sub-agent runs. Use these as the
-starting point for Phase 6 fixes. Each entry cites the exact TS file:line
-that RS must mirror, per the user's hard rule.
+Per-divergence catalog organized for incremental porting. Each entry cites
+the exact TS code path RS must mirror (user's hard rule: no novel ideas on
+RS side; TS is authoritative).
 
----
+## Session history
 
-## fuzz_00082 — `EXISTS flip+scalar` push gap
+| Commit | Change | adv-diverge |
+|---|---|---|
+| (baseline) | seed corpus + fuzz 1055 ASTs | 204 |
+| 597eb07ab | agent A threshold flip + agent B NotIn[] fix | 128 (thresholds wrong) |
+| 18ea0f82b | threshold revert + child-push sub-chain routing | 113 |
+| c4a010074 | or-branch decoration forward in push | 104 |
 
-**Query:**
-```ts
-zql.channels.where(({exists}) => exists('conversations', {flip: true, scalar: true}))
-```
+## Remaining categories (post-c4a010074, batch=30)
 
-**Symptom:** TS adds `ch-test-1` + `co-test-1` after `INSERT conversations`;
-RS adds nothing. RS misses the flipped-join child→parent advancement.
+### related-only — 28
 
-**TS push path (what should happen):**
-- Entry: `packages/zql/src/builder/builder.ts:367` — `applyWhere` detects `conditionIncludesFlippedSubqueryAtAnyLevel(condition) === true`, routes to `applyFilterWithFlips` at line 373.
-- Routing: `builder.ts:450` `case 'correlatedSubquery'` → builds child pipeline for `conversations` via `buildPipelineInternal`, creates **`FlippedJoin`** at `builder.ts:459`.
-- On child INSERT: `FlippedJoin.#pushChild` (`packages/zql/src/ivm/flipped-join.ts:312`) → `#pushChildChange` (line 336) → builds constraint `{channelId: 'ch-test-1'}` → fetches matching parent → emits `Change.Add(ch-test-1)` with `relationships.conversations = [co-test-1]` at `flipped-join.ts:402-414`.
+**Plain `.related(rel)` (7 cases, e.g. fuzz_00156)**
+- TS: `applyCorrelatedSubQuery` at `builder.ts:611-647` wraps child in a Join operator; Join's `#pushChild` (`join.ts:190+`) emits `Change::Child` when a child row arrives that correlates to an existing parent.
+- RS: `Chain::advance_child` calls `join.transformer.push_child` but the emission isn't reaching the RowChange::Add output. Suspected: JoinT::push_child doesn't emit Child for the non-correlated-existing-parent case, or the parent_snapshot (unconstrained) misses the correlation step.
+- **Isolation reproduces: NO** — fuzz_00156 alone passes. Batch-level timing-or-state issue.
 
-**RS counterpart status:**
-- Currently: `ExistsT` fallback. RS `ast_builder.rs:786-791` explicitly logs `"flip=true on relationship=conversations — falling back to ExistsT (hydration-equivalent; push may differ)"` and emits `ExistsSpec` at line 800.
-- Missing: a real `FlippedJoinT` operator. The `ExistsT` fallback would work for the 0→1 ADD case IF `child_primary_key` were filled — but it isn't.
+**`.related(rel, q => q.orderBy().limit(N))` (15 cases, e.g. fuzz_00161)**
+- TS: child's Take operator evaluates push; at-limit refetch can emit Remove+Add.
+- RS: `push_through_transformers` added in 18ea0f82b routes through child sub-chain, but Take operator's push semantics need verification for refetch/bound updates.
+- Next: confirm if Take push emits the refetch correctly via single-AST trace.
 
-**Root cause:**
-- `ast_builder.rs:809` sets `child_primary_key: None` on the `ExistsSpec`.
-- `pipeline.rs:424-443` requires both `child_table` AND `child_primary_key` to be `Some` to register the chain in `exists_child_tables`.
-- Without that registration, `advance_child_for_exists("conversations", Insert(co-test-1))` is never called.
-- So the chain never reacts to conversations mutations.
+**`.related(rel, q => q.related(subRel))` (4 cases)**
+- TS: grandchild emission via `Streamer#streamChanges` recursion at `pipeline-driver.ts:964-972`.
+- RS: `advance_child` doesn't recurse into grandchildren per nested related[].
 
-**Recommended fix (Phase 6):**
-1. **Driver-level:** in the `RustPipelineDriverV2::build_chain` call site that invokes `ast_to_chain_spec`, fill `child_primary_key` from the schema/table-registry before passing to `Chain::build`. The comment at `ast_builder.rs:808-810` already reads "Driver fills in from schema." — that wiring is missing. This minimum fix makes `ExistsT::push_child` work for the 0→1 ADD case.
-2. **Verify:** `exists_child_tables_flat()` (`pipeline.rs:881`) returns `"conversations"` after the fix.
-3. **Long-term:** for proper parity, install a `FlippedJoinT` mirroring `flipped-join.ts:336-419` instead of using `ExistsT` for `flip:true`. This is task #148 (kept open).
+### or(simple, csq) — 20
 
----
+Running my `c4a010074` decoration-forward fix, some were fixed; 20 remain.
+- TS: applyFilterWithFlips/applyOr at `builder.ts:410-557` — per-branch Filter + per-branch upfront-Join decoration, union via UnionFanIn.
+- RS: `OrBranchesT::push` now decorates, but the emission may still miss cases where the upstream change is Edit (partially handled) or Child (unhandled). Single-AST trace for fuzz_00377 still fails in batch (works in isolation).
 
-## fuzz_00087 — `NOT EXISTS` gate-flip on child Add (HIGH-IMPACT)
+### EXISTS / EXISTS scalar — 13 + 12
 
-**Query:**
-```ts
-zql.channels.where(({not, exists}) => not(exists('conversations')))
-```
+- fuzz_00089 `channels.whereExists('participants')` passes in isolation, fails in batch.
+- Hypothesis: batch-time race in how `advance_child_for_exists` fires vs when the replica snapshot is refreshed.
 
-**Symptom:**
-1. INSERT `ch-test-1` (no conversations) → ch-test-1 APPEARS (NOT EXISTS holds)
-2. INSERT `co-test-1` in ch-test-1 → ch-test-1 should DISAPPEAR (NOT EXISTS no longer holds)
-- TS net: 0 changes (appears then disappears).
-- RS net: +1 (ch-test-1 added but never removed) — RS misses the disappearance.
+### EXISTS flip / flip+scalar — 7 + 8
 
-**TS push path:**
-- Pipeline: `source(channels) → Join(child=conversations) → Exists(NOT EXISTS)`
-- On INSERT co-test-1, `Exists.push(Change::Child)` at `packages/zql/src/ivm/exists.ts:133-167` runs the `'add'` branch:
-  1. `size = yield* this.#fetchSize(change.node)` (line 135) — reads `change.node.relationships['zsubq_conversations_8']()`, count = **1** (Join's in-memory store reflects the just-added co-test-1)
-  2. `if (size === 1)` → true
-  3. `if (this.#not)` → true (NOT EXISTS)
-  4. Lines 142-154: emits `Remove(ch-test-1)` with empty relationships
-- Result: -1 propagates upstream; combined with +1 from step 1 = net 0.
+- TS: `FlippedJoin` at `packages/zql/src/ivm/flipped-join.ts:336-419`.
+- RS: falls back to ExistsT (see `ast_builder.rs:786-791` fallback comment). Task #148 — wire a real FlippedJoin operator into ChainSpec/driver.
 
-**RS counterpart:**
-- `advance_child_for_exists_recursive("conversations", Add(co-test-1))` at `pipeline.rs:909` correctly routes to `advance_child_for_exists` at `pipeline.rs:730`.
-- `parent_snapshot` built via `source.fetch(PREV snapshot)` returns ch-test-1 ✓.
-- `correlates()` matches ch-test-1 ↔ co-test-1 ✓.
-- Then `child_size_for(ch-test-1.row)` at `exists_t.rs:394` calls `child_input.fetch(constraint)` — **this queries SQLite via the SnapshotReader pinned to PREV snapshot (before co-test-1 was committed).**
-- PREV snapshot returns **0** conversations for ch-test-1.
-- `new_size = 0` ≠ 1 → the `if new_size == 1` branch at `exists_t.rs:540` is NOT taken.
-- No `Remove(ch-test-1)` emitted.
+### NOT EXISTS / NOT EXISTS scalar — 5 + 4
 
-**Root cause (CRITICAL — likely affects many divergences):**
-`exists_t.rs:394 child_size_for` reads from the PREV (pre-mutation) SQLite snapshot. The TS equivalent reads from the Join operator's in-memory relationship storage which IS updated before `Exists::push` runs. So RS systematically undercounts after INSERT and overcounts after DELETE — every gate-flip via `child_size_for` is broken at advance-time.
+- TS: `exists.ts:171` uses `size === 0` for flip threshold.
+- RS: thresholds now correct (per c4a010074). Remaining divergences likely from same batch-timing as the plain EXISTS cases.
 
-**Recommended fix:**
-- `exists_t.rs:394-406` (`child_size_for`) — derive post-mutation count from the Change itself instead of re-querying SQLite. Mirrors TS `exists.ts:135` semantics where `#fetchSize` already sees the mutation:
-  - For `Change::Add(_)`:  `new_size = child_input.fetch(constraint).count() + 1`
-  - For `Change::Remove(_)`: `new_size = child_input.fetch(constraint).count() - 1`
-  - For `Change::Edit(_)`: PK-preserving edit, count unchanged → `new_size = child_input.fetch(constraint).count()`
-- Cite: `// mirrors TS exists.ts:135 (#fetchSize reads Join's post-mutation in-memory store)`
-- Alternative considered & rejected: refresh SnapshotReader to CURR mid-batch — would require restructuring snapshot timing, breaks streaming.
+### and/or compound CSQ (and(csq,csq), or(csq,csq), or(and,csq), or(or,csq)) — 2 each
 
-**Why this likely fixes multiple divergences:** any push-path test where `Exists::push_child` needs to detect a 0→1 or 1→0 size flip will fail today. That includes plain `EXISTS` (when count goes 0→1), `NOT EXISTS` (1→0 via Add, 0→1 via Remove), and the EXISTS-in-OR variants whose evaluation routes through `child_size_for`. Re-run the sweep after applying this fix and watch the diverge count drop sharply.
+- TS: applyOr/applyAnd compose per-branch; RS OrBranchesT has specific support. 
+- These 8 divergences span both hydration and push paths; each shape likely needs an individual diagnosis.
 
-**⚠️ CONTRADICTION TO RESOLVE BEFORE FIXING:**
-The existing `exists_t.rs:388-393` comment states the opposite of the agent's hypothesis:
-> "Used by `push_child` to compute the *post-mutation* size … by the time `push_child` runs, the child source's SQLite connection has already applied the change. So pre-mutation size is inferred: `Add` → pre = post-1, `Remove` → pre = post+1, matching TS's `size === 1` / `size === 0` flip detection in `packages/zql/src/ivm/exists.ts:136/171`."
+### simple NOT IN — 1 (fuzz_00673)
 
-The empirical fact (RS misses `Remove(parent)` for `fuzz_00087`) proves a real bug. But which is right?
+Likely a different column-type or NULL variant not covered by agent B's fix. Re-check.
 
-**Verify before fixing — add temporary instrumentation:**
-1. In `exists_t.rs:394 child_size_for`, log the count returned per call along with the parent_row PK and the child_table.
-2. In `exists.ts:135 #fetchSize`, log the count it sees (TS, only when `IVM_PARITY_TRACE=1`).
-3. Run `harness-advance-coverage.ts` for `fuzz_00087` only (`CORPUS_LIMIT=N` after sorting corpus to put fuzz_00087 first, or run `harness-advance.ts` patterns).
-4. Compare the two logs:
-   - If RS's `child_size_for` returns 0 while TS's `#fetchSize` returns 1 → the agent's hypothesis is correct; the comment in `exists_t.rs` is aspirational. Fix as proposed.
-   - If RS's `child_size_for` returns the same count as TS but the `if new_size == 1` branch still doesn't fire → the bug is elsewhere (e.g., `parent_snapshot` doesn't include `ch-test-1`, or `correlates()` is comparing wrong fields).
-5. Revert the temporary logs after the bug is fixed (per the "TS-side logs only when env-gated" rule the TS log must be inside `if (process.env.IVM_PARITY_TRACE) …`).
+## Protocol to port each remaining class
 
-**Do not apply the proposed fix without this verification step.** The contradiction with the existing comment means one of the two is wrong, and "no novel ideas / only port from TS" requires us to know which.
+For any shape category with N divergences:
 
----
+1. Identify ONE representative divergence via `node -e "... find(r.outcome.status==='advance-diverge' && r.ast.where?.type===...)"` from `advance_coverage_run.json`.
+2. Run it in isolation (`CORPUS_LIMIT=1` after filtering corpus to that ID): if passes in isolation, issue is batch-timing; if fails, issue is RS code.
+3. For code bugs: read TS path (grep for the operator in `packages/zql/src/ivm/` + `builder/`). Read RS counterpart in `packages/zero-cache-rs/crates/sync-worker/src/ivm_v2/`.
+4. Add env-gated TS log (revert after) + RS trace to confirm the divergence point.
+5. Apply RS fix citing TS file:line. `cargo test`. Rebuild napi. Restart RS. Re-sweep.
+6. Revert TS logs.
 
-## Other divergence categories (from `parity_report.md`)
+## Streaming architectural-parity notes
 
-| Shape | Count | Sample IDs | Likely root cause |
-|---|---|---|---|
-| `or(or, csq)` | 6 | fuzz_00146, fuzz_00150, fuzz_00375 | Same family as p36 — OR-of-OR flattening interaction with CSQ decoration |
-| `or(simple, csq)` | 5 | fuzz_00126, fuzz_00127 | OR-of-mixed-scalar+CSQ — needs flip path |
-| `EXISTS scalar` | 2 | fuzz_00080, fuzz_00084 | Likely same `child_primary_key` bug as fuzz_00082 |
-| `and(csq, csq)` | 2 | fuzz_00135, seed_18_… | AND-of-EXISTS push — inner ExistsT child push |
-| `simple NOT IN []` | 1 | fuzz_00633 | NULL handling on empty IN list — RS more SQL-strict than TS |
-| `or(simple, simple, csq)` + `or(simple, and, and)` | 2 | seed_17, seed_22 | Compound shape, fuzz didn't reach |
+TS is generator-based throughout. RS:
+- **Per-operator push**: returns `Box<dyn Iterator<Item=Change>>` — streaming ✓
+- **Chain-level push chain (`Chain::advance`, `push_through_transformers`)**: Vec-buffered between operators. Bounded per-event (≤ few); not a streaming violation in practice but not literal parity with TS generator chaining.
+- **Push-side parent fetch**: `parent_snapshot = stream.collect()` at `pipeline.rs:652, 790, 1164`. TS fetches lazily via `#parent.fetch({constraint})` at `join.ts:227`. **Known divergence.** Worse than Vec buffering because it scales with table row count. Not yet refactored because the API (`push_child(change, parent_snapshot: &[Node])`) pre-materializes; a faithful port needs API change to pass an iterator.
 
-Generate fresh per-shape diagnoses by re-running `harness-coverage.ts` →
-`parity_report.md`, then dispatching one diagnostic agent per shape with
-the exact rendered ZQL + diff as input. The skill at
-`.claude/skills/ivm-parity-sweep/SKILL.md` documents the parallel-fix
-protocol.
+## Batch-vs-isolation flake
+
+Several tests pass alone but fail in BATCH_SIZE=30 sweeps (observed: fuzz_00089, fuzz_00156, fuzz_00377). Root cause unknown. POKE_WAIT_MS=5000 doesn't help. Possibly related to the non-constrained `source.fetch` in push paths interacting with concurrent CVR diffs.
