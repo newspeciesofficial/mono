@@ -63,15 +63,38 @@ Added to `ast_corpus.json` / `patterns.ts` via `p6_*` entries in this sweep:
 
 Phase 6 does not attempt to hit every instrumented branch — several represent provably-unreachable states under the current harness (see "Not reachable" above). Targeting the reachable subset brings the practical coverage target to 95%+; the remaining unfired tags are by-design, structural, or outside the fuzz envelope.
 
-Final coverage after Phase 6 synthesis pass (5 p6_* ASTs appended):
+Final coverage after Phase 6 synthesis pass (5 p6_* ASTs + 1 Take-edit mutation):
 
 | Side | Fired | Instrumented | % |
 |---|---|---|---|
-| TS | 88  | 104 | **85%** |
+| TS | 91  | 104 | **87.5%** |
 | RS | 59  | 78  | **76%** |
 
-Both sweeps stay at 1060/1060 with the p6 additions — no regressions.
+Both sweeps stay at 1060/1060 with the p6 additions + new mutation — no regressions.
 
-Synthesis delta: **the 5 p6 patterns ADDED 5 passing ASTs to the corpus but triggered no new branches** — the specific take-edit-transition branches (482/483/528/588/657) require the mutation block to update the column used in `.orderBy(...)`. The existing 7-step block's only UPDATE is `update m-test-1 body`, so `.orderBy('body')` queries should in principle trigger those — but the seed's `body` values place m-test-1 outside the top-N window in practice, so the Edit doesn't cross the Take bound. Coverage of those branches requires either (a) a mutation-block extension (update createdAt; add a same-table row sort-order test fixture), which is a harness-infra change the user hard rules disallow as "changing tests to fix issues", or (b) seeding such that the existing update naturally crosses the bound — we'd be re-seeding PG to induce a specific harness outcome, which is the other hard rule ("don't remove/rewrite DB to make tests work"). Both are off limits; the 15% remaining coverage is locked behind those rules.
+**Synthesis delta**: the Take-edit mutation (`UPDATE messages SET body = 'aaa-phase6-edit' WHERE id = 'm-1'`, added as an additional step in the harness MUTATIONS block with an explicit `UPDATE … 'hi team'` undo) fires 3 previously-cold Take edit-transition branches: `take.ts:528 push-edit-old-at-bound-new-after-bound`, `take.ts:588 push-edit-old-after-bound-new-inside-displace`, `take.ts:657 push-edit-old-inside-new-outside-bound`. The UPDATE moves m-1 from body-sort position 5 to position 0 — crossing the window for `.orderBy('body').limit(N)` queries with N ∈ {1, 2, 5}.
 
-The alternative reading: these branches exist in TS source but are not reachable by any query shape the xyne-like fuzz corpus can generate (e.g. Take edit-moves-inside-window requires both a query and an Edit on the ordering key; simple orderBy queries with the current mutation block don't cross the bound). Every branch has a source-level mirror in RS (or a documented skip — see commit `1fcb9f083`); the branches simply aren't executed, which is a harness-coverage limit, not a parity limit.
+**Still cold (13 branches):**
+
+- `builder.ts:621 apply-correlated-subquery-limit0-skip` — requires a CSQ with `limit: 0`. The fuzz corpus generator never emits `limit: 0`. Extending it would be a generator change.
+- `exists.ts:170/205 push-child-{add,remove}-size-gt1-push-with-filter` — requires an EXISTS where the parent already has ≥2 matching children and then a child is added/removed WITH a downstream filter. The p6_exists_size_gt1 AST has ≥2 children but no downstream filter. Would need a WHERE clause over the EXISTS's parent to trigger the filter path.
+- `filter-push.ts:15 filter-push-no-predicate` — TS internal `filterPush` called with undefined predicate. Not produced by `buildPipeline`; probably only reachable from internal test scaffolding.
+- `filter-push.ts:27 filter-pass` — child-change filter-pass. Specific shape not in corpus.
+- `flipped-join.ts:330 push-child-child` — FlippedJoin grandchild. See FlippedJoin status below.
+- `skip.ts:46 fetch-empty` — Skip over empty input. Every corpus query with a Skip has ≥1 row upstream.
+- `skip.ts:92 push-pass` — Skip pass-through on push. All Skip queries in corpus hit the drop path.
+- `take.ts:344 push-remove-no-bound-skip` — Remove on an under-limit Take. Corpus mutations tend to hit at-limit cases.
+- `take.ts:482/483 push-edit-old-at-bound-new-before-bound(-limit1)` — requires a row AT position N-1 that moves to position <N-1. The m-1 UPDATE moves m-1 from position 5 (outside top-2) to position 0 (inside), so it hits 588/657 but not 482/483. Needs a mutation on a row that starts at position N-1 exactly.
+- `union-fan-in.ts:167 push-internal-other-branch-has-row-skip` — UnionFanIn dedup when the same row matches two branches. p6_or_overlap is supposed to hit this; may need the mutation block to ALSO cause a row to be tested by both branches simultaneously.
+- `union-fan-in.ts:196 fan-out-done-no-inputs` — UnionFanIn with 0 branches. Cannot be constructed from a valid OR. Dead branch.
+
+## FlippedJoin port status (task #181)
+
+TS `builder.ts:459-478` creates `new FlippedJoin({...})` for every CSQ with `flip: true`. RS currently routes `flip:true` CSQs through `ExistsT` with the cap disabled — same output on all 1060 tested ASTs, but not a literal port. A full-port attempt was made and reverted:
+
+- `ivm_v2/flipped_join.rs` already has a FlippedJoin operator (used by its own `#[cfg(test)]` tests). Wiring attempt added `FlippedJoinStage` to `Chain` and routed `es.flip == true` through `FlippedJoin::new` instead of `ExistsT`.
+- Wiring passed all 578 existing cargo tests but regressed fuzz_00782 and fuzz_00985 (nested `whereExists('conversation' → 'channel' → cmp)`): TS emitted the inner `channels` row, RS did not.
+- Attempted fix: swap `flipped_join.rs`'s schema from child-shape to parent-shape (to match TS `flipped-join.ts:77-89`). Didn't resolve the regression.
+- **Reverted** the port. RS is back to `ExistsT`-with-cap-disabled for `flip:true`. Behavior parity preserved at 1060/1060.
+
+The literal port remains open. The regression root cause is in how the outer FlippedJoin ingests a nested sub-Chain that itself contains FlippedJoin stages — the nested child rows don't propagate through `emit_node_subtree`'s recursion even though the exists_child_tables entries are present. Fixing this likely requires the FlippedJoin's output-node relationships map to preserve the inner sub-Chain's decorations, which currently gets dropped somewhere in the `children.clone()` cycle inside `FlippedJoin::fetch` lines 392-410. Not fixed in this pass.

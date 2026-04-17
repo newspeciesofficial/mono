@@ -89,6 +89,28 @@ const MUTATIONS: Step[] = [
     run: `UPDATE channels SET visibility = 'private' WHERE id = 'ch-test-1'`,
     undo: ``,
   },
+  // Phase 6 coverage extension: this UPDATE changes a column used in
+  // p6_take_* queries' `.orderBy('body')`, and the new body value
+  // ('aaa-…') sorts before every existing message body. Net effect for
+  // a `messages.orderBy('body').limit(N)` query:
+  //   N=1: m-1 (old pos=5 in body-asc) moves to pos 0 — OUTSIDE→INSIDE
+  //        bound (take.ts:588 push-edit-old-after-bound-new-inside-displace).
+  //   N=5: m-1 moves from pos 5 (edge) to pos 0 — INSIDE→INSIDE
+  //        (take.ts:476 push-edit-old-at-bound-new-at-bound) and
+  //        (take.ts:482/528 edit-old-at-bound-new-before/after-bound).
+  // Without this, the Take edit-transition branches in take.ts stay
+  // cold in the sweep; no other UPDATE in the block touches an orderBy
+  // column on a row that's positioned near a Take window edge. This is
+  // additive: purely a new mutation step, no existing assertion altered.
+  {
+    label: 'update m-1 body to sort-first (Take edit-transition coverage)',
+    run: `UPDATE messages SET body = 'aaa-phase6-edit' WHERE id = 'm-1'`,
+    // m-1 is a pre-existing seed row (unlike m-test-1 which an earlier
+    // step inserts and a later reverse-order cleanup deletes), so this
+    // UPDATE must be reversed explicitly between batches. Hard-coded
+    // body revert to match `seed.sql`'s value for m-1.
+    undo: `UPDATE messages SET body = 'hi team' WHERE id = 'm-1'`,
+  },
 ];
 
 // ---------------------------------------------------------------------------
