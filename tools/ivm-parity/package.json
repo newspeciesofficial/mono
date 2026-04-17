@@ -14,13 +14,14 @@
 
     "fuzz": "tsx ast-fuzz.ts",
     "seed-corpus": "tsx seed-extractor.ts",
+    "synth-p6": "tsx synth-p6.ts",
     "refresh-stats": "tsx refresh-stats.ts",
     "sweep:hydrate": "tsx harness-coverage.ts",
     "sweep:advance": "tsx harness-advance-coverage.ts",
     "report": "tsx parity-report.ts",
 
     "test-rs": "cargo test --manifest-path ../../packages/zero-cache-rs/crates/sync-worker/Cargo.toml",
-    "test": "npm run fuzz && npm run seed-corpus && npm run refresh-stats && npm run sweep:hydrate && npm run sweep:advance && npm run report && cat parity_report.md | head -30",
+    "test": "npm run fuzz && npm run seed-corpus && npm run synth-p6 && npm run refresh-stats && npm run sweep:hydrate && npm run sweep:advance && npm run report && cat parity_report.md | head -30",
 
     "harness-legacy": "tsx harness.ts"
   },
