@@ -319,15 +319,22 @@ function sleep(ms: number): Promise<void> {
 async function cleanupDb(sql: postgres.Sql): Promise<void> {
   for (const step of [...MUTATIONS].reverse()) {
     if (step.undo) {
-      try { await sql.unsafe(step.undo); } catch {}
+      try { await sql.unsafe(step.undo); } catch (e) {
+        console.error(`[cleanupDb] undo failed: ${(e as Error).message}`);
+      }
     }
   }
   // Defensive explicit deletes by ID — survive across MUTATIONS edits.
-  await sql`DELETE FROM attachments WHERE id = 'a-test-1'`;
-  await sql`DELETE FROM messages WHERE id = 'm-test-1'`;
-  await sql`DELETE FROM conversations WHERE id = 'co-test-1'`;
-  await sql`DELETE FROM participants WHERE "userId" = 'u1' AND "channelId" = 'ch-test-1'`;
-  await sql`DELETE FROM channels WHERE id = 'ch-test-1'`;
+  try {
+    await sql`DELETE FROM attachments WHERE id = 'a-test-1'`;
+    await sql`DELETE FROM messages WHERE id = 'm-test-1'`;
+    await sql`DELETE FROM conversations WHERE id = 'co-test-1'`;
+    await sql`DELETE FROM participants WHERE "userId" = 'u1' AND "channelId" = 'ch-test-1'`;
+    await sql`DELETE FROM channels WHERE id = 'ch-test-1'`;
+  } catch (e) {
+    console.error(`[cleanupDb] explicit DELETE failed: ${(e as Error).message}`);
+    throw e;
+  }
   await sleep(CLEANUP_WAIT_MS);
 }
 

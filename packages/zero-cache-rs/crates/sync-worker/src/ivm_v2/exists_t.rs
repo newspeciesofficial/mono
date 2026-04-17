@@ -186,6 +186,57 @@ impl ExistsT {
         self.should_forward(node)
     }
 
+    /// Attach the relationship factory that yields matching child
+    /// rows to `node.relationships[relationship_name]`. Mirror of TS
+    /// `Join#processParentNode` at `packages/zql/src/ivm/join.ts:253-295`
+    /// which inserts `{...parentNodeRelations, [relationshipName]: childStream}`
+    /// where `childStream` calls `this.#child.fetch({constraint})`.
+    /// Called from `ExistsT::push` so downstream `Streamer#streamNodes`
+    /// emits the subquery rows. Matches TS's upfront Join behavior
+    /// established at `packages/zql/src/builder/builder.ts:308-329`.
+    /// For NOT EXISTS, we explicitly skip decoration because the
+    /// subquery's rows belong to the EXCLUDED parents
+    /// (mirror of exists.ts:142-154 emptying the relationship).
+    fn decorate_push_node(&mut self, node: &mut Node) {
+        if self.not {
+            return;
+        }
+        let Some(child) = self.child_input.as_mut() else {
+            return;
+        };
+        let Some(constraint) = build_join_constraint(
+            &node.row,
+            &self.parent_join_key,
+            &self.child_key,
+        ) else {
+            return;
+        };
+        let matched: Vec<Node> = child
+            .fetch(FetchRequest {
+                constraint: Some(constraint),
+                ..FetchRequest::default()
+            })
+            .collect();
+        if matched.is_empty() {
+            return;
+        }
+        use crate::ivm::data::{NodeOrYield, RelationshipFactory};
+        use std::sync::Mutex;
+        let rel_name = self.relationship_name.clone();
+        let cell = std::sync::Arc::new(Mutex::new(Some(matched)));
+        let factory: RelationshipFactory = Box::new(move || {
+            let taken = cell
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take())
+                .unwrap_or_default();
+            Box::new(taken.into_iter().map(NodeOrYield::Node))
+        });
+        node.relationships
+            .entry(rel_name)
+            .or_insert(factory);
+    }
+
     fn should_forward(&mut self, node: &Node) -> bool {
         // Legacy "do we forward?" entry point used by `push`. When the
         // child input is wired in, this re-fetches the subquery each
@@ -740,17 +791,46 @@ impl Transformer for ExistsT {
             );
         }
         self.in_push = true;
+        // Decorate the emitted parent's relationships with the
+        // matching children so downstream Streamer#streamNodes (our
+        // `emit_node_subtree`) can emit the subquery rows alongside
+        // the parent. Mirror of TS `buildPipelineInternal` at
+        // `packages/zql/src/builder/builder.ts:308-329` which inserts
+        // an UPFRONT `applyCorrelatedSubQuery` Join BEFORE the
+        // `applyCorrelatedSubqueryCondition` Exists for every
+        // non-flip EXISTS, with `subquery.limit = EXISTS_LIMIT` (3).
+        // The Join's `#processParentNode` at `join.ts:253-295`
+        // decorates parent rows with the relationship factory. RS
+        // absorbs the Join's role into ExistsT — the net effect on
+        // node.relationships is the same, and downstream Streamer
+        // emission behaves identically.
+        let decorate = |node: Node, this: &mut ExistsT| -> Node {
+            let mut n = node;
+            this.decorate_push_node(&mut n);
+            n
+        };
         let out = match change {
-            Change::Add(AddChange { ref node }) | Change::Remove(RemoveChange { ref node }) => {
-                if self.should_forward(node) {
-                    Some(change)
+            Change::Add(AddChange { node }) => {
+                if self.should_forward(&node) {
+                    Some(Change::Add(AddChange { node: decorate(node, self) }))
                 } else {
                     None
                 }
             }
-            Change::Child(ref c) => {
+            Change::Remove(RemoveChange { node }) => {
+                if self.should_forward(&node) {
+                    Some(Change::Remove(RemoveChange { node: decorate(node, self) }))
+                } else {
+                    None
+                }
+            }
+            Change::Child(c) => {
                 if self.should_forward(&c.node) {
-                    Some(change)
+                    let decorated_node = decorate(c.node, self);
+                    Some(Change::Child(ChildChange {
+                        node: decorated_node,
+                        child: c.child,
+                    }))
                 } else {
                     None
                 }
