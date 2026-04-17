@@ -15,12 +15,44 @@ use super::operator::{FetchRequest, Transformer};
 pub type Predicate = Arc<dyn Fn(&Row) -> bool + Send + Sync>;
 
 pub struct FilterT {
+    /// Fetch-time predicate — mirror of TS's SQL-backed fetch path
+    /// (SQLite WHERE semantics). Used by `fetch_through` which runs
+    /// during hydrate and on re-fetches.
     predicate: Predicate,
+    /// Push-time predicate — mirror of TS's JS `createPredicate` at
+    /// `packages/zql/src/builder/filter.ts:87-93`, which returns
+    /// `false` for any NULL LHS column EXCEPT for `IS` / `IS NOT`
+    /// operators. This differs from SQL semantics only for specific
+    /// ops like `NOT IN []` on nullable columns: SQL returns TRUE
+    /// (`NULL NOT IN (empty set)` → 1); TS's push-time JS predicate
+    /// returns FALSE. When the caller doesn't supply a separate push
+    /// predicate, falls back to `predicate` (unchanged behaviour).
+    /// See fuzz_00673 canary: `messages.where('visibleTo', 'NOT IN',
+    /// [])` — at push the `m-test-1` insert with visibleTo=NULL must
+    /// NOT flow through, matching TS's push-time drop.
+    push_predicate: Predicate,
 }
 
 impl FilterT {
     pub fn new(predicate: Predicate) -> Self {
-        Self { predicate }
+        let push = Arc::clone(&predicate);
+        Self {
+            predicate,
+            push_predicate: push,
+        }
+    }
+
+    /// Construct with separate fetch vs push predicates. Used by the
+    /// AST builder when a WHERE contains ops whose SQL and JS
+    /// semantics differ (see the `push_predicate` doc above).
+    pub fn with_push_predicate(
+        fetch_predicate: Predicate,
+        push_predicate: Predicate,
+    ) -> Self {
+        Self {
+            predicate: fetch_predicate,
+            push_predicate,
+        }
     }
 }
 
@@ -48,27 +80,27 @@ impl Transformer for FilterT {
         }
         let out: Option<Change> = match change {
             Change::Add(AddChange { ref node }) => {
-                if (self.predicate)(&node.row) {
+                if (self.push_predicate)(&node.row) {
                     Some(change)
                 } else {
                     None
                 }
             }
             Change::Remove(RemoveChange { ref node }) => {
-                if (self.predicate)(&node.row) {
+                if (self.push_predicate)(&node.row) {
                     Some(change)
                 } else {
                     None
                 }
             }
             Change::Child(ref c) => {
-                if (self.predicate)(&c.node.row) {
+                if (self.push_predicate)(&c.node.row) {
                     Some(change)
                 } else {
                     None
                 }
             }
-            Change::Edit(edit) => maybe_split_edit(edit, &*self.predicate),
+            Change::Edit(edit) => maybe_split_edit(edit, &*self.push_predicate),
         };
         Box::new(out.into_iter())
     }

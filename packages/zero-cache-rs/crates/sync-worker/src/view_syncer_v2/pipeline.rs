@@ -37,6 +37,13 @@ pub struct ChainSpec {
     pub table: String,
     pub primary_key: PrimaryKey,
     pub predicate: Option<Predicate>,
+    /// Push-time predicate — mirror of TS `Connection.filters.predicate`
+    /// at `packages/zqlite/src/table-source.ts:253-256`. Differs from
+    /// `predicate` only on NULL-LHS handling (see
+    /// `ast_builder::build_push_predicate` doc). When `None`, falls
+    /// back to `predicate` (same closure for fetch and push). Driven
+    /// by the AST builder; see the `eval` split inside `SimpleClause`.
+    pub push_predicate: Option<Predicate>,
     pub skip_bound: Option<Bound>,
     pub limit: Option<usize>,
     pub exists: Option<ExistsSpec>,
@@ -471,7 +478,17 @@ impl Chain {
         let mut transformers: Vec<Box<dyn Transformer>> = Vec::new();
         let comparator = std::sync::Arc::clone(&source.get_schema().compare_rows);
         if let Some(predicate) = spec.predicate {
-            transformers.push(Box::new(FilterT::new(predicate)));
+            // Mirror of TS `Connection.filters = {condition, predicate}`
+            // at `packages/zqlite/src/table-source.ts:253-256` — SQL
+            // semantics for fetch, TS-JS `createPredicate` for push.
+            // When the AST builder supplies a distinct push predicate
+            // (via `build_push_predicate`), wire it through; otherwise
+            // the same predicate covers both modes.
+            let filter = match spec.push_predicate {
+                Some(push) => FilterT::with_push_predicate(predicate, push),
+                None => FilterT::new(predicate),
+            };
+            transformers.push(Box::new(filter));
         }
         if let Some(bound) = spec.skip_bound {
             transformers.push(Box::new(SkipT::new(bound, std::sync::Arc::clone(&comparator))));

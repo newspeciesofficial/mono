@@ -57,6 +57,7 @@ fn hydrate_filter_only() {
         table: "t".into(),
         primary_key: PrimaryKey::new(vec!["id".into()]),
         predicate: Some(predicate_flag_true()),
+        push_predicate: None,
         skip_bound: None,
         limit: None,
         exists: None,
@@ -80,6 +81,7 @@ fn hydrate_filter_then_skip() {
         table: "t".into(),
         primary_key: PrimaryKey::new(vec!["id".into()]),
         predicate: Some(predicate_flag_true()),
+        push_predicate: None,
         // Skip anything <= id=3.
         skip_bound: Some(Bound {
             row: row(3, true),
@@ -120,6 +122,7 @@ fn advance_multi_op_push_propagates_through_chain() {
         table: "t".into(),
         primary_key: PrimaryKey::new(vec!["id".into()]),
         predicate: Some(predicate_flag_true()),
+        push_predicate: None,
         skip_bound: Some(Bound {
             row: row(3, true),
             exclusive: true,
@@ -192,6 +195,7 @@ fn hydrate_with_join_decorates_parent_with_children() {
         table: "users".into(),
         primary_key: PrimaryKey::new(vec!["id".into()]),
         predicate: None,
+        push_predicate: None,
         skip_bound: None,
         limit: None,
         exists: None,
@@ -230,6 +234,7 @@ fn advance_with_take_at_limit_refetches_new_bound() {
         table: "t".into(),
         primary_key: PrimaryKey::new(vec!["id".into()]),
         predicate: Some(predicate_flag_true()),
+        push_predicate: None,
         skip_bound: None,
         limit: Some(2),
         exists: None,

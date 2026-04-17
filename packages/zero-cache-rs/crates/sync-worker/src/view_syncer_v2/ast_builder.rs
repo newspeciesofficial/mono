@@ -62,6 +62,16 @@ pub fn ast_to_chain_spec(
         None => None,
         Some(cond) => Some(build_predicate(cond)?),
     };
+    // Push predicate — mirror of TS
+    // `Connection.filters.predicate = createPredicate(filters)` at
+    // `packages/zqlite/src/table-source.ts:253-256`. Same AST, but
+    // evaluated with TS-JS NULL-LHS semantics (filter.ts:87-93) so
+    // at push time rows with NULL-in-a-filtered-column are dropped
+    // regardless of the op — matching TS push behaviour.
+    let push_predicate = match ast.where_clause.as_deref() {
+        None => None,
+        Some(cond) => Some(build_push_predicate(cond)?),
+    };
 
     let skip_bound = ast.start.as_ref().map(ast_bound_to_v2);
 
@@ -178,6 +188,7 @@ pub fn ast_to_chain_spec(
         table: ast.table.clone(),
         primary_key,
         predicate,
+        push_predicate,
         skip_bound,
         limit: ast.limit.map(|l| l as usize),
         exists,
@@ -292,6 +303,13 @@ fn flip_condition_if_leaf_exists_or(cond: &mut Condition) {
                     }
                 }
             }
+            // Mixed-branch ORs (CSQ sitting next to non-CSQ branches)
+            // are NOT handled here: TS's planner decision is cost-based
+            // (`packages/zql/src/planner/planner-builder.ts`), and any
+            // heuristic RS adds without porting the cost model risks
+            // tailoring to specific queries rather than mirroring TS.
+            // A future port of the cost model should replace this
+            // narrow pass entirely.
             // Recurse into every branch so nested OR-of-leaf-EXISTS
             // (even if this outer OR didn't qualify) still gets
             // flipped. Matches TS walking every sub-condition in
@@ -384,7 +402,39 @@ pub enum AstBuildError {
 
 fn build_predicate(cond: &Condition) -> Result<Predicate, AstBuildError> {
     let tree = build_predicate_tree(cond)?;
-    Ok(Arc::new(move |row: &Row| tree.eval(row)))
+    Ok(Arc::new(move |row: &Row| tree.eval(row, /*push_mode=*/false)))
+}
+
+/// Mirror of TS `createPredicate` at
+/// `packages/zql/src/builder/filter.ts:26-94`. The TS JS predicate
+/// — stored on `Connection.filters.predicate` at `table-source.ts:
+/// 253-256` and invoked at push time via `filterPush` at
+/// `filter-push.ts:21` — differs from SQL-fetch semantics on NULL
+/// LHS: for any op that is NOT `IS` / `IS NOT`, TS's predicate returns
+/// FALSE for a NULL-or-undefined LHS column (filter.ts:87-93):
+///
+/// ```ignore
+///   return (row: Row) => {
+///     const lhs = row[left.name];
+///     if (lhs === null || lhs === undefined) {
+///       return false;
+///     }
+///     return impl(lhs);
+///   };
+/// ```
+///
+/// This matters for operators where the SQL answer for NULL differs
+/// — e.g. SQLite `NULL NOT IN (SELECT FROM json_each('[]'))` returns
+/// TRUE, but the TS JS predicate returns FALSE. RS must match the JS
+/// predicate at push time (fuzz_00673 canary).
+///
+/// The same `build_predicate_tree` is used; only the `eval` call-site
+/// passes `push_mode=true`, which flips the NULL-LHS fallback in
+/// `SimpleClause::eval` — see the `match self.op` inside that
+/// function.
+fn build_push_predicate(cond: &Condition) -> Result<Predicate, AstBuildError> {
+    let tree = build_predicate_tree(cond)?;
+    Ok(Arc::new(move |row: &Row| tree.eval(row, /*push_mode=*/true)))
 }
 
 fn build_predicate_tree(cond: &Condition) -> Result<PredicateNode, AstBuildError> {
@@ -455,11 +505,18 @@ enum PredicateNode {
 }
 
 impl PredicateNode {
-    fn eval(&self, row: &Row) -> bool {
+    /// `push_mode = true` mirrors TS `createPredicate` at
+    /// `packages/zql/src/builder/filter.ts:87-93` which returns FALSE
+    /// for any NULL-or-undefined LHS column (except `IS`/`IS NOT`,
+    /// which are handled before the NULL-LHS guard at filter.ts:62-71).
+    /// `push_mode = false` preserves the SQLite/SQL-fetch semantics
+    /// (`NULL NOT IN (empty)` → TRUE, etc. — mirror of TS
+    /// `zqlite/src/query-builder.ts:125-134`).
+    fn eval(&self, row: &Row, push_mode: bool) -> bool {
         match self {
-            PredicateNode::Simple(c) => c.eval(row),
-            PredicateNode::And(cs) => cs.iter().all(|c| c.eval(row)),
-            PredicateNode::Or(cs) => cs.iter().any(|c| c.eval(row)),
+            PredicateNode::Simple(c) => c.eval(row, push_mode),
+            PredicateNode::And(cs) => cs.iter().all(|c| c.eval(row, push_mode)),
+            PredicateNode::Or(cs) => cs.iter().any(|c| c.eval(row, push_mode)),
             PredicateNode::AlwaysTrue => true,
             PredicateNode::AlwaysFalse => false,
         }
@@ -527,25 +584,42 @@ struct SimpleClause {
 }
 
 impl SimpleClause {
-    fn eval(&self, row: &Row) -> bool {
+    fn eval(&self, row: &Row, push_mode: bool) -> bool {
         let lhs = match row.get(&self.column) {
             Some(Some(v)) => v,
             _ => {
-                // NULL lhs handling — mirrors SQLite semantics as used by TS's
-                // zqlite/src/query-builder.ts:125-134 (IN/NOT IN → json_each).
+                // NULL lhs handling splits on mode:
                 //
-                // SQLite: `NULL NOT IN (SELECT value FROM json_each('[]'))` → 1 (true)
-                //         `NULL NOT IN (SELECT value FROM json_each('[...]'))` → 0 (false)
-                //         `NULL IN (anything)` → 0 (false)
+                //   `push_mode = true` mirrors TS `createPredicate` at
+                //   `packages/zql/src/builder/filter.ts:62-93`. IS / IS NOT
+                //   are special-cased at filter.ts:62-71 (createIsPredicate)
+                //   so they still compare against NULL directly; for every
+                //   OTHER operator the function returns FALSE for a
+                //   NULL-or-undefined LHS (filter.ts:87-93:
+                //   `if (lhs === null || lhs === undefined) return false`).
                 //
-                // For IS/IS NOT, compare against NULL directly.
-                // For NOT IN, return true iff the rhs array is empty.
-                // Everything else → false.
+                //   `push_mode = false` mirrors TS's SQL-fetch semantics
+                //   (via SQLite `json_each` for IN/NOT IN — see TS
+                //   `zqlite/src/query-builder.ts:125-134`):
+                //     - `NULL NOT IN (SELECT FROM json_each('[]'))` → 1
+                //       (TRUE, because the set is empty)
+                //     - `NULL NOT IN (SELECT FROM json_each('[...]'))` → 0
+                //       (NULL/FALSE in SQL three-valued logic)
+                //     - `NULL IN (anything)` → 0
+                //
+                // Keeping both in one `eval` preserves RS's single-
+                // predicate-tree + two-invocation pattern (one for fetch,
+                // one for push) that mirrors TS's dual-storage on
+                // `Connection.filters` at `table-source.ts:253-256`:
+                // `{condition, predicate}` — SQL for fetch, JS for push.
                 return match self.op {
                     SimpleOperator::IsNot => !self.rhs.is_null(),
                     SimpleOperator::IS => self.rhs.is_null(),
-                    // mirrors TS: zqlite/src/query-builder.ts:125-134
-                    SimpleOperator::NotIn => matches!(&self.rhs, serde_json::Value::Array(xs) if xs.is_empty()),
+                    _ if push_mode => false,
+                    // push_mode = false → SQL-fetch semantics.
+                    SimpleOperator::NotIn => {
+                        matches!(&self.rhs, serde_json::Value::Array(xs) if xs.is_empty())
+                    }
                     _ => false,
                 };
             }
@@ -762,9 +836,27 @@ fn collect_branch_parts(
             }
             Ok(())
         }
-        // Nested OR inside an OR branch would require another layer
-        // of UnionFanOut/FanIn — scope limit; caller falls back.
-        Condition::Or { .. } => Err(()),
+        Condition::Or { .. } => {
+            // Nested OR inside an OR branch is ONLY supported when it
+            // contains no CSQ — then it's a pure scalar disjunction
+            // which `build_predicate_tree` handles natively via its
+            // `PredicateNode::Or` case. Push the whole sub-OR as a
+            // single scalar and let the predicate compiler fold it.
+            //
+            // If the nested OR contains CSQs we'd need another layer
+            // of UnionFanOut/FanIn — leave that as the fall-back so
+            // the caller can retry via the legacy exists_chain path.
+            //
+            // Mirror of TS `applyFilterWithFlips` OR case which
+            // recursively calls `applyOr` for the non-flipped branch
+            // only when it has no flipped CSQs (builder.ts:422-435).
+            if condition_has_correlated_subquery(cond) {
+                Err(())
+            } else {
+                scalars.push(cond.clone());
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1037,20 +1129,32 @@ mod tests {
         let spec =
             ast_to_chain_spec(&ast, "q1".into(), PrimaryKey::new(vec!["id".into()])).unwrap();
         let p = spec.predicate.unwrap();
+        let push_p = spec.push_predicate.unwrap();
 
-        // Row with NULL visibleTo — must pass (mirrors SQLite: NULL NOT IN () → true).
+        // Row with NULL visibleTo — fetch predicate (SQL semantics)
+        // passes (mirrors SQLite: NULL NOT IN () → true).
         let mut null_row = Row::new();
         null_row.insert("visibleTo".into(), None); // NULL
-        assert!(p(&null_row), "NULL NOT IN [] must be true (mirrors TS SQLite semantics)");
+        assert!(p(&null_row), "NULL NOT IN [] must be true at fetch (mirrors TS SQLite semantics)");
 
-        // Row with a non-null visibleTo — also passes (empty set, nothing to exclude).
+        // Push predicate mirrors TS `createPredicate`
+        // (packages/zql/src/builder/filter.ts:87-93): for any op
+        // that isn't IS/IS NOT, NULL LHS → false.
+        assert!(
+            !push_p(&null_row),
+            "NULL NOT IN [] must be false at push (mirrors TS createPredicate: NULL lhs → false)"
+        );
+
+        // Row with a non-null visibleTo — also passes under both.
         let mut non_null_row = Row::new();
         non_null_row.insert("visibleTo".into(), Some(json!("u1")));
         assert!(p(&non_null_row), "non-null NOT IN [] must be true");
+        assert!(push_p(&non_null_row), "non-null NOT IN [] must be true at push too");
 
-        // Column missing entirely (also treated as NULL by Row::get returning None).
+        // Column missing entirely (also treated as NULL).
         let empty_row = Row::new();
-        assert!(p(&empty_row), "missing column (NULL) NOT IN [] must be true");
+        assert!(p(&empty_row), "missing column NOT IN [] must be true at fetch");
+        assert!(!push_p(&empty_row), "missing column NOT IN [] must be false at push");
     }
 
     /// Complement: `NOT IN [non-empty]` with NULL column must be false.
