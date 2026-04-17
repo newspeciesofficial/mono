@@ -30,7 +30,7 @@
 
 use indexmap::IndexMap;
 
-use super::change::{Change, Node};
+use super::change::{AddChange, Change, EditChange, Node, RemoveChange};
 use super::exists_t::ExistsT;
 use super::filter_t::Predicate;
 use super::operator::{FetchRequest, Transformer};
@@ -187,12 +187,20 @@ impl Transformer for OrBranchesT {
 
     fn push<'a>(&'a mut self, change: Change) -> Box<dyn Iterator<Item = Change> + 'a> {
         // Push path: mirror TS non-flipped `applyOr`
-        // (`builder.ts:514-557`) — row passes iff any branch's
-        // Exists filter passes. Decorations are not rewritten onto
-        // the emitted change today; the Chain's separate child-push
-        // routing handles relationship-bearing emissions (see
-        // `Chain::advance_child_recursive`). Future work for #148:
-        // re-emit a decorated Add to mirror TS UnionFanIn push.
+        // (`builder.ts:514-557` + `union-fan-in.ts` push path). Row
+        // passes iff any branch passes. A passing branch's ExistsT
+        // has populated `cur.relationships[<rel>]` via evaluate_decorate
+        // — we must carry those decorations forward on the emitted
+        // change so the Streamer emits subquery rows (channels for
+        // `exists('channel')`, etc.).
+        //
+        // I missed the decoration-forward in RS originally — only the
+        // raw `change` was re-emitted, so downstream saw a parent
+        // node with empty relationships and the Streamer skipped
+        // emitting the subquery row (TS equivalent at
+        // `packages/zero-cache/src/services/view-syncer/pipeline-driver.ts:1027-1030`
+        // walks `node.relationships[name]()` to emit child rows).
+        // Adding: re-emit the Change with the decorated node.
         let probe_node = change_node(&change);
         let mut cur = Node {
             row: probe_node.row.clone(),
@@ -206,11 +214,26 @@ impl Transformer for OrBranchesT {
                 any_pass = true;
             }
         }
-        if any_pass {
-            Box::new(std::iter::once(change))
-        } else {
-            Box::new(std::iter::empty())
+        if !any_pass {
+            return Box::new(std::iter::empty());
         }
+        // Rewrite the change with the decorated node so downstream
+        // operators + the Streamer walk the populated relationships.
+        let decorated_change = match change {
+            Change::Add(_) => Change::Add(AddChange { node: cur }),
+            Change::Remove(_) => Change::Remove(RemoveChange { node: cur }),
+            Change::Edit(e) => {
+                // Edit carries separate old+new node. Only rewrite `node`
+                // (the post-edit row). The pre-edit `old_row` remains
+                // untouched — TS `Change::edit` does the same.
+                Change::Edit(EditChange {
+                    node: cur,
+                    old_node: e.old_node,
+                })
+            }
+            Change::Child(_) => change,
+        };
+        Box::new(std::iter::once(decorated_change))
     }
 
     fn push_child<'a>(
