@@ -114,8 +114,13 @@ pub trait Transformer: Send {
     }
 
     /// Receives rows fulfilling a previously-signalled refetch request.
-    /// Default: drop the rows (no-op for transformers that never request).
-    fn ingest_refetch(&mut self, _rows: Vec<crate::ivm::data::Node>) {}
+    /// Default: drop the rows and emit nothing. TakeT's Remove-path
+    /// refetch returns `Vec::[Change::Add(replacementRow)]` so the
+    /// Chain can propagate the replacement downstream in the same
+    /// advance cycle (mirror of TS take.ts:411-417).
+    fn ingest_refetch(&mut self, _rows: Vec<crate::ivm::data::Node>) -> Vec<Change> {
+        Vec::new()
+    }
 
     /// Child-side push, mirroring TS `Exists`/`Join` `#pushChild` flow
     /// (`packages/zql/src/ivm/exists.ts:120` / `join.ts:190`).

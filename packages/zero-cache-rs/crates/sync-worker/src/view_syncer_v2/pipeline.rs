@@ -1529,7 +1529,14 @@ impl Chain {
                 next.extend(emissions);
                 if let Some(req) = t.take_pending_refetch() {
                     let rows = fetch_prefix(&mut *self.source, preceding, req);
-                    t.ingest_refetch(rows);
+                    // Mirror of TS take.ts:411-417: when the refetch
+                    // came from a Remove-within-bound path, the
+                    // ingested row becomes the new bound AND must be
+                    // emitted downstream as `Change::Add`. Propagate
+                    // any such emission so the next transformer's push
+                    // picks it up in the same advance cycle.
+                    let refetch_emissions = t.ingest_refetch(rows);
+                    next.extend(refetch_emissions);
                 }
             }
             buf = next;
@@ -1555,7 +1562,14 @@ impl Chain {
                 next.extend(emissions);
                 if let Some(req) = t.take_pending_refetch() {
                     let rows = fetch_prefix(&mut *self.source, preceding, req);
-                    t.ingest_refetch(rows);
+                    // Mirror of TS take.ts:411-417: when the refetch
+                    // came from a Remove-within-bound path, the
+                    // ingested row becomes the new bound AND must be
+                    // emitted downstream as `Change::Add`. Propagate
+                    // any such emission so the next transformer's push
+                    // picks it up in the same advance cycle.
+                    let refetch_emissions = t.ingest_refetch(rows);
+                    next.extend(refetch_emissions);
                 }
             }
             buf = next;

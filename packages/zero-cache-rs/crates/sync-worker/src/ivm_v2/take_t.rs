@@ -54,6 +54,15 @@ pub struct TakeT {
     /// Pending refetch set during push, drained by Chain on
     /// `take_pending_refetch`.
     pending_refetch: Option<FetchRequest>,
+    /// When `true`, a pending refetch was set by the Remove-within-bound
+    /// path (TS take.ts:354-417). The ingested row (if any) must be
+    /// emitted downstream as `Change::Add` and recorded as the new
+    /// bound, mirroring TS's `yield* this.#output.push({type:'add',
+    /// node: newBound.node}, this)` at take.ts:411-417. When `false`,
+    /// the refetch was set by an Add-displaces-bound path (TS
+    /// take.ts:280-291) where the emitted Add has already gone
+    /// downstream — ingest_refetch only updates state.
+    pending_refetch_emit_add: bool,
 }
 
 impl TakeT {
@@ -77,6 +86,7 @@ impl TakeT {
             states: HashMap::new(),
             compare_rows,
             pending_refetch: None,
+            pending_refetch_emit_add: false,
         }
     }
 }
@@ -289,6 +299,10 @@ impl TakeT {
                             }),
                             ..FetchRequest::default()
                         });
+                        // Add-path refetch is bound-update-only — the
+                        // Add(node) has already been emitted above.
+                        // `ingest_refetch` must not emit anything.
+                        self.pending_refetch_emit_add = false;
                     } else {
                         // mirrors TS take.ts:278
                         if std::env::var("IVM_PARITY_TRACE").is_ok() {
@@ -344,11 +358,39 @@ impl TakeT {
                     return out;
                 }
                 let was_bound = cmp == CmpOrdering::Equal;
+                // Capture OLD bound before we clear it — the refetch
+                // must use the old bound as its `start` per TS
+                // take.ts:355-359 (`start: { row: takeState.bound,
+                // basis: 'after' }`). Using the removed row as start
+                // instead would return a row already in the window.
+                let old_bound = bound.clone();
                 let s = self.states.entry(key).or_default();
                 s.size = s.size.saturating_sub(1);
+                // Mirror of TS take.ts:354-418: when a row within the
+                // window is removed, fetch the next row AFTER the old
+                // bound to promote into the window. If a replacement
+                // exists, TS emits Remove(change) + Add(newBound) and
+                // updates the bound. If not, emits only Remove and
+                // clears the bound. Previously RS only emitted Remove
+                // and cleared the bound — leaving the window at size-1
+                // permanently, breaking LIMIT N after any within-bound
+                // remove (BEH-5 in PARITY-DIVERGENCES.md). We use the
+                // same `pending_refetch` two-phase mechanism the Add
+                // path uses: set the request here, emit Remove, and
+                // `ingest_refetch` emits the Add(newBound) once the
+                // Chain drives the source fetch.
+                s.bound = None;
+                let constraint = self.partition_constraint_for(&node.row);
+                self.pending_refetch = Some(FetchRequest {
+                    start: Some(Start {
+                        row: old_bound,
+                        basis: StartBasis::After,
+                    }),
+                    constraint,
+                    ..FetchRequest::default()
+                });
+                self.pending_refetch_emit_add = true;
                 if was_bound {
-                    s.bound = None;
-                    // Will be re-established by next fetch/refetch.
                     // mirrors TS take.ts:420
                     if std::env::var("IVM_PARITY_TRACE").is_ok() {
                         eprintln!("[ivm:rs:take.ts:418:push-remove-within-bound-no-replacement]");
@@ -417,23 +459,61 @@ impl TakeT {
         out
     }
 
-    fn ingest_refetch(&mut self, rows: Vec<Node>) {
-        // Chain hands back the next row(s) after a pending_refetch. The
-        // refetch only fires from an at-limit eviction in the active
-        // partition, so the first returned row becomes that partition's
-        // new bound. Route by the returned row's partition key to stay
-        // partition-correct.
+    fn ingest_refetch(&mut self, rows: Vec<Node>) -> Vec<Change> {
+        // Chain hands back the next row(s) after a pending_refetch. Two
+        // callers:
+        //   - Add-path: refetch just updates the bound. Add(node) was
+        //     already emitted. emit=false; return [].
+        //   - Remove-path: refetch provides the replacement row to
+        //     promote into the window. Emit Change::Add(first) per TS
+        //     take.ts:411-417 and update both size and bound. emit=true.
+        let emit_add = self.pending_refetch_emit_add;
+        self.pending_refetch_emit_add = false;
         let Some(first) = rows.into_iter().next() else {
-            return;
+            return Vec::new();
         };
         let key = take_state_key(self.partition_key.as_ref(), &first.row);
         let s = self.states.entry(key).or_default();
         s.bound = Some(first.row.clone());
         if std::env::var("IVM_PARITY_TRACE").is_ok() {
             eprintln!(
-                "[ivm:rs:take_t:ingest_refetch] partition={:?} new_bound_is_some=true",
-                take_state_key(self.partition_key.as_ref(), &first.row)
+                "[ivm:rs:take_t:ingest_refetch] partition={:?} new_bound_is_some=true emit_add={}",
+                take_state_key(self.partition_key.as_ref(), &first.row),
+                emit_add,
             );
+        }
+        if emit_add {
+            // Remove-path replacement: restore window size and emit
+            // the Add. Mirror of TS take.ts:405-417 which updates
+            // take state then yields `this.#output.push({type:'add',
+            // node: newBound.node}, this)`.
+            s.size = s.size.saturating_add(1);
+            vec![Change::Add(AddChange { node: first })]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Mirror of TS `take.ts:212-239` `#getStateAndConstraint` — build
+    /// a per-partition `Constraint` from the row's partition key so the
+    /// refetch fetches rows only from the same partition. Without this,
+    /// refetch returns rows from every partition (BEH-6 in
+    /// PARITY-DIVERGENCES.md).
+    fn partition_constraint_for(
+        &self,
+        row: &Row,
+    ) -> Option<crate::ivm::constraint::Constraint> {
+        let pk = self.partition_key.as_ref()?;
+        let mut c = crate::ivm::constraint::Constraint::new();
+        for col in pk.iter() {
+            if let Some(v) = row.get(col).cloned() {
+                c.insert(col.clone(), v);
+            }
+        }
+        if c.is_empty() {
+            None
+        } else {
+            Some(c)
         }
     }
 }
@@ -528,7 +608,13 @@ mod tests {
     }
 
     #[test]
-    fn push_remove_of_bound_clears_bound_no_refetch_signalled() {
+    fn push_remove_of_bound_signals_refetch_for_replacement() {
+        // Mirror of TS take.ts:354-418: Remove within-bound triggers a
+        // refetch whose first row is promoted into the window as the
+        // new bound and emitted as `Change::Add` downstream. The
+        // previous test asserted no refetch was signalled — that was
+        // the RS-side shortcut flagged as BEH-5 in
+        // PARITY-DIVERGENCES.md, now ported.
         let mut t = TakeT::new(2, comparator());
         let upstream = vec![node_of(row(10)), node_of(row(20))];
         let _: Vec<Node> = t
@@ -543,11 +629,19 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0], Change::Remove(_)));
         assert_eq!(single_state(&t).unwrap().size, 1);
-        // Bound cleared pending the next fetch.
+        // Bound is cleared at this point; refetch will re-establish it.
         assert!(single_state(&t).unwrap().bound.is_none());
-        // Remove-of-bound deferred-refetch not signalled in this first
-        // cut; next hydrate re-populates.
-        assert!(t.take_pending_refetch().is_none());
+        // The Remove now signals a refetch request (start: after removed
+        // row) so the Chain drives the source to find a replacement.
+        let pending = t.take_pending_refetch().expect("refetch expected");
+        assert!(pending.start.is_some());
+        // If a replacement exists, ingest_refetch emits Change::Add and
+        // restores the window size.
+        let emitted = t.ingest_refetch(vec![node_of(row(30))]);
+        assert_eq!(emitted.len(), 1);
+        assert!(matches!(emitted[0], Change::Add(_)));
+        assert_eq!(single_state(&t).unwrap().size, 2);
+        assert!(single_state(&t).unwrap().bound.is_some());
     }
 
     /// Partition-aware: two partitions with separate `(size, bound)`.
