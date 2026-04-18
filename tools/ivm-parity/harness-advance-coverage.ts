@@ -40,6 +40,12 @@ const PG_URL =
   process.env.PARITY_PG_URL ??
   'postgresql://user:password@127.0.0.1:6434/parity';
 const BATCH_SIZE = Number(process.env.BATCH_SIZE ?? 30);
+// Safety ceiling for the event-driven post-mutation wait. The loop
+// actually returns as soon as every sub's `pokeEnd` timestamp
+// advances past the mutation-apply time — on a local dev setup this
+// is typically 50-200ms. The ceiling protects against a stuck sync
+// worker (would show as all subs timing out together) rather than
+// being the nominal wait.
 const POKE_WAIT_MS = Number(process.env.POKE_WAIT_MS ?? 3000);
 const HYDRATE_TIMEOUT_MS = Number(process.env.HYDRATE_TIMEOUT_MS ?? 20_000);
 const CORPUS_LIMIT = Number(process.env.CORPUS_LIMIT ?? 0);
@@ -172,6 +178,15 @@ type Sub = {
   rows: RowsByTable;
   initialHydrated: Promise<void>;
   close: () => void;
+  /**
+   * Monotonic millisecond timestamp of the most recent `pokeEnd` this
+   * socket has received. Used by the advance-wait loop to detect that
+   * post-mutation changes have propagated without a blind sleep —
+   * when `lastPokeEndAtMs > mutationAppliedAtMs`, this sub has been
+   * drained. Zero sync emits one `pokeEnd` per coalesced push batch,
+   * so a single observation is sufficient.
+   */
+  lastPokeEndAtMs: () => number;
 };
 
 function buildClientSchema(): {
@@ -230,6 +245,7 @@ async function subscribe(
   });
   let sawGotPatch = false;
   let resolved = false;
+  let lastPokeEnd = 0;
   ws.on('message', (data: Buffer | string) => {
     let parsed: unknown;
     try {
@@ -260,9 +276,12 @@ async function subscribe(
           }
         }
       }
-    } else if (tag === 'pokeEnd' && sawGotPatch && !resolved) {
-      resolved = true;
-      resolveHydrated();
+    } else if (tag === 'pokeEnd') {
+      lastPokeEnd = Date.now();
+      if (sawGotPatch && !resolved) {
+        resolved = true;
+        resolveHydrated();
+      }
     }
   });
   ws.on('error', err => {
@@ -271,7 +290,12 @@ async function subscribe(
   ws.on('close', () => {
     if (!resolved) rejectHydrated(new Error('socket closed before hydration'));
   });
-  return {rows, initialHydrated, close: () => { try { ws.close(); } catch {} }};
+  return {
+    rows,
+    initialHydrated,
+    close: () => { try { ws.close(); } catch {} },
+    lastPokeEndAtMs: () => lastPokeEnd,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -475,9 +499,30 @@ async function runBatch(
   } catch (e) {
     mutationErr = `mutate: ${(e as Error).message}`;
   }
+  const mutationFinishedAt = Date.now();
 
-  // Wait for advancement to settle.
-  await sleep(POKE_WAIT_MS);
+  // Event-driven wait — wait for QUIESCENCE rather than per-sub
+  // completion. Zero sync emits `pokeEnd` only to subs whose result
+  // set actually changed; subs unaffected by the mutation never emit
+  // (so a per-sub "must see pokeEnd" loop would hit the ceiling every
+  // time). Instead: observe the LATEST pokeEnd across all subs, and
+  // consider the batch drained once 150ms elapses without any new
+  // pokeEnd. That covers both the affected-subs case (they emit fast
+  // and we wait 150ms after the last one) and the unaffected-subs
+  // case (no emits at all → we wait a floor of 150ms from mutation
+  // finish and proceed). `POKE_WAIT_MS` remains a hard ceiling.
+  if (!mutationErr) {
+    const QUIET_MS = 150;
+    const deadline = Date.now() + POKE_WAIT_MS;
+    while (Date.now() < deadline) {
+      let latest = mutationFinishedAt;
+      for (const s of subs) {
+        latest = Math.max(latest, s.ts.lastPokeEndAtMs(), s.rs.lastPokeEndAtMs());
+      }
+      if (Date.now() - latest >= QUIET_MS) break;
+      await sleep(20);
+    }
+  }
 
   // Snapshot final per-AST.
   const results: Result[] = [];
