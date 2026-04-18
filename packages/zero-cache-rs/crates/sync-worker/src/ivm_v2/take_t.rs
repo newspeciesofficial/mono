@@ -226,6 +226,41 @@ impl Transformer for TakeT {
     fn take_pending_refetch(&mut self) -> Option<FetchRequest> {
         self.pending_refetch.take()
     }
+
+    fn ingest_refetch(&mut self, rows: Vec<Node>) -> Vec<Change> {
+        // Chain hands back the next row(s) after a pending_refetch. Two
+        // callers:
+        //   - Add-path: refetch just updates the bound. Add(node) was
+        //     already emitted. emit=false; return [].
+        //   - Remove-path: refetch provides the replacement row to
+        //     promote into the window. Emit Change::Add(first) per TS
+        //     take.ts:411-417 and update both size and bound. emit=true.
+        let emit_add = self.pending_refetch_emit_add;
+        self.pending_refetch_emit_add = false;
+        let Some(first) = rows.into_iter().next() else {
+            return Vec::new();
+        };
+        let key = take_state_key(self.partition_key.as_ref(), &first.row);
+        let s = self.states.entry(key).or_default();
+        s.bound = Some(first.row.clone());
+        if std::env::var("IVM_PARITY_TRACE").is_ok() {
+            eprintln!(
+                "[ivm:rs:take_t:ingest_refetch] partition={:?} new_bound_is_some=true emit_add={}",
+                take_state_key(self.partition_key.as_ref(), &first.row),
+                emit_add,
+            );
+        }
+        if emit_add {
+            // Remove-path replacement: restore window size and emit
+            // the Add. Mirror of TS take.ts:405-417 which updates
+            // take state then yields `this.#output.push({type:'add',
+            // node: newBound.node}, this)`.
+            s.size = s.size.saturating_add(1);
+            vec![Change::Add(AddChange { node: first })]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 impl TakeT {
@@ -494,41 +529,6 @@ impl TakeT {
             }
         }
         out
-    }
-
-    fn ingest_refetch(&mut self, rows: Vec<Node>) -> Vec<Change> {
-        // Chain hands back the next row(s) after a pending_refetch. Two
-        // callers:
-        //   - Add-path: refetch just updates the bound. Add(node) was
-        //     already emitted. emit=false; return [].
-        //   - Remove-path: refetch provides the replacement row to
-        //     promote into the window. Emit Change::Add(first) per TS
-        //     take.ts:411-417 and update both size and bound. emit=true.
-        let emit_add = self.pending_refetch_emit_add;
-        self.pending_refetch_emit_add = false;
-        let Some(first) = rows.into_iter().next() else {
-            return Vec::new();
-        };
-        let key = take_state_key(self.partition_key.as_ref(), &first.row);
-        let s = self.states.entry(key).or_default();
-        s.bound = Some(first.row.clone());
-        if std::env::var("IVM_PARITY_TRACE").is_ok() {
-            eprintln!(
-                "[ivm:rs:take_t:ingest_refetch] partition={:?} new_bound_is_some=true emit_add={}",
-                take_state_key(self.partition_key.as_ref(), &first.row),
-                emit_add,
-            );
-        }
-        if emit_add {
-            // Remove-path replacement: restore window size and emit
-            // the Add. Mirror of TS take.ts:405-417 which updates
-            // take state then yields `this.#output.push({type:'add',
-            // node: newBound.node}, this)`.
-            s.size = s.size.saturating_add(1);
-            vec![Change::Add(AddChange { node: first })]
-        } else {
-            Vec::new()
-        }
     }
 
     /// Mirror of TS `take.ts:212-239` `#getStateAndConstraint` — build
