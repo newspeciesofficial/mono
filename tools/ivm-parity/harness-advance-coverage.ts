@@ -49,6 +49,10 @@ const BATCH_SIZE = Number(process.env.BATCH_SIZE ?? 30);
 const POKE_WAIT_MS = Number(process.env.POKE_WAIT_MS ?? 3000);
 const HYDRATE_TIMEOUT_MS = Number(process.env.HYDRATE_TIMEOUT_MS ?? 20_000);
 const CORPUS_LIMIT = Number(process.env.CORPUS_LIMIT ?? 0);
+// Hard ceiling for the event-driven cleanup verification loop. The
+// loop polls PG every 20ms for the test artifact to disappear; on a
+// local dev setup PG commits are <5ms so this usually returns on the
+// first poll. The ceiling catches the pathological "PG hung" case.
 const CLEANUP_WAIT_MS = Number(process.env.CLEANUP_WAIT_MS ?? 1000);
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -426,11 +430,25 @@ async function cleanupDb(sql: postgres.Sql): Promise<void> {
     } catch (e) {
       console.error(`[cleanupDb] explicit DELETE failed (attempt ${attempt}): ${(e as Error).message}`);
     }
-    await sleep(CLEANUP_WAIT_MS);
-    const leftover = await sql`SELECT id FROM channels WHERE id = 'ch-test-1'`;
-    if (leftover.length === 0) return;
+    // Event-driven verification: poll `SELECT id FROM channels` every
+    // 20ms until `ch-test-1` is gone, with `CLEANUP_WAIT_MS` as a
+    // hard ceiling. Replaces the blind `sleep(CLEANUP_WAIT_MS)` that
+    // waited the full second every batch regardless of actual
+    // replication lag. Postgres local commits are typically <5ms, so
+    // this usually returns on the first poll.
+    const cleanupDeadline = Date.now() + CLEANUP_WAIT_MS;
+    let gone = false;
+    while (Date.now() < cleanupDeadline) {
+      const leftover = await sql`SELECT id FROM channels WHERE id = 'ch-test-1'`;
+      if (leftover.length === 0) {
+        gone = true;
+        break;
+      }
+      await sleep(20);
+    }
+    if (gone) return;
     if (attempt === 0) {
-      console.error(`[cleanupDb] retry needed: ch-test-1 still present after DELETE + ${CLEANUP_WAIT_MS}ms`);
+      console.error(`[cleanupDb] retry needed: ch-test-1 still present after DELETE + ${CLEANUP_WAIT_MS}ms poll`);
     }
   }
   throw new Error('cleanupDb could not remove ch-test-1 after 5 attempts');
