@@ -404,23 +404,60 @@ impl TakeT {
                 out.push(Change::Remove(RemoveChange { node }));
             }
             Change::Edit(EditChange { node, old_node }) => {
-                // Edit = "row content changed." Split into the equivalent
-                // Remove(old) + Add(new) and recurse — TS `take.ts`'s
-                // edit-handling behavior. Doing it in two steps yields the
-                // same downstream observable result regardless of whether
-                // old/new are inside or outside the window:
-                //   - both inside: emits Remove(old) then Add(new), client
-                //     applies as edit on next reconciliation.
-                //   - old inside, new outside (drop-out): Remove emitted,
-                //     no Add (Add hits at-limit branch and is dropped if
-                //     it doesn't beat bound).
-                //   - old outside, new inside (drop-in): Remove a
-                //     no-row-in-window, Add emits.
-                //   - both outside: both no-ops.
-                out.extend(self.push_internal(Change::Remove(RemoveChange {
-                    node: old_node,
-                })));
-                out.extend(self.push_internal(Change::Add(AddChange { node })));
+                // Partial port of TS take.ts:444-712 `#pushEditChange`.
+                // TS treats Edit as a FIRST-CLASS change type with ~7
+                // sub-cases determined by the relative position of
+                // `oldNode.row` and `node.row` vs `takeState.bound`.
+                // The key invariant (take.ts:476-482, 651-656): when
+                // BOTH rows are strictly inside the window (oldCmp < 0
+                // && newCmp < 0), TS emits a single `Change::Edit`
+                // downstream — never decomposing into Remove+Add.
+                //
+                // Previously RS unconditionally split Edit into
+                // `Remove(old) + Add(new) + recurse`, which for the
+                // simple "UPDATE non-order-key column" case would:
+                //   1. Remove(old) fires the Remove refetch path and
+                //      promotes a new row into the window.
+                //   2. Add(new) hits at-limit and displaces the
+                //      promoted row back out.
+                //   3. Net: two spurious parent Add/Remove events plus
+                //      the original Edit is lost (BEH-4).
+                //
+                // Narrow fix: forward Edit unchanged when both old and
+                // new are strictly inside the window. Other sub-cases
+                // (crossings, at-bound transitions) keep the existing
+                // Remove+Add decomposition until the full state
+                // machine is ported.
+                let key = take_state_key(self.partition_key.as_ref(), &node.row);
+                let state_bound = self.states.get(&key).and_then(|s| s.bound.clone());
+                let both_inside_window = match state_bound {
+                    Some(ref b) => {
+                        let old_cmp = (self.compare_rows)(&old_node.row, b);
+                        let new_cmp = (self.compare_rows)(&node.row, b);
+                        old_cmp != CmpOrdering::Greater && new_cmp != CmpOrdering::Greater
+                    }
+                    None => false,
+                };
+                if both_inside_window {
+                    // mirrors TS take.ts:476 push-edit-old-at-bound-new-at-bound
+                    // and take.ts:651 push-edit-both-inside-bound — Edit
+                    // forwarded as-is; state unchanged (no size / bound
+                    // flip).
+                    if std::env::var("IVM_PARITY_TRACE").is_ok() {
+                        eprintln!("[ivm:rs:take.ts:651:push-edit-both-inside-bound]");
+                    }
+                    out.push(Change::Edit(EditChange { node, old_node }));
+                } else {
+                    // Remaining sub-cases (crossings, outside-outside)
+                    // still decompose. Full port of the 7-sub-case
+                    // state machine at TS take.ts:444-712 is future
+                    // work; this keeps the tests that exercise the
+                    // split path passing.
+                    out.extend(self.push_internal(Change::Remove(RemoveChange {
+                        node: old_node,
+                    })));
+                    out.extend(self.push_internal(Change::Add(AddChange { node })));
+                }
             }
             Change::Child(child) => {
                 // mirrors TS take.ts:429

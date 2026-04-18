@@ -314,6 +314,94 @@ fn build_select_sql(
     }
 
     let reverse = req.reverse.unwrap_or(false);
+
+    // Mirror of TS `gatherStartConstraints` at
+    // `packages/zqlite/src/query-builder.ts:207-280`. Given a `start`
+    // with `{row: from, basis}`, builds a cursor condition of the
+    // form:
+    //   (col_0 > from.col_0)
+    //   OR (col_0 = from.col_0 AND col_1 > from.col_1)
+    //   OR ... [one clause per order-by column, each tightening the
+    //          previous prefix]
+    //   [OR (col_0 = from.col_0 AND ... AND col_N = from.col_N) when
+    //    basis == 'at' to include the row itself]
+    //
+    // The comparison flips for `desc` direction and also for
+    // `reverse=true`. Previously RS ignored `req.start` entirely, so
+    // TakeT's Remove-within-bound refetch (take.ts:354-418) received
+    // rows starting at position 0 instead of after the old bound —
+    // the refetch promoted a row already in the window and the real
+    // promotion row (TS emits `m-5` after deleting `m-2` from a
+    // limit(5) query) was never seen. Observable as fuzz_00842
+    // `rs=2 changes` vs `ts=3 changes` (missing Add(m-5)).
+    if let Some(start) = req.start.as_ref() {
+        if !sort.is_empty() {
+            let mut or_clauses: Vec<String> = Vec::new();
+            for i in 0..sort.len() {
+                let mut and_parts: Vec<String> = Vec::new();
+                for j in 0..=i {
+                    let (col, dir) = &sort[j];
+                    let col_sql = format!("\"{}\"", col.replace('"', "\"\""));
+                    if j == i {
+                        // Position `i` is the tightening boundary; value
+                        // binds here.
+                        let asc = matches!(dir, Direction::Asc);
+                        // Effective direction after `reverse` (TS
+                        // query-builder.ts:226-247).
+                        let strict_greater = match (asc, reverse) {
+                            (true, false) => true,
+                            (false, true) => true,
+                            _ => false,
+                        };
+                        let op = if strict_greater { ">" } else { "<" };
+                        // TS emits `(from.col IS NULL OR col op from.col)`
+                        // on the ASC/not-reverse side and the inverse
+                        // on the flipped side — here we collapse to the
+                        // column-side IS NULL clause which SQLite treats
+                        // equivalently when the value is non-NULL.
+                        and_parts.push(format!(
+                            "({col} IS NULL OR {col} {op} ?)",
+                            col = col_sql,
+                            op = op
+                        ));
+                        let v = start.row.get(col).cloned().unwrap_or(None);
+                        params.push(value_to_sql_value(&v));
+                    } else {
+                        // Prefix column: exact match via `IS` so NULL
+                        // compares equal (TS uses `IS` too at
+                        // query-builder.ts:252-256).
+                        and_parts.push(format!("{col_sql} IS ?"));
+                        let v = start.row.get(col).cloned().unwrap_or(None);
+                        params.push(value_to_sql_value(&v));
+                    }
+                }
+                or_clauses.push(format!("({})", and_parts.join(" AND ")));
+            }
+
+            // Basis == 'at' adds a final clause that matches the exact
+            // start row across all sort columns so the row itself is
+            // included (TS query-builder.ts:262-276). 'after' omits
+            // it, making the fetch strictly past the start.
+            if matches!(start.basis, crate::ivm::operator::StartBasis::At) {
+                let mut eq_parts: Vec<String> = Vec::new();
+                for (col, _) in sort.iter() {
+                    let col_sql = format!("\"{}\"", col.replace('"', "\"\""));
+                    eq_parts.push(format!("{col_sql} IS ?"));
+                    let v = start.row.get(col).cloned().unwrap_or(None);
+                    params.push(value_to_sql_value(&v));
+                }
+                or_clauses.push(format!("({})", eq_parts.join(" AND ")));
+            }
+
+            let cursor = or_clauses.join(" OR ");
+            if sql.contains(" WHERE ") {
+                sql.push_str(&format!(" AND ({})", cursor));
+            } else {
+                sql.push_str(&format!(" WHERE ({})", cursor));
+            }
+        }
+    }
+
     if !sort.is_empty() {
         let order_parts: Vec<String> = sort
             .iter()
