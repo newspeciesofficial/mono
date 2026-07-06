@@ -1,6 +1,6 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1771927002698,
-  "repoUrl": "https://github.com/rocicorp/mono",
+  "lastUpdate": 1783346049646,
+  "repoUrl": "https://github.com/newspeciesofficial/mono",
   "entries": {
     "Bundle Sizes": [
       {
@@ -55233,6 +55233,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "Size of replicache.min.mjs.br (Brotli compressed)",
             "value": 31995,
+            "unit": "bytes"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "matt.wonlaw@gmail.com",
+            "name": "Matt Wonlaw",
+            "username": "tantaman"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "48694d892b7013cda649e5b643865a389b97f872",
+          "message": "chore: retry replication lag reports (#6187)\n\nA replication lag report can be missed in which case we just sit and\ncontinuously bump the replication lag meter. This cause zero-console to\nshow 2hrs of replication lag even when no writes were happening.\n\nhttps://app.incident.io/rocicorp/incidents/900\n\nRetries the replication lag report if we missed it.",
+          "timestamp": "2026-07-06T12:48:13Z",
+          "tree_id": "14afc7b5be8dde8dc96197dbefed00cd05177631",
+          "url": "https://github.com/newspeciesofficial/mono/commit/48694d892b7013cda649e5b643865a389b97f872"
+        },
+        "date": 1783346037675,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Size of replicache.mjs",
+            "value": 317540,
+            "unit": "bytes"
+          },
+          {
+            "name": "Size of replicache.mjs.br (Brotli compressed)",
+            "value": 57097,
+            "unit": "bytes"
+          },
+          {
+            "name": "Size of replicache.min.mjs",
+            "value": 117426,
+            "unit": "bytes"
+          },
+          {
+            "name": "Size of replicache.min.mjs.br (Brotli compressed)",
+            "value": 33511,
             "unit": "bytes"
           }
         ]
